@@ -26,6 +26,7 @@ from representation.observation_encoder import ObservationEncoder
 from training.replay_buffer import ReplayBuffer
 from training.self_play import (
     BatchedSelfPlayWorker,
+    PopulationSelfPlayWorker,
     SelfPlayWorker,
     build_opponent_pool,
     snapshot_agent,
@@ -88,6 +89,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--league-snapshot-every", type=int, default=None)
     parser.add_argument("--league-size", type=int, default=None)
     parser.add_argument("--league-recency-decay", type=float, default=None)
+    parser.add_argument("--league-weighting", choices=["linear", "geometric"], default=None)
+    parser.add_argument(
+        "--population", dest="population_self_play", action="store_true", default=None,
+        help="population self-play: villains sampled from a library of checkpoints, "
+        "randomised full games, later-street scenario mixture",
+    )
     parser.add_argument("--no-eval", action="store_true")
     return parser.parse_args()
 
@@ -118,6 +125,8 @@ def build_config(args: argparse.Namespace) -> Config:
         ("league_snapshot_every", "train"),
         ("league_size", "train"),
         ("league_recency_decay", "train"),
+        ("league_weighting", "train"),
+        ("population_self_play", "train"),
         ("reward_mode", "env"),
         ("reward_clip", "env"),
         ("starting_stack", "env"),
@@ -187,22 +196,34 @@ def main() -> None:
     )
     print(f"replay capacity={buffer.capacity:,}  ({buffer.memory_bytes() / 1e6:.0f} MB reserved)\n")
 
-    pool = build_opponent_pool(cfg, network, device=device)
-    use_league = "checkpoint" in cfg.train.opponent_pool
-    worker_class = BatchedSelfPlayWorker if cfg.train.self_play_envs > 1 else SelfPlayWorker
-    worker_kwargs = dict(device=device, seed=cfg.train.seed, opponent_pool=pool)
-    if worker_class is BatchedSelfPlayWorker:
-        worker_kwargs["num_envs"] = cfg.train.self_play_envs
-    worker = worker_class(cfg, network, encoder, **worker_kwargs)
-    print(
-        f"self-play: {worker_class.__name__}"
-        + (f" ({cfg.train.self_play_envs} envs in lockstep)" if cfg.train.self_play_envs > 1 else "")
-    )
-    if cfg.train.opponent_pool:
-        print(
-            f"opponent pool: {', '.join(cfg.train.opponent_pool)}  "
-            f"(mixed into {cfg.train.opponent_mix_prob:.0%} of hands)"
+    population = bool(cfg.train.population_self_play)
+    use_league = (not population) and "checkpoint" in cfg.train.opponent_pool
+    if population:
+        worker = PopulationSelfPlayWorker(
+            cfg, network, encoder, device=device, seed=cfg.train.seed
         )
+        print(
+            f"self-play: population (library<= {cfg.train.population_library_size}, "
+            f"{cfg.train.league_weighting} recency, snapshot every "
+            f"{cfg.train.population_snapshot_every} iters, entry-street mix "
+            f"{tuple(round(p, 2) for p in cfg.train.entry_street_probs)})"
+        )
+    else:
+        pool = build_opponent_pool(cfg, network, device=device)
+        worker_class = BatchedSelfPlayWorker if cfg.train.self_play_envs > 1 else SelfPlayWorker
+        worker_kwargs = dict(device=device, seed=cfg.train.seed, opponent_pool=pool)
+        if worker_class is BatchedSelfPlayWorker:
+            worker_kwargs["num_envs"] = cfg.train.self_play_envs
+        worker = worker_class(cfg, network, encoder, **worker_kwargs)
+        print(
+            f"self-play: {worker_class.__name__}"
+            + (f" ({cfg.train.self_play_envs} envs in lockstep)" if cfg.train.self_play_envs > 1 else "")
+        )
+        if cfg.train.opponent_pool:
+            print(
+                f"opponent pool: {', '.join(cfg.train.opponent_pool)}  "
+                f"(mixed into {cfg.train.opponent_mix_prob:.0%} of hands)"
+            )
     trainer = Trainer(cfg, network, device=device)
     sample_rng = np.random.default_rng(cfg.train.seed)
 
@@ -216,7 +237,9 @@ def main() -> None:
     try:
         for iteration in range(start_iteration + 1, cfg.train.iterations + 1):
             tic = time.time()
-            if use_league and iteration % max(1, cfg.train.league_snapshot_every) == 0:
+            if population:
+                worker.maybe_snapshot()
+            elif use_league and iteration % max(1, cfg.train.league_snapshot_every) == 0:
                 worker.add_snapshot(snapshot_agent(cfg, network, device=device))
 
             transitions, sp_stats = worker.generate(cfg.train.hands_per_iteration)

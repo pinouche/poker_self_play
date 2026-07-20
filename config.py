@@ -169,12 +169,33 @@ class TrainConfig:
     opponent_heuristic_samples: int = 25
     league_snapshot_every: int = 50
     league_size: int = 5
-    # Recency weighting for league snapshots.  Snapshot i (0 = oldest of those
-    # retained) is sampled with weight `league_recency_decay ** (age)`, where
-    # age counts back from the newest.  1.0 = uniform over the league; smaller
-    # values concentrate on recent, stronger versions.  0.5 means the newest
-    # snapshot is twice as likely as the one before it.
+    # Recency weighting for league snapshots.
+    #   "geometric": snapshot at age `a` (0 = newest) has weight
+    #                `league_recency_decay ** a`.
+    #   "linear":    the K retained snapshots get weights K, K-1, ..., 1 from
+    #                newest to oldest -- a straight-line decline with recency.
+    league_weighting: str = "geometric"
     league_recency_decay: float = 0.5
+
+    # --- population self-play ----------------------------------------------
+    # When enabled, every hand seats the learner in one seat and samples the
+    # other two "villains" from a library of frozen checkpoint policies, with
+    # recency weighting.  Games are played start to finish from a randomised
+    # setup, and a configurable fraction begin on a later street (the earlier
+    # streets played out by the population, so the starting state is realistic).
+    population_self_play: bool = False
+    population_library_size: int = 20
+    population_snapshot_every: int = 10
+    # Randomised game setup.
+    population_random_setup: bool = True
+    population_stack_min_bb: float = 15.0
+    population_stack_max_bb: float = 200.0
+    population_big_blind_choices: tuple = (10, 20, 50, 100)
+    # Scenario mixture: probability a hand's learner *enters* on each street.
+    # Earlier streets are still played (by the population) so ranges and pots
+    # are realistic; the learner simply starts collecting from its entry street.
+    # Order: preflop, flop, turn, river.  Normalised if it does not sum to 1.
+    entry_street_probs: tuple = (0.75, 0.13, 0.08, 0.04)
 
     # --- replay buffer ------------------------------------------------------
     # The specification suggests 1_000_000.  That is supported, but the default

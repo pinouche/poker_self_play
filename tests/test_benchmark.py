@@ -234,3 +234,76 @@ def test_sweep_alphas_differ_only_in_alpha():
             a, b = getattr(reference, section).__dict__, getattr(other, section).__dict__
             changed |= {k for k in a if a[k] != b[k]}
         assert changed == {"alpha"}
+
+
+# --- capacity and league configs -------------------------------------------
+def test_capacity_configs_vary_only_the_trunk():
+    from benchmark import CAPACITIES, SETTLED_ALPHA
+
+    reference = build_config("cap_base", 0, 1)
+    for size in CAPACITIES:
+        cfg = build_config(f"cap_{size}", 0, 1)
+        assert cfg.train.alpha == SETTLED_ALPHA
+        for section in ("env", "obs", "train"):
+            assert getattr(cfg, section).__dict__ == getattr(reference, section).__dict__
+
+
+def test_capacity_sizes_are_strictly_increasing():
+    from model.network import build_network
+
+    counts = [
+        build_network(build_config(f"cap_{size}", 0, 1)).num_parameters()
+        for size in ("small", "base", "large", "xlarge")
+    ]
+    assert counts == sorted(counts)
+    assert counts[0] < counts[-1] / 10  # a genuine range, not a token change
+
+
+def test_cap_base_matches_the_settled_sweep_configuration():
+    """`cap_base` must be the incumbent, or the sweep is not a baseline."""
+    base = build_config("cap_base", 0, 1)
+    settled = build_config("sweep_a0.02", 0, 1)
+    for section in ("env", "obs", "train"):
+        assert getattr(base, section).__dict__ == getattr(settled, section).__dict__
+    assert base.model.__dict__ == settled.model.__dict__
+
+
+def test_long_configs_reuse_the_capacity_settings():
+    for long_name, cap_name in (("long_base", "cap_base"), ("long_large", "cap_large")):
+        long_cfg = build_config(long_name, 0, 1)
+        cap_cfg = build_config(cap_name, 0, 1)
+        assert long_cfg.model.__dict__ == cap_cfg.model.__dict__
+        for section in ("env", "obs", "train"):
+            assert getattr(long_cfg, section).__dict__ == getattr(cap_cfg, section).__dict__
+
+
+def test_broad_league_deepens_the_league_without_adding_fixed_bots():
+    base = build_config("cap_base", 0, 1)
+    broad = build_config("league_broad", 0, 1)
+
+    # Still self-snapshots only: adding a fixed bot would reintroduce the
+    # contamination the alpha sweep removed.
+    assert broad.train.opponent_pool == ("checkpoint",)
+    assert broad.train.league_size > base.train.league_size
+    assert broad.train.league_snapshot_every < base.train.league_snapshot_every
+    assert broad.train.opponent_mix_prob > base.train.opponent_mix_prob
+
+
+# --- population config ------------------------------------------------------
+def test_population_config_enables_population_self_play():
+    cfg = build_config("population", 0, 1)
+    assert cfg.train.population_self_play is True
+    assert cfg.train.league_weighting == "linear"
+    # No fixed bot in the library -- all baselines stay held out.
+    assert cfg.train.opponent_pool == ("checkpoint",) or not any(
+        b in cfg.train.opponent_pool
+        for b in ("random", "calling_station", "heuristic", "tight_aggressive")
+    )
+    assert cfg.env.all_in_ev_runout is True  # inherits the settled setup
+    assert cfg.train.alpha == 0.02
+
+
+def test_population_config_keeps_the_finer_abstraction():
+    from environment.state import action_space_for
+
+    assert action_space_for(build_config("population", 0, 1).env).num_actions == 14

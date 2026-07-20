@@ -34,7 +34,7 @@ from typing import Callable, Dict, List
 
 import numpy as np
 
-from config import Config, EnvConfig, ObsConfig
+from config import Config, EnvConfig, ModelConfig, ObsConfig
 from environment.state import action_space_for
 
 # --- configuration matrix --------------------------------------------------
@@ -144,6 +144,84 @@ def _make_sweep_config(alpha: float) -> Callable[[Config], None]:
     return apply
 
 
+#: Alpha is settled at 0.02: the sweep from 0.01 to 0.05 was flat within seed
+#: noise, so it is fixed here and everything below varies something else.
+SETTLED_ALPHA = 0.02
+
+#: Trunk sizes.  `base` is the configuration everything so far was trained
+#: with; it had never been varied, and the plateau at ~16k hands is as
+#: consistent with a capacity ceiling as with a data one.
+CAPACITIES: Dict[str, dict] = {
+    "small": dict(
+        hidden_dim=64, num_residual_blocks=4, head_hidden=64,
+        embed_cards=32, embed_board=32, embed_players=32,
+        embed_pot_history=64, embed_position=16,
+    ),
+    "base": dict(
+        hidden_dim=128, num_residual_blocks=6, head_hidden=128,
+        embed_cards=64, embed_board=64, embed_players=64,
+        embed_pot_history=128, embed_position=32,
+    ),
+    "large": dict(
+        hidden_dim=256, num_residual_blocks=8, head_hidden=256,
+        embed_cards=128, embed_board=128, embed_players=128,
+        embed_pot_history=256, embed_position=64,
+    ),
+    "xlarge": dict(
+        hidden_dim=384, num_residual_blocks=10, head_hidden=384,
+        embed_cards=192, embed_board=192, embed_players=192,
+        embed_pot_history=384, embed_position=96,
+    ),
+}
+
+
+def _make_capacity_config(size: str) -> Callable[[Config], None]:
+    def apply(cfg: Config) -> None:
+        _sweep_reference(cfg)
+        cfg.train.alpha = SETTLED_ALPHA
+        cfg.model = ModelConfig(**CAPACITIES[size], bounded_q=None)
+
+    return apply
+
+
+def _make_population_config(size: str = "base") -> Callable[[Config], None]:
+    """Population self-play: the feature under test.
+
+    Villains are sampled from a library of frozen checkpoints (linear recency
+    weighting), games run start-to-finish from randomised stacks and blinds, and
+    a minority of hands have the learner enter on a later street.  No fixed bot
+    is ever in the library, so all three baselines stay held out.
+    """
+
+    def apply(cfg: Config) -> None:
+        _make_capacity_config(size)(cfg)
+        cfg.train.population_self_play = True
+        cfg.train.league_weighting = "linear"
+        cfg.train.population_library_size = 20
+        cfg.train.population_snapshot_every = 10
+        cfg.train.entry_street_probs = (0.75, 0.13, 0.08, 0.04)
+
+    return apply
+
+
+def _make_broad_league_config(size: str = "base") -> Callable[[Config], None]:
+    """More snapshots, taken more often, seated more often.
+
+    Still self-snapshots only -- adding fixed bots would put an evaluation
+    baseline back into training, which is exactly the contamination the sweep
+    removed.  "Broader" here means a deeper and fresher league, not a more
+    varied cast.
+    """
+
+    def apply(cfg: Config) -> None:
+        _make_capacity_config(size)(cfg)
+        cfg.train.league_size = 12
+        cfg.train.league_snapshot_every = 15
+        cfg.train.opponent_mix_prob = 0.6
+
+    return apply
+
+
 def _legacy(cfg: Config) -> None:
     """The original configuration, before any of the fixes."""
     cfg.train.alpha = 0.5
@@ -165,6 +243,15 @@ CONFIGS: Dict[str, Callable[[Config], None]] = {
     "alpha_0.02": _alpha_002,
     "legacy": _legacy,
     **{f"sweep_a{alpha:g}": _make_sweep_config(alpha) for alpha in SWEEP_ALPHAS},
+    # Capacity sweep at the settled alpha.
+    **{f"cap_{size}": _make_capacity_config(size) for size in CAPACITIES},
+    # Same configurations, run 4x longer to separate a capacity ceiling from a
+    # data ceiling.  Selected by passing --iterations 1000.
+    "long_base": _make_capacity_config("base"),
+    "long_large": _make_capacity_config("large"),
+    "league_broad": _make_broad_league_config("base"),
+    "population": _make_population_config("base"),
+    "long_population": _make_population_config("base"),
 }
 
 #: Order used in reports; `full` first so ablations read as deltas from it.

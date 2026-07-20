@@ -968,25 +968,309 @@ than self-snapshots alone.
 
 ---
 
-## Comparing runs
+## Capacity sweep (alpha fixed at 0.02)
 
-Every run writes `history.json` next to its checkpoints. To compare settings:
+Alpha is settled, so it is fixed at 0.02 here and the trunk size is varied
+instead. Four sizes, 3 seeds each, 250 iterations, plus a deeper self-snapshot
+league at the base size. Same clean setup as the alpha sweep (self-snapshots
+only, no equity, finer abstraction).
+
+| config | params | vs random | vs calling station | vs heuristic |
+|---|---:|---:|---:|---:|
+| `cap_small` | 119k | +479 | +378 | −48 |
+| `cap_base` | 409k | +644 | +523 | −66 |
+| `cap_large` | 1.6M | +596 | +329 | −55 |
+| `cap_xlarge` | 4.1M | +378 | +84 | −55 |
+| `league_broad` | 409k | +474 | +362 | −92 |
+
+![capacity](benchmark_results/capacity/report_results.png)
+
+### Capacity is not the lever either — and this one is a clean negative
+
+**Against the heuristic every size lands between −48 and −92, and the
+within-size seed spread (8 to 270 bb/100) covers that entire range.** There is
+no capacity effect that survives the noise. If anything the two biggest changes
+(`cap_xlarge`, `league_broad`) are *worse*, not better.
+
+The interesting part is *why*, and the training curves answer it directly.
+**Bigger networks fit the critic strictly better**: final `q_loss` is ~0.058
+for `cap_base`, ~0.047 for `cap_large` and `league_broad`. The regression the
+Q head is asked to solve is easier for a larger trunk, exactly as expected. But
+that better fit **does not become better play**:
+
+| config | final q_loss | Q spread over legal actions | vs heuristic |
+|---|---:|---:|---:|
+| `cap_small` | 0.052 | 0.151 | −48 |
+| `cap_base` | 0.058 | 0.223 | −66 |
+| `cap_large` | 0.049 | 0.185 | −55 |
+| `cap_xlarge` | 0.055 | 0.185 | −36..−55 |
+
+Lower q_loss, same strength; and the Q *spread* (which is what alpha turns into
+a policy) does not widen with capacity at all. So the network is already able
+to fit the value targets it is given — **the ceiling is not the model's
+capacity to represent the value function.** It is upstream: the quality of the
+targets (a terminal-only signal, model-free, taken action only) and the
+strategic variety of the self-play opponent, which a bigger network cannot
+manufacture.
+
+This is a more useful result than a win would have been: it rules out the
+cheapest hypothesis and points at the two expensive ones.
+
+### Was xlarge just undertrained? And does more data help? (corrected)
+
+The obvious objection to the capacity result is that a bigger network on 16k
+hands is starved of data. `long_base` / `long_large` (1000 iterations, 64k
+hands) were meant to test it, and their endpoints looked alarming:
+
+| | 250 iters | 1000 iters (vs heuristic) |
+|---|---|---|
+| `base` | −72, −64, −63 | −214, −127 |
+
+I first read that as "4x more hands makes it monotonically worse." **That was
+wrong, and it is worth showing exactly how it was wrong**, because it is the
+easiest mistake to make in this domain.
+
+Two endpoints cannot distinguish degradation from a noisy tail. So I checkpointed
+the base config every 100 iterations to 1000 (2 seeds) and scored each against
+all three baselines:
+
+![trajectory](benchmark_results/trajectory/trajectory.png)
+
+The vs-heuristic panel **oscillates with no trend at all**: the correlation
+between iteration and bb/100 is **0.04**, the fitted slope is +16 per 1000
+iterations, and the value swings between −27 and −456. Seed 0 was −27 (nearly
+break-even) at iteration 500 and −157 at 1000; the two seeds dip out of phase.
+Adjacent checkpoints swing by ~100-170 bb/100, far more than the ±65 evaluation
+interval, so the oscillation is real trajectory dynamics, not measurement noise.
+
+**The endpoint comparison was an artifact.** The 1000-iteration runs happened to
+land in a down-swing; iteration 500 would have said "more data is *better*."
+Comparing two samples of a directionless oscillation is not a measurement.
+
+### What is actually going on
+
+This is **non-stationarity**, the textbook failure mode of naive self-play and
+the reason serious systems (AlphaStar, OpenAI Five) use populations rather than
+pure self-play. The agent's opponent is its own moving policy, and poker has
+rock-paper-scissors structure (tight beats loose-aggressive beats calling beats
+tight), so as the self-play policy drifts around that cycle, its matchup against
+any *fixed* style swings by hundreds of bb/100 without converging.
+
+The one genuine, signed trend is the opposite of what I claimed, and against a
+different opponent: the agent slowly gets **worse at exploiting random and the
+calling station** (correlation −0.67 and −0.48, roughly −300 bb/100 over 1000
+iterations) while staying massively positive against them. It is un-learning
+crude exploitation as it specialises against itself -- but strength against the
+disciplined heuristic just oscillates.
+
+### What still holds
+
+* **Capacity is not the bottleneck.** The 250-iteration capacity sweep is a fair
+  fixed-budget comparison, and it holds: bigger networks fit the critic strictly
+  better (lower q_loss) and play the same or worse. That result does not depend
+  on the endpoint mistake.
+* **A single self-play checkpoint is not a stable measure of strength.** Its
+  matchup against a fixed opponent is a snapshot of an oscillation. Any claim
+  about "the agent's strength" should average over checkpoints, or the
+  measurement is dominated by *when* you happened to stop.
+* **Opponent diversity is still the indicated lever** -- and now for a sharper
+  reason. A diverse, held-out league is exactly what damps this oscillation: it
+  stops the policy from chasing its own tail around the strategy cycle. Pure
+  self-play and self-snapshot leagues cannot, because every opponent shares the
+  current style.
+
+### A note on method
+
+I reported the endpoint comparison as a finding before I had the curve, and it
+was wrong. The lesson is specific: **against a non-stationary training process,
+never compare two endpoints -- measure the trajectory.** The trajectory is
+cheap (checkpoint during training, evaluate each), and `trajectory.py` /
+`plot_trajectory.py` in `benchmark_results/trajectory/` reproduce it.
+
+---
+
+## Population self-play
+
+The trajectory result -- strength against a fixed opponent oscillating with no
+convergence -- is the standard failure of naive self-play, and the standard fix
+is a *population*.  `--population` switches the training distribution to:
+
+**A library of frozen checkpoints as opponents.** Every hand seats the learner
+once and fills the other two seats with policies sampled from a capacity-bounded
+library of past snapshots.  Sampling is **recency-weighted, linearly**: of the
+`K` retained snapshots the newest is drawn with weight `K`, the next `K-1`, down
+to `1` for the oldest -- a straight-line decline, not the geometric decay used
+by the older league (`--league-weighting` selects either).  Facing a
+distribution of past selves, rather than only the current self, is what damps
+the strategy-cycling.
+
+**Randomised full games.** Each game is dealt from a random button, a random
+blind level (`population_big_blind_choices`) and independent per-seat stack
+depths (`population_stack_min_bb`..`population_stack_max_bb`), then played from
+the button's first action to showdown.  The agent sees the whole range of stack
+depths instead of one fixed 50bb setup.  Blinds are now a per-hand property of
+the game state, so nothing downstream assumes a fixed big blind.
+
+**A scenario mixture over entry streets.** Most hands start preflop, but a
+configurable minority have the learner *enter* on the flop, turn or river
+(`entry_street_probs`, default 0.75 / 0.13 / 0.08 / 0.04).  The earlier streets
+are still played out -- by a population stand-in in the learner's seat and by
+the villains in theirs -- so the state the learner inherits has a realistic
+pot, board and opponent range.  It is generated by policies, not sampled
+uniformly.  Only the learner's own decisions, from its entry street onward,
+become training transitions.
+
+The motivation is coverage: if only ~10% of complete hands reach the river,
+complete-hand self-play spends almost all of its gradient on preflop and flop
+decisions.  Starting a slice of hands directly on the turn or river
+concentrates experience where it is otherwise rare, without resorting to
+synthetic states.
 
 ```bash
-python -m training.plotting checkpoints/alpha0.05 checkpoints/alpha0.10 \
-    --metrics entropy kl_target_vs_policy q_loss --window 9 --out compare.png
+python train.py --population --league-weighting linear
+python benchmark.py train --config population --seed 0 --root runs/
 ```
 
-Policy **entropy** is the headline panel, and it is informative in both
-directions. Entropy near `log(num legal actions)` means the policy is ignoring
-its critic; entropy near zero means it has stopped exploring, so the critic
-never learns the value of untaken actions, and the strategy is readable.
+Because the three seats hold heterogeneous policies, population play does not
+batch the way single-network self-play does -- each seat acts with its own
+forward pass -- so it runs at the sequential rate rather than the batched one.
+Design and rationale live in `training/population.py`.
 
-**Lower entropy is not better.** Across the alpha sweep the correlation between
-entropy and result is only -0.47, and the best setting sits at mid-range
-entropy 1.01 while the *lowest* entropy run (0.43) is worse. The plot also
-shows why: at alpha <= 0.02 entropy oscillates between 0.1 and 0.7 instead of
-settling, which is training instability rather than a sharper policy.
+## Does population self-play beat the heuristic? (measured: no)
+
+The population feature was built because the trajectory result -- strength vs a
+fixed opponent oscillating with no convergence -- is the textbook motivation for
+a population.  So the same trajectory experiment was run for the population
+config (2 seeds, checkpoints every 100 iterations to 1000) and overlaid on plain
+self-play.
+
+![plain vs population](benchmark_results/population/plain_vs_population.png)
+
+Mean strength across checkpoints (iteration >= 200, dropping the ragged startup):
+
+| opponent | plain self-play | population |
+|---|---:|---:|
+| heuristic | −127 ±87 | **−232 ±89** |
+| random | +560 ±145 | **+713 ±135** |
+| calling station | +483 ±166 | +318 ±94 |
+
+**Population did not solve the heuristic problem.** It is still below the
+heuristic at every checkpoint of both seeds, and on average *worse* than plain
+self-play (−232 vs −127).  Crucially, it also **did not damp the oscillation**:
+the vs-heuristic standard deviation is unchanged (89 vs 87).  The whole premise
+-- that facing a distribution of past selves would stabilise strength against a
+fixed style -- is not borne out here.
+
+### What population play *did* do
+
+It is a **generalist**, and the trade is legible:
+
+* **It resists the "un-learning" drift.**  Plain self-play slowly gets worse at
+  beating random over training (the −0.67 correlation from the trajectory
+  section); population stays stronger and steadier against random (+713 vs +560).
+* **It is more stable but less exploitative against specific styles.**  Against
+  the calling station its variance is far lower (std 94 vs 166) but its mean is
+  lower too (+318 vs +483): it does not specialise as hard on punishing that
+  bot's passivity.
+
+So population play buys robustness against weak/varied opponents at the cost of
+peak exploitation of specific ones -- but it does **not** close the gap to the
+disciplined heuristic.
+
+### Why not -- and what this does not yet isolate
+
+The likely reason is that a **library of past selves is a style monoculture.**
+Every snapshot descends from the same self-play lineage and shares the same
+blind spot against the heuristic's equity-disciplined, fold-heavy style.
+Diversity of *strength* (weak early snapshots to strong recent ones) is not
+diversity of *style*.  To beat the heuristic the population would need a policy
+that plays like it -- which only the heuristic itself provides, and seating it
+would be training on the evaluation opponent.
+
+Two honesty caveats on this experiment:
+
+* **It is a bundled change.**  The population config alters three things at once
+  -- library opponents, randomised stacks/blinds (15-200bb), and the
+  later-street entry mixture -- so the −232 cannot be attributed to any one of
+  them.  Isolating the library effect needs an ablation (population opponents at
+  fixed 50bb, preflop-only), which has not been run.
+* **The evaluation is out of the population's training distribution.**  It trains
+  across stack depths and entry streets but is scored only at fixed 50bb
+  complete hands.  A generalist judged at one depth may look worse than it is;
+  the vs-random gain suggests the broader training is not purely a handicap.
+
+The blunt summary: population self-play as specified made the agent a more
+robust generalist but did **not** beat the heuristic, and did not stabilise the
+matchup against it. The evidence continues to point at *style* diversity held
+out from evaluation as the missing ingredient -- not more self-derived opponents.
+
+## Plotting results
+
+Three entry points, depending on what you have.
+
+### 1. Replot a finished experiment (no run directories needed)
+
+Both experiments are archived under `benchmark_results/`, and the archive is
+self-sufficient: `report.json` holds the scores and `report_histories.json`
+holds every seed's training curve. Run directories are large and routinely
+deleted, so this is the path that still works months later.
+
+```bash
+python benchmark.py replot --report benchmark_results/alpha_sweep/report
+python benchmark.py replot --report benchmark_results/ablation/report --out /tmp/ablation
+```
+
+Writes `<out>_results.png` (bar chart, whiskers = seed range) and
+`<out>_curves.png` (training curves).
+
+### 2. Regenerate tables and figures from run directories
+
+```bash
+python benchmark.py report --root benchmark_runs/ --out benchmark_runs/report
+```
+
+Produces `report.md`, `report.json`, `report_histories.json` and both figures.
+Do this once while the run directories still exist; afterwards use `replot`.
+
+### 3. Ad-hoc comparison of arbitrary runs
+
+Any directory containing a `history.json` works -- including ordinary
+`train.py` checkpoint directories, not just benchmark cells.
+
+```bash
+python -m training.plotting checkpoints/runA checkpoints/runB \
+    --metrics entropy kl_target_vs_policy q_loss --window 9 --out compare.png
+
+python -m training.plotting benchmark_runs/sweep_a0.0*__seed0 --no-plot   # table only
+```
+
+`--no-plot` prints just the table of final smoothed values, which is often all
+you need:
+
+```
+run                            entropy        q_loss
+----------------------------------------------------
+sweep_a0.01__seed0              0.6119        0.0669
+sweep_a0.05__seed0              1.2194        0.0572
+```
+
+### Reading the figures
+
+* **Whiskers on the bar chart are the seed range, not the evaluation
+  interval.** Seed variation is the larger of the two here (up to ~470 bb/100
+  against the calling station), so it is the honest error bar.
+* `q_loss` and `kl_target_vs_policy` are drawn on a **log axis**: both fall by
+  one to two orders of magnitude, and a linear axis squashes the informative
+  tail onto zero.
+* The dashed line on the entropy panel is `log(mean legal actions)` -- the
+  uniform-policy bound. It depends on the bet abstraction (~4.5 legal actions
+  by default, ~5.4 with the finer grid), so `benchmark.py` sets it from the
+  configuration rather than hardcoding it.
+
+Policy **entropy** is the metric to watch, and it is informative in both
+directions: near the uniform bound means the policy is ignoring its critic;
+near zero means it has stopped exploring, and the `q_loss` panel will show the
+critic suffering for it.
 
 ---
 

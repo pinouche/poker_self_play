@@ -68,17 +68,23 @@ class PokerEnv:
         stacks: Optional[Sequence[int]] = None,
         hole_cards: Optional[Sequence[Sequence[Card]]] = None,
         board: Optional[Sequence[Card]] = None,
+        small_blind: Optional[int] = None,
+        big_blind: Optional[int] = None,
     ) -> GameState:
         """Start a new hand.
 
         ``hole_cards`` and ``board`` allow deterministic setups in tests; any
         cards supplied are removed from the deck before dealing the rest.
+        ``small_blind`` / ``big_blind`` override the configured blinds for this
+        hand, which lets population self-play randomise the blind structure.
         """
         n = self.cfg.num_players
         if dealer is None:
             dealer = self._hand_index % n if self.cfg.rotate_dealer else 0
         if stacks is None:
             stacks = [self.cfg.starting_stack] * n
+        small_blind = self.cfg.small_blind if small_blind is None else int(small_blind)
+        big_blind = self.cfg.big_blind if big_blind is None else int(big_blind)
 
         preset: List[Card] = []
         if hole_cards:
@@ -94,8 +100,8 @@ class PokerEnv:
         state = GameState(
             players=players,
             dealer=dealer % n,
-            small_blind=self.cfg.small_blind,
-            big_blind=self.cfg.big_blind,
+            small_blind=small_blind,
+            big_blind=big_blind,
             initial_stacks=[int(s) for s in stacks],
         )
         self.state = state
@@ -117,7 +123,7 @@ class PokerEnv:
     def _post_blinds(self) -> None:
         state = self.state
         assert state is not None
-        for seat, amount in ((state.sb_seat, self.cfg.small_blind), (state.bb_seat, self.cfg.big_blind)):
+        for seat, amount in ((state.sb_seat, state.small_blind), (state.bb_seat, state.big_blind)):
             player = state.players[seat]
             posted = min(amount, player.stack)
             player.stack -= posted
@@ -126,7 +132,7 @@ class PokerEnv:
             if player.stack == 0:
                 player.all_in = True
         state.current_bet = max(p.street_bet for p in state.players)
-        state.min_raise_increment = self.cfg.big_blind
+        state.min_raise_increment = state.big_blind
         # Preflop, the big blind is the standing full-raise level.
         state.last_full_raise_level = state.current_bet
 
@@ -176,7 +182,7 @@ class PokerEnv:
 
         state.street = next_street
         state.current_bet = 0
-        state.min_raise_increment = self.cfg.big_blind
+        state.min_raise_increment = state.big_blind
         state.last_full_raise_level = 0
         for player in state.players:
             player.reset_for_street()
@@ -381,7 +387,7 @@ class PokerEnv:
                 for seat, d in enumerate(deltas)
             ]
         if mode == "bb_normalized":
-            return [float(d) / max(float(self.cfg.big_blind), 1.0) for d in deltas]
+            return [float(d) / max(float(self.state.big_blind), 1.0) for d in deltas]
         if mode == "chip_return":
             return [float(d) for d in deltas]
         if mode == "binary":

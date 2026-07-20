@@ -2,4 +2,13 @@
 name = "poker-self-play"
 version = "0.1.0"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "matplotlib>=3.9",
+    "numpy>=2.1",
+    "torch>=2.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]

@@ -1,7 +1,9 @@
 # Benchmark results
 
 Duplicate-deal scoring: every deal is replayed with the hero in all three
-seats on the same deck order. `*` marks a 95% interval that excludes zero.
+seats on the same deck order. `*` marks a 95% interval that excludes zero,
+but note it covers evaluation noise only -- the seed spread is wider and is
+shown as whiskers in the results plot.
 Rows below `full` are single-change ablations from it.
 
 | config | seeds | vs random | vs calling station | vs heuristic |

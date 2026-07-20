@@ -106,7 +106,7 @@ def build_observation(
 ) -> Dict[str, np.ndarray]:
     """Build the canonical observation dictionary for ``self_seat``."""
     n = state.num_players
-    bb = float(env_cfg.big_blind)
+    bb = float(state.big_blind)
     pot = state.pot
     me = state.players[self_seat]
     eff = float(state.effective_stack(self_seat))
@@ -229,7 +229,7 @@ def build_observation(
         "board": tuple(state.board),
         "pot": pot,
         "to_call": to_call,
-        "big_blind": env_cfg.big_blind,
+        "big_blind": state.big_blind,
         "stack": me.stack,
         "position": my_position,
         "num_active_opponents": opponents_active,
@@ -251,7 +251,7 @@ def encode_action_history(
     the oldest events are dropped.
     """
     length = obs_cfg.action_history_length
-    bb = float(env_cfg.big_blind)
+    bb = float(state.big_blind)
     num_actions = action_space_for(env_cfg).num_actions
     out = np.zeros((length, history_event_dim(num_actions)), dtype=np.float32)
 

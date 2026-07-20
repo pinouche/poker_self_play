@@ -1,0 +1,356 @@
+{
+  "summary": {
+    "cap_small": {
+      "random": 478.59199659863947,
+      "calling_station": 378.02324263038554,
+      "heuristic": -48.39924225245653
+    },
+    "cap_base": {
+      "random": 644.2441534391534,
+      "calling_station": 523.4214663643235,
+      "heuristic": -66.27023620559335
+    },
+    "cap_large": {
+      "random": 595.9131281179139,
+      "calling_station": 328.69569160997736,
+      "heuristic": -54.826472033257744
+    },
+    "cap_xlarge": {
+      "random": 378.0191829176115,
+      "calling_station": 84.22891156462585,
+      "heuristic": -35.58038548752834
+    },
+    "league_broad": {
+      "random": 473.9118340891912,
+      "calling_station": 361.5669690098262,
+      "heuristic": -91.96014739229024
+    }
+  },
+  "cells": {
+    "cap_base": [
+      {
+        "seed": 0,
+        "random": {
+          "bb_per_100": 768.895558956916,
+          "ci_half_width": 78.27119577683969,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 662.5726757369614,
+          "ci_half_width": 108.52928082164544,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -71.66920634920633,
+          "ci_half_width": 55.53166146710299,
+          "significant": true,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 1,
+        "random": {
+          "bb_per_100": 699.9585589569161,
+          "ci_half_width": 78.15656560531193,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 684.0132653061224,
+          "ci_half_width": 110.17664635578224,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -63.752312925170074,
+          "ci_half_width": 52.012928533891184,
+          "significant": true,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 2,
+        "random": {
+          "bb_per_100": 463.87834240362815,
+          "ci_half_width": 57.35546599222054,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 223.67845804988661,
+          "ci_half_width": 97.47287568716425,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -63.389189342403625,
+          "ci_half_width": 43.44926706462672,
+          "significant": true,
+          "deals": 700
+        }
+      }
+    ],
+    "cap_large": [
+      {
+        "seed": 0,
+        "random": {
+          "bb_per_100": 519.6573662131519,
+          "ci_half_width": 65.31857540571332,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 247.45975056689346,
+          "ci_half_width": 98.66307928755414,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": 2.70019841269841,
+          "ci_half_width": 44.76753037682478,
+          "significant": false,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 1,
+        "random": {
+          "bb_per_100": 627.477537414966,
+          "ci_half_width": 66.54118429072048,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 529.9113378684808,
+          "ci_half_width": 117.84352099178444,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -91.33002267573696,
+          "ci_half_width": 50.5608576620449,
+          "significant": true,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 2,
+        "random": {
+          "bb_per_100": 640.6044807256236,
+          "ci_half_width": 60.12005306687161,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 208.71598639455783,
+          "ci_half_width": 91.83444204447876,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -75.84959183673469,
+          "ci_half_width": 54.42286582084361,
+          "significant": true,
+          "deals": 700
+        }
+      }
+    ],
+    "cap_small": [
+      {
+        "seed": 0,
+        "random": {
+          "bb_per_100": 310.4383605442177,
+          "ci_half_width": 52.41256919709494,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 52.263492063492066,
+          "ci_half_width": 100.70338322555645,
+          "significant": false,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -15.25726757369614,
+          "ci_half_width": 41.4412863892824,
+          "significant": false,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 1,
+        "random": {
+          "bb_per_100": 694.3308900226757,
+          "ci_half_width": 66.17482481265871,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 544.7878684807256,
+          "ci_half_width": 104.4115521067759,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -92.52839569160996,
+          "ci_half_width": 57.37516117933179,
+          "significant": true,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 2,
+        "random": {
+          "bb_per_100": 431.00673922902496,
+          "ci_half_width": 62.3889521557069,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 537.0183673469388,
+          "ci_half_width": 100.6614542536228,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -37.412063492063496,
+          "ci_half_width": 46.65089501952935,
+          "significant": false,
+          "deals": 700
+        }
+      }
+    ],
+    "cap_xlarge": [
+      {
+        "seed": 0,
+        "random": {
+          "bb_per_100": 370.7741848072563,
+          "ci_half_width": 57.25888538858647,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": -45.50476190476192,
+          "ci_half_width": 90.62803380629398,
+          "significant": false,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -39.95965986394558,
+          "ci_half_width": 38.02510128350839,
+          "significant": true,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 1,
+        "random": {
+          "bb_per_100": 80.60136054421768,
+          "ci_half_width": 40.29666393597649,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 80.98809523809524,
+          "ci_half_width": 25.614084111985793,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -13.859285714285711,
+          "ci_half_width": 16.080029535796182,
+          "significant": false,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 2,
+        "random": {
+          "bb_per_100": 682.6820034013606,
+          "ci_half_width": 79.86642846995261,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 217.2034013605442,
+          "ci_half_width": 110.78460379418672,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -52.92221088435374,
+          "ci_half_width": 59.178853560088186,
+          "significant": false,
+          "deals": 700
+        }
+      }
+    ],
+    "league_broad": [
+      {
+        "seed": 0,
+        "random": {
+          "bb_per_100": 264.3178922902494,
+          "ci_half_width": 50.8048557044006,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 233.65952380952385,
+          "ci_half_width": 109.8329927561422,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -40.40506235827664,
+          "ci_half_width": 35.88753696125624,
+          "significant": true,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 1,
+        "random": {
+          "bb_per_100": 668.4941587301587,
+          "ci_half_width": 67.54041973824212,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 662.0566893424037,
+          "ci_half_width": 106.20513141688745,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": -252.8653231292517,
+          "ci_half_width": 61.271080004496156,
+          "significant": true,
+          "deals": 700
+        }
+      },
+      {
+        "seed": 2,
+        "random": {
+          "bb_per_100": 488.92345124716553,
+          "ci_half_width": 70.80947287407317,
+          "significant": true,
+          "deals": 700
+        },
+        "calling_station": {
+          "bb_per_100": 188.98469387755102,
+          "ci_half_width": 87.16600339475443,
+          "significant": true,
+          "deals": 700
+        },
+        "heuristic": {
+          "bb_per_100": 17.38994331065759,
+          "ci_half_width": 42.58599119643124,
+          "significant": false,
+          "deals": 700
+        }
+      }
+    ]
+  }
+}

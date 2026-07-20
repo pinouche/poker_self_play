@@ -104,7 +104,7 @@ def legal_actions(state: GameState, seat: int, cfg) -> LegalActions:
             allowed = can_reopen and max_to > state.current_bet
         else:
             sizing_ids = space.bet_ids
-            min_legal_to = player.street_bet + cfg.big_blind
+            min_legal_to = player.street_bet + state.big_blind
             pot = state.pot
             candidates = [
                 player.street_bet + int(round(frac * pot)) for frac in cfg.bet_fractions

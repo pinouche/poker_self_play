@@ -616,3 +616,194 @@ class BatchedSelfPlayWorker:
             "chains": {seat: [] for seat in range(self.cfg.env.num_players)},
             "mixed": int(len(learner_seats) < self.cfg.env.num_players),
         }
+
+
+# ============================================================================
+# Population self-play
+# ============================================================================
+def play_population_hand(
+    env: PokerEnv,
+    learner: Agent,
+    villains: Sequence[Agent],
+    standin: Optional[Agent],
+    setup,
+    learner_seat: int,
+    entry_street,
+    encoder: ObservationEncoder,
+    rng: random.Random,
+    gamma: float,
+    lam: float,
+    store_next_obs: bool = True,
+    max_decisions: int = 500,
+) -> HandResult:
+    """Play one full game and collect transitions for the learner seat only.
+
+    The learner occupies ``learner_seat``.  Before ``entry_street`` that seat is
+    controlled by ``standin`` (a population policy), so the state the learner
+    inherits at its entry street was produced by real play rather than sampled
+    synthetically.  The other seats are controlled by ``villains`` throughout.
+    Only decisions the learner itself makes become training transitions.
+    """
+    env.reset(
+        dealer=setup.dealer,
+        stacks=setup.stacks,
+        small_blind=setup.small_blind,
+        big_blind=setup.big_blind,
+    )
+    num_players = env.state.num_players
+
+    # Map the two non-learner seats to the villain policies in order.
+    villain_by_seat = {}
+    vi = 0
+    for seat in range(num_players):
+        if seat != learner_seat:
+            villain_by_seat[seat] = villains[vi % len(villains)]
+            vi += 1
+
+    chain: List[_Step] = []
+    decisions = 0
+    while not env.is_terminal:
+        decisions += 1
+        if decisions > max_decisions:  # pragma: no cover - rule-bug guard
+            raise RuntimeError("hand exceeded the maximum number of decisions")
+
+        seat = env.to_act
+        observation = env.get_observation(seat)
+        legal_mask = observation["legal_action_mask"]
+        if legal_mask.sum() <= 0:
+            raise RuntimeError(f"seat {seat} has no legal actions")
+        flat = encoder.encode_flat(observation)
+
+        is_learner_turn = seat == learner_seat and int(env.state.street) >= int(entry_street)
+        if is_learner_turn:
+            controller = learner
+        elif seat == learner_seat:
+            controller = standin if standin is not None else learner
+        else:
+            controller = villain_by_seat[seat]
+
+        choice = controller.act(observation, flat, legal_mask, rng)
+        if not legal_mask[choice.action]:
+            raise RuntimeError(f"agent {controller.name} chose illegal action {choice.action}")
+
+        if is_learner_turn:
+            chain.append(
+                _Step(
+                    observation=flat,
+                    legal_mask=legal_mask.copy(),
+                    action=choice.action,
+                    policy=choice.policy.copy(),
+                    value=choice.value,
+                )
+            )
+        env.step(choice.action)
+
+    rewards = env.terminal_rewards()
+    transitions = build_transitions(
+        {learner_seat: chain}, rewards, gamma, lam, store_next_obs
+    )
+    return HandResult(
+        transitions=transitions,
+        rewards=rewards,
+        chip_deltas=env.chip_deltas(),
+        went_to_showdown=env.state.went_to_showdown,
+        num_decisions=decisions,
+        dealer=env.state.dealer,
+    )
+
+
+class PopulationSelfPlayWorker:
+    """Self-play against a library of frozen checkpoint policies.
+
+    Every hand seats the learner once and fills the other two seats from the
+    library (recency-weighted).  Games start from a randomised setup and run to
+    showdown; a configurable fraction begin with the learner entering on a later
+    street, the earlier streets played out by the population.
+
+    The library is seeded with a snapshot of the initial network so villains
+    exist from the first hand.  ``maybe_snapshot`` adds the current network on a
+    schedule.  Because the seats hold heterogeneous policies, decisions are not
+    batched -- each acts with its own forward pass.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        network: PokerNet,
+        encoder: ObservationEncoder,
+        device: Optional[str] = None,
+        seed: int = 0,
+    ) -> None:
+        from training.population import PolicyLibrary, freeze_policy
+
+        self.cfg = cfg
+        self.network = network
+        self.encoder = encoder
+        self.device = device
+        self.rng = random.Random(seed)
+        self.env = PokerEnv(cfg.env, cfg.obs, seed=seed)
+        self._freeze = freeze_policy
+
+        self.learner = NetworkAgent(
+            network,
+            alpha=cfg.train.alpha,
+            beta=cfg.train.beta,
+            temperature=cfg.train.sampling_temperature,
+            device=device,
+            q_scale=reward_scale(cfg.env),
+        )
+        self.library = PolicyLibrary(
+            capacity=cfg.train.population_library_size,
+            weighting=cfg.train.league_weighting,
+            decay=cfg.train.league_recency_decay,
+        )
+        self.library.add(self._freeze(cfg, network, device))  # seed at iter 0
+        self._iteration = 0
+
+    def maybe_snapshot(self) -> None:
+        """Add the current network to the library on the configured schedule."""
+        self._iteration += 1
+        every = max(1, self.cfg.train.population_snapshot_every)
+        if self._iteration % every == 0:
+            self.library.add(self._freeze(self.cfg, self.network, self.device))
+
+    def generate(self, num_hands: int) -> Tuple[List[Transition], dict]:
+        from training.population import sample_entry_street, sample_game_setup
+
+        transitions: List[Transition] = []
+        showdowns = decisions = collected_hands = 0
+        entry_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        num_players = self.cfg.env.num_players
+
+        for _ in range(num_hands):
+            setup = sample_game_setup(self.rng, self.cfg)
+            learner_seat = self.rng.randrange(num_players)
+            entry_street = sample_entry_street(self.rng, self.cfg)
+            villains = self.library.sample_many(num_players - 1, self.rng)
+            standin = self.library.sample(self.rng) if int(entry_street) > 0 else None
+            for agent in (self.learner, standin, *villains):
+                if agent is not None:
+                    agent.reset()
+
+            result = play_population_hand(
+                self.env, self.learner, villains, standin, setup, learner_seat,
+                entry_street, self.encoder, self.rng,
+                gamma=self.cfg.train.gamma, lam=self.cfg.train.lam,
+                store_next_obs=self.cfg.train.store_next_obs,
+            )
+            transitions.extend(result.transitions)
+            showdowns += int(result.went_to_showdown)
+            decisions += result.num_decisions
+            collected_hands += int(bool(result.transitions))
+            entry_counts[int(entry_street)] += 1
+
+        stats = {
+            "hands": num_hands,
+            "transitions": len(transitions),
+            "decisions_per_hand": decisions / max(1, num_hands),
+            "showdown_rate": showdowns / max(1, num_hands),
+            "hands_with_learner_transitions": collected_hands / max(1, num_hands),
+            "library_size": len(self.library),
+            "entry_street_fractions": [entry_counts[i] / max(1, num_hands) for i in range(4)],
+        }
+        return transitions, stats
