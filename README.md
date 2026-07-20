@@ -705,70 +705,288 @@ earlier `normalized_chip_return` runs were handicapping their own critic.
 
 ---
 
-## Roadmap: what actually moves the needle
+## Roadmap: implemented
 
-Ordered by measured or expected value per unit of effort. The first two are
-implemented and measured; the rest are not done yet.
+All six items below are implemented and tested. The first two are measured;
+the rest are mechanisms whose effect still needs a full training comparison.
 
-### 1. Lower alpha (done — worth ~150 bb/100)
+### 1. Lower alpha (measured: ~140 bb/100)
 
 `alpha` alone sets how sharp the converged policy can be (`pi* ∝ exp(Q/alpha)`).
-At the old default of 0.5 the agent was pinned near-uniform and shoved 20-32%
-of the time regardless of how good its critic got. Config-only change; see the
-sweep above.
+At the old default of 0.5 the agent was pinned near-uniform and shoved 20-32% of
+the time regardless of how good its critic got. See the sweep above.
 
-### 2. Mixed-opponent and league training (done)
+### 2. Mixed-opponent and league training (measured: ~75 bb/100 at alpha=0.10)
 
-`--opponent-pool heuristic,loose_passive,calling_station,checkpoint`
-`--opponent-mix-prob 0.5`
+```
+--opponent-pool heuristic,loose_passive,calling_station,checkpoint
+--opponent-mix-prob 0.5 --league-recency-decay 0.5
+```
 
 Pure self-play calibrates Q against exactly one distribution: its own current
-policy. Seating fixed bots and frozen past checkpoints in 1-2 seats for a
-fraction of hands widens that distribution. Transitions are collected **only**
-from learner seats — an opponent's decisions were not drawn from the policy
-being improved and must never become training data.
+policy. Fixed bots and frozen snapshots occupy 1-2 seats for a fraction of
+hands. Transitions are collected **only** from learner seats -- an opponent's
+decisions were not drawn from the policy being improved.
 
-Frozen snapshots are taken every `league_snapshot_every` iterations, keeping
-the most recent `league_size`.
+**Snapshots are sampled by recency**: the newest gets weight 1, the one before
+it `league_recency_decay`, then `decay²`, and so on, so the learner mostly
+faces recent (stronger) versions of itself while older ones stay in the mix to
+avoid cycling against a single opponent. At the default 0.5 with a league of 4
+the shares are 54 / 26 / 13 / 7 percent.
 
-### 3. Enable the equity feature (not done — likely the next big one)
+### 3. Equity feature, memoised (now on by default)
 
-`ObsConfig.use_equity_feature = True`
+`ObsConfig.use_equity_feature = True`. Naively this costs 40x in observation
+throughput. It is made affordable by memoising on a **suit-isomorphic** key:
+equity is invariant under relabelling suits, so taking the lexicographically
+smallest image over all 24 suit permutations collapses 1326 preflop hole
+combinations to 169 and merges every board with the same suit pattern. Measured
+~70% cache hit rate and a 5.4x speedup over the uncached version.
 
-The heuristic's entire edge is equity versus pot odds, computed by rollout. The
-network currently has to learn that relationship from scratch out of a
-terminal-only, extremely noisy signal. The feature is already implemented and
-provably leak-free (it samples opponent holdings from the full deck minus the
-acting player's own cards and the board, never from what was actually dealt).
-Cost: slower self-play, since it runs a Monte-Carlo rollout per decision.
+### 4. All-in EV runouts (measured: reward std 0.79 -> 0.40)
 
-### 4. All-in EV runouts (not done — biggest variance reduction available)
+`EnvConfig.all_in_ev_runout = True`. When betting is closed, the pot is settled
+on the **expected split over every remaining board** rather than one random
+runout -- enumerated exactly when there are few completions, sampled otherwise.
+Identical in expectation (mean reward stays 0.0, chips conserve to 1e-13) at
+**half the standard deviation**, which is worth as much as quadrupling the
+number of hands. A concrete board is still dealt so observations and history
+stay meaningful; only the chips are settled on the expectation. Preset boards
+always take the concrete path so scripted hands stay reproducible.
 
-When betting is closed and players are all-in, the environment currently deals
-one random runout and pays the winner. Replacing that with the **exact expected
-split over all remaining boards** removes the single largest source of noise
-from the learning signal, at no cost in correctness — it is the same
-expectation with far lower variance. Standard practice in poker RL. This is the
-training-time analogue of the duplicate-deal trick already used in evaluation.
+### 5. Configurable bet abstraction
 
-### 5. Finer action abstraction (not done)
+The action space is still *fixed* for a given configuration -- the network needs
+a constant output width -- but its **size is derived** from `bet_fractions` and
+`raise_multipliers`:
 
-Three bet sizes and three raise sizes is coarse. Real solvers use many more,
-especially small river sizings. This widens the policy space the agent can
-express and is the most likely ceiling once the above are in.
+```
+0 FOLD, 1 CHECK, 2 CALL, <bet sizings>, <raise sizings>, ALL_IN last
+```
 
-### 6. Throughput (not done)
+The default three-and-three reproduces the documented ten-action space exactly,
+ids and names included. A finer setting widens the mask, every action-history
+slot, and the network heads automatically:
 
-~35 hands/second single-threaded, bottlenecked on Python observation building
-and one single-sample forward pass per decision. Batching decisions across
-parallel hands should give 10-50x, which makes everything above cheaper to
-iterate on.
+| sizings | actions | observation dim |
+|---|---:|---:|
+| 3 bets, 3 raises (default) | 10 | 984 |
+| 5 bets, 5 raises | 14 | 1116 |
+| 8 bets, 6 raises | 18 | 1248 |
+
+Names stay `BET_SMALL/MEDIUM/LARGE` for the classic three and become
+size-derived (`BET_25`, `RAISE_2_5X`) otherwise. The heuristic bot expresses its
+preferences as "largest available raise" rather than fixed ids, so it keeps
+working in any space.
+
+### 6. Batched self-play (measured: 2.3x)
+
+`--self-play-envs 64` advances that many hands in lockstep so their decisions
+batch into a single forward pass. Semantics are identical -- at temperature 0
+the batched and sequential workers agree transition for transition on the same
+deal, which is asserted in the tests.
+
+The speedup is **2.3x, not the 10-50x estimated earlier**: batching removes the
+per-decision forward pass, which shifts the bottleneck onto Python-side
+observation construction. Getting further means vectorising the encoder, not
+larger batches.
 
 ### What does *not* help
 
 * **More hands at fixed hyperparameters.** Measured flat from 16k to 64k hands.
-* **Reward shaping** for pot size, aggression, or reaching showdown. It invites
-  the agent to farm the reward function; the terminal-only signal is correct.
+* **Reward shaping** for pot size, aggression, or reaching showdown.
+
+---
+
+## Benchmark
+
+`benchmark.py` trains a matrix of configurations and scores each against the
+three fixed baselines. It is an **ablation from one reference configuration**
+rather than a grid, so every difference is attributable to a single change.
+
+```bash
+python benchmark.py train    --config full --seed 0 --root runs/   # per cell
+python benchmark.py evaluate --config full --seed 0 --root runs/
+python benchmark.py report   --root runs/ --out runs/report        # tables + plots
+python benchmark.py replot   --report runs/report                  # redraw figures
+```
+
+`report` writes `<prefix>_histories.json` alongside the tables, holding every
+cell's per-iteration metrics for every seed. `replot` redraws both figures from
+that file and `<prefix>.json` alone, so the plots can be restyled after the run
+directories — which are large, and hold the checkpoints — have been deleted.
+Without it, restyling a curve means re-training the cell.
+
+Results below: 8 configurations x 2 seeds, 250 iterations (16k hands) each,
+scored on 600 duplicate deals (1800 hands) per cell.
+
+| config | vs random | vs calling station | vs heuristic |
+|---|---:|---:|---:|
+| `full` (α=0.05, equity, EV, pool) | +523 | +926 | −77 |
+| `no_equity` | +544 | +703 | −52 |
+| `no_ev_runout` | +264 | +689 | −25 |
+| `no_pool` | +504 | +379 | −15 |
+| `fine_abstraction` (5×5 sizings) | +628 | +939 | −39 |
+| `alpha_0.10` | +640 | +818 | −166 |
+| **`alpha_0.02`** | +504 | +914 | **+11** |
+| `legacy` (the original config) | +313 | +211 | **−413** |
+
+![results](benchmark_results/report_results.png)
+
+### The noise floor
+
+Seed-to-seed spread over just two seeds reaches **490 bb/100** against the
+calling station, ~200 against random and ~190 against the heuristic. Any
+difference smaller than that is not a result. The evaluation intervals
+(±40-90) are much tighter than the seed spread, which is exactly why the plot
+shows the **seed range** as whiskers rather than the evaluation interval.
+
+### What survives that filter
+
+* **The overall improvement is large and unambiguous.** Against the heuristic,
+  `legacy` −413 → roughly break-even. Against the calling station, +211 → +900.
+  Against random, +313 → +500-640.
+* **All-in EV runouts are the clearest single win.** Removing them costs
+  −259 bb/100 against random with a seed spread of only ~16-53, the tightest
+  measurement in the table. The training curves show why directly: `q_loss`
+  sits ~3x higher without them.
+* **Lower alpha keeps helping against the strongest opponent**: −166 (α=0.10)
+  → −77 (α=0.05) → +11 (α=0.02). Note α=0.02 was *unstable* in the earlier
+  sweep and is now the best cell — the instability was caused by the noisy Q
+  signal that EV runouts removed. The two changes interact.
+* **`alpha_0.02` is the first configuration that is not losing to the
+  heuristic** (+11, interval covering zero).
+
+### What does not survive it
+
+* **Equity is not demonstrated.** +22 against random (noise), and it costs
+  3-4x self-play throughput. On this evidence I would leave it off.
+* **The finer abstraction is promising but unproven**: +105/+13/+38, all inside
+  the seed noise. It is never worse, which is mildly encouraging.
+
+### A contamination caveat, and it matters
+
+The opponent pool contains `calling_station`, `heuristic` and `loose_passive`
+— and two of those are also *evaluation baselines*. For any pool-using
+configuration the "vs calling station" and "vs heuristic" columns are partly
+**training on the test opponent**.
+
+The evidence that this matters: dropping the pool costs 548 bb/100 against the
+calling station but only **18 against random** — and random is the one baseline
+*not* in the pool. So the pool's apparent benefit is largely contamination, and
+`vs random` is the only clean generalisation measure in the table.
+
+Fixing this properly means holding a family of opponents out of training
+entirely. The `--opponent-pool` flag makes that easy; it was not done here.
+
+### Training curves
+
+![curves](benchmark_results/report_curves.png)
+
+Reading them:
+
+* **entropy** — `legacy` (purple) sits flat at 1.30 against a uniform bound of
+  1.61: the original failure, a policy ignoring its critic. `alpha_0.02` (blue)
+  is lowest at ~0.65 and still visibly oscillates.
+* **q_loss** — `no_ev_runout` (pink, 0.14-0.47) and `legacy` (purple, ~0.17)
+  are several times higher than every EV-runout configuration (~0.05). This is
+  the variance reduction visible directly in the learning signal.
+* **kl_target_vs_policy** — collapses toward zero for every configuration by
+  iteration ~150: the policy has reached its fixed point, and after that only a
+  better critic (or a smaller alpha) moves it.
+
+---
+
+## Alpha sweep on a clean setup
+
+The first benchmark's pool contained `calling_station` and heuristic-family
+bots that were *also* evaluation baselines. This sweep removes them: the pool
+is **self-snapshots only**, so all three baselines are genuinely held out.
+Equity is off (never demonstrated, 3-4x throughput cost) and the finer 5x5
+abstraction is kept. Five alpha values, **3 seeds each**, 250 iterations,
+700 duplicate deals (2100 hands) per cell.
+
+| alpha | vs random | vs calling station | vs heuristic |
+|---:|---:|---:|---:|
+| 0.01 | +593 | +713 | −66 |
+| 0.02 | +644 | +523 | −66 |
+| 0.03 | +602 | +388 | −108 |
+| 0.04 | +600 | +584 | −74 |
+| 0.05 | +559 | +405 | −50 |
+
+![alpha sweep](benchmark_results/alpha_sweep/report_results.png)
+
+### Alpha has no detectable effect below 0.05
+
+Within-alpha seed spread reaches **471 bb/100** against the calling station,
+305 against random and 235 against the heuristic. The between-alpha variation
+(85, 325 and 58 respectively) is *smaller than the noise*. This is a flat
+response, not a curve with an optimum.
+
+That is consistent with the mechanism rather than contradicting it. Alpha still
+does exactly what the algebra says -- the entropy curves separate cleanly and
+monotonically by alpha (0.63, 0.85, 0.98, 1.12, 1.22 at convergence, against a
+uniform bound of 1.69). The earlier 0.5 → 0.05 change was worth ~140 bb/100
+because it moved the policy off the near-uniform ceiling. Once alpha is small
+enough that the policy acts on its critic at all, **making it smaller does not
+help further**.
+
+The cost of going too low is visible in the training curves: alpha = 0.01 has
+a clearly higher `q_loss` throughout (~0.065 versus ~0.050-0.060), because a
+sharper policy explores less and the critic learns less about untaken actions.
+That is the exploration/exploitation trade-off appearing directly in the
+learning signal.
+
+![alpha sweep curves](benchmark_results/alpha_sweep/report_curves.png)
+
+### The break-even against the heuristic did not reproduce
+
+The earlier benchmark reported `alpha_0.02` at **+11 bb/100** against the
+heuristic -- the first configuration not losing to it. On the clean setup the
+same alpha gives **−66**, and every alpha in the sweep loses by 50-108.
+
+The difference is exactly the contamination: that cell trained against
+`heuristic` and `loose_passive`, from the same family as the evaluation bot.
+**The apparent break-even was training on the test opponent, not strength.**
+
+The same correction shows against the calling station: `full` measured +926
+with the station in its training pool, while these clean runs measure +388 to
++713 without it.
+
+### Where this leaves the agent
+
+Against genuinely held-out opponents, after 16k hands of self-play:
+
+* **beats random by ~600 bb/100** and **the calling station by ~400-700**, both
+  decisively and at every alpha;
+* **still loses to the equity-based heuristic by 50-110 bb/100.**
+
+Alpha is no longer the lever. The remaining candidates are the ones the
+ablation could not settle: a larger network, materially more hands now that
+batching makes them cheaper, and a held-out-opponent league that is broader
+than self-snapshots alone.
+
+---
+
+## Comparing runs
+
+Every run writes `history.json` next to its checkpoints. To compare settings:
+
+```bash
+python -m training.plotting checkpoints/alpha0.05 checkpoints/alpha0.10 \
+    --metrics entropy kl_target_vs_policy q_loss --window 9 --out compare.png
+```
+
+Policy **entropy** is the headline panel, and it is informative in both
+directions. Entropy near `log(num legal actions)` means the policy is ignoring
+its critic; entropy near zero means it has stopped exploring, so the critic
+never learns the value of untaken actions, and the strategy is readable.
+
+**Lower entropy is not better.** Across the alpha sweep the correlation between
+entropy and result is only -0.47, and the best setting sits at mid-range
+entropy 1.01 while the *lowest* entropy run (0.43) is worse. The plot also
+shows why: at alpha <= 0.02 entropy oscillates between 0.1 and 0.7 instead of
+settling, which is training instability rather than a sharper policy.
 
 ---
 

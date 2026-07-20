@@ -85,6 +85,32 @@ def test_plot_runs_writes_a_file():
         assert os.path.getsize(out) > 0
 
 
+def decaying_history(n=30, floor=0.0):
+    """``q_loss`` falling by two orders of magnitude, as it does in a real run."""
+    return [
+        {"iteration": i, "q_loss": floor + 0.5 * (0.85**i)} for i in range(1, n + 1)
+    ]
+
+
+def test_decaying_metrics_get_a_log_y_axis():
+    axis = plot_runs({"a": decaying_history()}, metrics=["q_loss"]).axes[0]
+    assert axis.get_yscale() == "log"
+    assert axis.get_title() == "q_loss (log scale)"
+
+
+def test_a_non_positive_sample_falls_back_to_a_linear_axis():
+    """A log axis drops non-positive points silently, which would hide data."""
+    history = decaying_history()
+    history[3]["q_loss"] = 0.0
+    axis = plot_runs({"a": history}, metrics=["q_loss"]).axes[0]
+    assert axis.get_yscale() == "linear"
+
+
+def test_other_metrics_keep_their_linear_axis():
+    axis = plot_runs({"a": fake_history()}, metrics=["entropy"]).axes[0]
+    assert axis.get_yscale() == "linear"
+
+
 def test_plot_runs_rejects_metrics_that_appear_nowhere():
     with pytest.raises(ValueError):
         plot_runs({"a": fake_history()}, metrics=["nonexistent"])

@@ -32,13 +32,22 @@ if not os.environ.get("DISPLAY") and os.environ.get("MPLBACKEND") is None:
     matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402  (must follow the backend choice)
+import matplotlib.ticker as ticker  # noqa: E402
 
 DEFAULT_METRICS = ("entropy", "loss", "q_loss", "policy_loss")
 
-#: Metrics where a reference line makes the plot readable.
+#: Metrics where a reference line makes the plot readable.  The entropy bound
+#: is log(mean number of *legal* actions), which depends on the bet abstraction
+#: -- about 4.5 legal actions with the default sizings and 5.4 with a finer
+#: grid -- so callers plotting a non-default abstraction should override it.
 REFERENCE_LINES = {
-    "entropy": ("uniform over 5 legal actions", 1.6094379),
+    "entropy": ("uniform over ~4.5 legal actions", 1.5131),
 }
+
+#: Metrics that decay across orders of magnitude, so a linear axis hides most
+#: of the run.  Both of these fall by 10-100x and then keep improving; on a
+#: linear axis that tail is squashed onto the zero line and reads as flat.
+LOG_SCALE_METRICS = {"kl_target_vs_policy", "q_loss"}
 
 
 def load_history(path: str) -> List[dict]:
@@ -83,6 +92,24 @@ def smooth(values: Sequence[float], window: int) -> List[float]:
     return out
 
 
+def _apply_log_scale(axis) -> None:
+    """Switch ``axis`` to a log y-scale with labels that stay readable.
+
+    Decade-only labels leave these panels nearly unlabelled -- ``q_loss``
+    spans about one decade and ``kl_target_vs_policy`` about two -- so
+    intra-decade ticks are labelled too, thinned out as the span widens.
+    """
+    axis.set_yscale("log")
+    low, high = axis.get_ylim()
+    if low > 0 and high / low < 1000:
+        subs = (1, 2, 3, 5, 7) if high / low < 30 else (1, 2, 5)
+        axis.yaxis.set_major_locator(ticker.LogLocator(subs=subs, numticks=12))
+        axis.yaxis.set_major_formatter(ticker.ScalarFormatter())
+        axis.yaxis.set_minor_formatter(ticker.NullFormatter())
+    # Minor gridlines carry the eye between decades on the wide-range panels.
+    axis.grid(which="minor", alpha=0.12, linewidth=0.5)
+
+
 def plot_runs(
     runs: Dict[str, Sequence[dict]],
     metrics: Sequence[str] = DEFAULT_METRICS,
@@ -90,8 +117,10 @@ def plot_runs(
     out: Optional[str] = None,
     title: Optional[str] = None,
     show_raw: bool = True,
+    reference_lines: Optional[Dict[str, tuple]] = None,
 ):
     """Overlay ``metrics`` for every run; returns the matplotlib figure."""
+    reference_lines = REFERENCE_LINES if reference_lines is None else reference_lines
     metrics = [m for m in metrics if any(series(h, m)[0] for h in runs.values())]
     if not metrics:
         raise ValueError("none of the requested metrics appear in any run")
@@ -105,6 +134,7 @@ def plot_runs(
 
     for index, metric in enumerate(metrics):
         axis = axes[index // columns][index % columns]
+        drawn: List[float] = []
         for run_index, (label, history) in enumerate(runs.items()):
             xs, ys = series(history, metric)
             if not xs:
@@ -112,10 +142,19 @@ def plot_runs(
             colour = colours[run_index % len(colours)]
             if window > 1 and show_raw:
                 axis.plot(xs, ys, color=colour, alpha=0.18, linewidth=0.8)
-            axis.plot(xs, smooth(ys, window), color=colour, label=label, linewidth=1.6)
+                drawn += ys
+            smoothed = smooth(ys, window)
+            axis.plot(xs, smoothed, color=colour, label=label, linewidth=1.6)
+            drawn += smoothed
 
-        if metric in REFERENCE_LINES:
-            note, value = REFERENCE_LINES[metric]
+        # A log axis silently drops non-positive samples, so only take it when
+        # every drawn point is positive.
+        log_scaled = metric in LOG_SCALE_METRICS and drawn and min(drawn) > 0
+        if log_scaled:
+            _apply_log_scale(axis)
+
+        if metric in reference_lines:
+            note, value = reference_lines[metric]
             axis.axhline(value, color="0.4", linestyle="--", linewidth=1.0)
             axis.annotate(
                 note,
@@ -127,7 +166,7 @@ def plot_runs(
                 color="0.35",
             )
 
-        axis.set_title(metric)
+        axis.set_title(f"{metric} (log scale)" if log_scaled else metric)
         axis.set_xlabel("iteration")
         axis.grid(alpha=0.25, linewidth=0.6)
         if index == 0:
