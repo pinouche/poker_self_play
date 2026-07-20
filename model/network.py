@@ -157,8 +157,11 @@ def build_network(cfg: Config) -> PokerNet:
     The Q head's bounding is derived from the reward mode so the head can
     always represent the return range it is asked to regress onto.
     """
+    from environment.state import action_space_for
+
     bounded, scale = resolve_q_head(cfg)
-    return PokerNet(build_spec(cfg.obs), cfg.model, bounded_q=bounded, q_scale=scale)
+    spec = build_spec(cfg.obs, action_space_for(cfg.env).num_actions)
+    return PokerNet(spec, cfg.model, bounded_q=bounded, q_scale=scale)
 
 
 def save_checkpoint(path: str, network: PokerNet, cfg: Config, extra: Optional[dict] = None) -> None:

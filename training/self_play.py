@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from config import Config
+from config import Config, reward_scale
 from environment.poker_env import PokerEnv
 from model.network import PokerNet
 from representation.action_encoder import apply_temperature, masked_softmax, sample_action
@@ -58,6 +58,40 @@ class Agent:
         pass
 
 
+def network_action_choice(
+    logits: np.ndarray,
+    q_values: np.ndarray,
+    legal_mask: np.ndarray,
+    alpha: float,
+    beta: float,
+    temperature: float,
+    q_scale: float,
+    rng: random.Random,
+) -> ActionChoice:
+    """Turn one network output into an action choice.
+
+    Factored out so the sequential agent and the batched worker cannot drift
+    apart: batching must change throughput, never behaviour.
+    """
+    reference = masked_softmax(logits, legal_mask, temperature=1.0)
+    improved = improved_policy_np(
+        q_values, reference, legal_mask, alpha, beta, temperature=1.0, q_scale=q_scale
+    )
+    sampling = (
+        improved if temperature == 1.0 else apply_temperature(improved, legal_mask, temperature)
+    )
+    if temperature <= 0:
+        action = int(np.argmax(np.where(legal_mask > 0, sampling, -np.inf)))
+    else:
+        action = sample_action(sampling, rng)
+    return ActionChoice(
+        action=action,
+        policy=sampling.astype(np.float32),
+        value=expected_value(sampling, q_values, legal_mask),
+        q_values=np.asarray(q_values, dtype=np.float32),
+    )
+
+
 class NetworkAgent(Agent):
     """Acts with the shared network plus the policy-improvement operator."""
 
@@ -70,40 +104,29 @@ class NetworkAgent(Agent):
         beta: float = 1.0,
         temperature: float = 1.0,
         device: Optional[str] = None,
+        q_scale: float = 1.0,
     ) -> None:
         self.network = network
         self.alpha = alpha
         self.beta = beta
         self.temperature = temperature
         self.device = device
+        self.q_scale = q_scale
 
     def act(self, observation, flat_observation, legal_mask, rng) -> ActionChoice:
         logits, q_values = self.network.infer(flat_observation, device=self.device)
-
-        # The network's own (masked) policy is the reference for improvement.
-        reference = masked_softmax(logits, legal_mask, temperature=1.0)
-        improved = improved_policy_np(
-            q_values, reference, legal_mask, self.alpha, self.beta, temperature=1.0
-        )
-
-        # Exploration temperature is applied on top; at temperature 1.0 the
-        # sampling distribution and the stored behaviour policy are identical.
-        sampling = (
-            improved
-            if self.temperature == 1.0
-            else apply_temperature(improved, legal_mask, self.temperature)
-        )
-
-        if self.temperature <= 0:
-            action = int(np.argmax(np.where(legal_mask > 0, sampling, -np.inf)))
-        else:
-            action = sample_action(sampling, rng)
-
-        return ActionChoice(
-            action=action,
-            policy=sampling.astype(np.float32),
-            value=expected_value(sampling, q_values, legal_mask),
-            q_values=np.asarray(q_values, dtype=np.float32),
+        # Exploration temperature is applied on top of the improved policy; at
+        # temperature 1.0 the sampling distribution and the stored behaviour
+        # policy are identical.
+        return network_action_choice(
+            logits,
+            q_values,
+            legal_mask,
+            self.alpha,
+            self.beta,
+            self.temperature,
+            self.q_scale,
+            rng,
         )
 
 
@@ -137,8 +160,14 @@ def play_hand(
     collect: bool = True,
     store_next_obs: bool = True,
     max_decisions: int = 500,
+    collect_seats: Optional[Sequence[int]] = None,
 ) -> HandResult:
-    """Play one hand to completion and build per-seat training transitions."""
+    """Play one hand to completion and build per-seat training transitions.
+
+    ``collect_seats`` restricts collection to the seats played by the learner.
+    When fixed opponents share the table their decisions must not become
+    training data -- they were not drawn from the policy being improved.
+    """
     state = env.reset(dealer=dealer)
     num_players = state.num_players
     chains: Dict[int, List[_Step]] = {seat: [] for seat in range(num_players)}
@@ -164,7 +193,7 @@ def play_hand(
                 f"agent {agents[seat].name} chose illegal action {choice.action}"
             )
 
-        if collect:
+        if collect and (collect_seats is None or seat in collect_seats):
             chains[seat].append(
                 _Step(
                     observation=flat,
@@ -238,6 +267,59 @@ def build_transitions(
     return transitions
 
 
+def build_opponent_pool(
+    cfg: Config, network: PokerNet, device: Optional[str] = None
+) -> List[Agent]:
+    """Instantiate the configured fixed opponents.
+
+    Frozen learner snapshots ("checkpoint") are added separately by the
+    training loop via :func:`snapshot_agent`, since they change over time.
+    """
+    from evaluation.heuristic_agent import HEURISTIC_AGENTS
+    from evaluation.random_agent import BASELINE_AGENTS
+
+    pool: List[Agent] = []
+    for index, name in enumerate(cfg.train.opponent_pool):
+        if name == "checkpoint":
+            continue
+        if name in BASELINE_AGENTS:
+            pool.append(BASELINE_AGENTS[name]())
+        elif name in HEURISTIC_AGENTS:
+            pool.append(
+                HEURISTIC_AGENTS[name](
+                    seed=index, samples=cfg.train.opponent_heuristic_samples
+                )
+            )
+        else:
+            raise ValueError(f"unknown opponent: {name!r}")
+    return pool
+
+
+def snapshot_agent(cfg: Config, network: PokerNet, device: Optional[str] = None) -> Agent:
+    """A frozen copy of the current network, for league play."""
+    import copy
+
+    from model.network import build_network
+
+    frozen = build_network(cfg)
+    frozen.load_state_dict(copy.deepcopy(network.state_dict()))
+    frozen.eval()
+    for parameter in frozen.parameters():
+        parameter.requires_grad_(False)
+    if device:
+        frozen.to(device)
+    agent = NetworkAgent(
+        frozen,
+        alpha=cfg.train.alpha,
+        beta=cfg.train.beta,
+        temperature=cfg.train.sampling_temperature,
+        device=device,
+        q_scale=reward_scale(cfg.env),
+    )
+    agent.name = "checkpoint"
+    return agent
+
+
 class SelfPlayWorker:
     """Repeatedly plays hands with the shared network in every seat."""
 
@@ -248,6 +330,7 @@ class SelfPlayWorker:
         encoder: ObservationEncoder,
         device: Optional[str] = None,
         seed: int = 0,
+        opponent_pool: Optional[Sequence[Agent]] = None,
     ) -> None:
         self.cfg = cfg
         self.network = network
@@ -260,8 +343,60 @@ class SelfPlayWorker:
             beta=cfg.train.beta,
             temperature=cfg.train.sampling_temperature,
             device=device,
+            q_scale=reward_scale(cfg.env),
         )
         self.agents = [self.agent] * cfg.env.num_players
+        self.opponent_pool: List[Agent] = list(opponent_pool or [])
+        self.opponent_mix_prob = cfg.train.opponent_mix_prob
+
+    def add_snapshot(self, agent: Agent) -> None:
+        """Append a frozen self-snapshot, evicting the oldest past league_size."""
+        self.opponent_pool.append(agent)
+        snapshots = [a for a in self.opponent_pool if getattr(a, "name", "") == "checkpoint"]
+        for stale in snapshots[: -self.cfg.train.league_size]:
+            self.opponent_pool.remove(stale)
+
+    def _opponent_weights(self) -> List[float]:
+        """Sampling weights over the pool.
+
+        Fixed bots get weight 1.  Self-snapshots are weighted by recency:
+        the newest gets 1, the one before it `decay`, then `decay**2`, ...
+        so the learner mostly faces recent -- and therefore stronger --
+        versions of itself, while older ones stay in the mix to avoid
+        cycling against a single opponent.
+        """
+        decay = self.cfg.train.league_recency_decay
+        snapshots = [
+            i for i, a in enumerate(self.opponent_pool)
+            if getattr(a, "name", "") == "checkpoint"
+        ]
+        weights = [1.0] * len(self.opponent_pool)
+        for age, index in enumerate(reversed(snapshots)):  # age 0 = newest
+            weights[index] = decay ** age
+        return weights
+
+    def _choose_opponent(self) -> Agent:
+        weights = self._opponent_weights()
+        return self.rng.choices(self.opponent_pool, weights=weights, k=1)[0]
+
+    def _seat_agents(self) -> Tuple[List[Agent], List[int]]:
+        """Build a table, optionally seating opponents from the pool.
+
+        Pure self-play only ever shows the critic its own policy, so Q is
+        calibrated against the self-play population and nothing else.  Mixing in
+        fixed bots and frozen past checkpoints widens that distribution.
+        """
+        n = self.cfg.env.num_players
+        agents: List[Agent] = [self.agent] * n
+        learner_seats = list(range(n))
+        if self.opponent_pool and self.rng.random() < self.opponent_mix_prob:
+            num_opponents = self.rng.choice([1, 2])
+            seats = self.rng.sample(range(n), num_opponents)
+            agents = list(agents)
+            for seat in seats:
+                agents[seat] = self._choose_opponent()
+            learner_seats = [s for s in range(n) if s not in seats]
+        return agents, learner_seats
 
     def generate(self, num_hands: int) -> Tuple[List[Transition], dict]:
         transitions: List[Transition] = []
@@ -270,15 +405,21 @@ class SelfPlayWorker:
         reward_sums = np.zeros(self.cfg.env.num_players, dtype=np.float64)
         chip_sums = np.zeros(self.cfg.env.num_players, dtype=np.float64)
 
+        mixed_hands = 0
         for _ in range(num_hands):
+            agents, learner_seats = self._seat_agents()
+            mixed_hands += len(learner_seats) < self.cfg.env.num_players
+            for agent in agents:
+                agent.reset()
             result = play_hand(
                 self.env,
-                self.agents,
+                agents,
                 self.encoder,
                 self.rng,
                 gamma=self.cfg.train.gamma,
                 lam=self.cfg.train.lam,
                 store_next_obs=self.cfg.train.store_next_obs,
+                collect_seats=learner_seats,
             )
             transitions.extend(result.transitions)
             showdowns += int(result.went_to_showdown)
@@ -291,7 +432,187 @@ class SelfPlayWorker:
             "transitions": len(transitions),
             "decisions_per_hand": decisions / max(1, num_hands),
             "showdown_rate": showdowns / max(1, num_hands),
+            "mixed_opponent_rate": mixed_hands / max(1, num_hands),
             "mean_reward_per_seat": (reward_sums / max(1, num_hands)).tolist(),
             "mean_chips_per_seat": (chip_sums / max(1, num_hands)).tolist(),
         }
         return transitions, stats
+
+
+class BatchedSelfPlayWorker:
+    """Self-play that steps many hands in lockstep to batch the network.
+
+    Sequential self-play spends most of its time on single-row forward passes.
+    Here ``num_envs`` independent hands advance together: at each step every
+    hand that needs a *network* decision is encoded, the batch goes through the
+    network once, and the results are distributed back.
+
+    Semantics are identical to :class:`SelfPlayWorker` -- the hands are
+    independent, each carries its own RNG, and action selection goes through the
+    same :func:`network_action_choice`.  Only throughput changes.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        network: PokerNet,
+        encoder: ObservationEncoder,
+        device: Optional[str] = None,
+        seed: int = 0,
+        num_envs: int = 32,
+        opponent_pool: Optional[Sequence[Agent]] = None,
+    ) -> None:
+        self.cfg = cfg
+        self.network = network
+        self.encoder = encoder
+        self.device = device
+        self.num_envs = max(1, num_envs)
+        self.q_scale = reward_scale(cfg.env)
+        self.rng = random.Random(seed)
+        self.opponent_pool: List[Agent] = list(opponent_pool or [])
+        self.opponent_mix_prob = cfg.train.opponent_mix_prob
+
+        self.envs = [
+            PokerEnv(cfg.env, cfg.obs, seed=seed * 1000 + i) for i in range(self.num_envs)
+        ]
+        self.rngs = [random.Random(seed * 7919 + i) for i in range(self.num_envs)]
+
+    # Reuse the pool machinery from the sequential worker.
+    add_snapshot = SelfPlayWorker.add_snapshot
+    _opponent_weights = SelfPlayWorker._opponent_weights
+    _choose_opponent = SelfPlayWorker._choose_opponent
+    _seat_agents = SelfPlayWorker._seat_agents
+
+    @property
+    def agent(self) -> Agent:
+        """A sequential-style agent view, used by ``_seat_agents``."""
+        if not hasattr(self, "_agent"):
+            self._agent = NetworkAgent(
+                self.network,
+                alpha=self.cfg.train.alpha,
+                beta=self.cfg.train.beta,
+                temperature=self.cfg.train.sampling_temperature,
+                device=self.device,
+                q_scale=self.q_scale,
+            )
+        return self._agent
+
+    def generate(self, num_hands: int) -> Tuple[List[Transition], dict]:
+        cfg = self.cfg.train
+        transitions: List[Transition] = []
+        completed = showdowns = decisions = mixed = 0
+        reward_sums = np.zeros(self.cfg.env.num_players, dtype=np.float64)
+        chip_sums = np.zeros(self.cfg.env.num_players, dtype=np.float64)
+
+        # Never run more hands than were asked for: several envs can finish in
+        # the same step, so the number started is tracked explicitly rather than
+        # inferred from the number completed.
+        active_envs = min(self.num_envs, num_hands)
+        slots: List[Optional[dict]] = [None] * self.num_envs
+        for index in range(active_envs):
+            slots[index] = self._start_hand(index)
+        started = active_envs
+
+        while any(slot is not None for slot in slots):
+            pending = []  # (slot index, seat, observation, flat, mask)
+            for index, slot in enumerate(slots):
+                if slot is None:
+                    continue
+                env = self.envs[index]
+                if env.is_terminal:
+                    continue
+                seat = env.to_act
+                observation = env.get_observation(seat)
+                mask = observation["legal_action_mask"]
+                if mask.sum() <= 0:
+                    raise RuntimeError(f"seat {seat} has no legal actions")
+                pending.append(
+                    (index, seat, observation, self.encoder.encode_flat(observation), mask)
+                )
+
+            if not pending:
+                break
+
+            # One forward pass for every hand needing a network decision.
+            network_rows = [p for p in pending if p[1] in slots[p[0]]["learner_seats"]]
+            batched_outputs = {}
+            if network_rows:
+                observations = np.stack([row[3] for row in network_rows])
+                logits, q_values = self.network.infer_batch(observations, device=self.device)
+                for offset, row in enumerate(network_rows):
+                    batched_outputs[(row[0], row[1])] = (logits[offset], q_values[offset])
+
+            for index, seat, observation, flat, mask in pending:
+                slot = slots[index]
+                if (index, seat) in batched_outputs:
+                    logit_row, q_row = batched_outputs[(index, seat)]
+                    choice = network_action_choice(
+                        logit_row,
+                        q_row,
+                        mask,
+                        cfg.alpha,
+                        cfg.beta,
+                        cfg.sampling_temperature,
+                        self.q_scale,
+                        self.rngs[index],
+                    )
+                    slot["chains"][seat].append(
+                        _Step(
+                            observation=flat,
+                            legal_mask=mask.copy(),
+                            action=choice.action,
+                            policy=choice.policy.copy(),
+                            value=choice.value,
+                        )
+                    )
+                else:
+                    choice = slot["agents"][seat].act(
+                        observation, flat, mask, self.rngs[index]
+                    )
+                decisions += 1
+                self.envs[index].step(choice.action)
+
+            for index, slot in enumerate(slots):
+                if slot is None or not self.envs[index].is_terminal:
+                    continue
+                env = self.envs[index]
+                rewards = env.terminal_rewards()
+                transitions.extend(
+                    build_transitions(
+                        slot["chains"], rewards, cfg.gamma, cfg.lam, cfg.store_next_obs
+                    )
+                )
+                showdowns += int(env.state.went_to_showdown)
+                mixed += slot["mixed"]
+                reward_sums += rewards
+                chip_sums += env.chip_deltas()
+                completed += 1
+                if started < num_hands:
+                    slots[index] = self._start_hand(index)
+                    started += 1
+                else:
+                    slots[index] = None
+
+        stats = {
+            "hands": completed,
+            "transitions": len(transitions),
+            "decisions_per_hand": decisions / max(1, completed),
+            "showdown_rate": showdowns / max(1, completed),
+            "mixed_opponent_rate": mixed / max(1, completed),
+            "mean_reward_per_seat": (reward_sums / max(1, completed)).tolist(),
+            "mean_chips_per_seat": (chip_sums / max(1, completed)).tolist(),
+            "num_envs": self.num_envs,
+        }
+        return transitions, stats
+
+    def _start_hand(self, index: int) -> dict:
+        agents, learner_seats = self._seat_agents()
+        for agent in agents:
+            agent.reset()
+        self.envs[index].reset()
+        return {
+            "agents": agents,
+            "learner_seats": set(learner_seats),
+            "chains": {seat: [] for seat in range(self.cfg.env.num_players)},
+            "mixed": int(len(learner_seats) < self.cfg.env.num_players),
+        }

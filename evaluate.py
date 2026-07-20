@@ -51,7 +51,7 @@ def main() -> None:
         network = build_network(cfg).to(device)
         print("no checkpoint supplied: evaluating a randomly initialised network")
 
-    encoder = ObservationEncoder(cfg.obs)
+    encoder = ObservationEncoder.from_config(cfg)
     print(encoder.describe())
 
     results = evaluate_suite(

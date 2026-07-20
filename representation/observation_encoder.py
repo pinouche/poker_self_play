@@ -22,17 +22,23 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 
 from config import ObsConfig
-from environment.state import MAX_BOARD_CARDS, NUM_ACTIONS, NUM_BETTING_STREETS, NUM_HOLE_CARDS
+from environment.state import (
+    MAX_BOARD_CARDS,
+    NUM_ACTIONS,
+    NUM_BETTING_STREETS,
+    NUM_HOLE_CARDS,
+    action_space_for,
+)
 
 from .canonicalizer import (
     CARD_DIM,
     DERIVED_FEATURE_DIM,
     EQUITY_FEATURE_DIM,
-    HISTORY_EVENT_DIM,
     NUM_REL_PLAYERS,
     PLAYER_FEATURE_DIM,
     POSITION_FEATURE_DIM,
     POT_FEATURE_DIM,
+    history_event_dim,
 )
 
 GROUP_ORDER = ["cards", "board", "players", "pot_history", "position"]
@@ -76,7 +82,7 @@ class ObservationSpec:
         return "\n".join(lines)
 
 
-def build_spec(obs_cfg: ObsConfig) -> ObservationSpec:
+def build_spec(obs_cfg: ObsConfig, num_actions: int = NUM_ACTIONS) -> ObservationSpec:
     dims: Dict[str, int] = {
         "hole_cards": NUM_HOLE_CARDS * CARD_DIM,
         "board": MAX_BOARD_CARDS * CARD_DIM,
@@ -84,8 +90,8 @@ def build_spec(obs_cfg: ObsConfig) -> ObservationSpec:
         "players": NUM_REL_PLAYERS * PLAYER_FEATURE_DIM,
         "pot_features": POT_FEATURE_DIM,
         "position_features": POSITION_FEATURE_DIM,
-        "action_history": obs_cfg.action_history_length * HISTORY_EVENT_DIM,
-        "legal_action_mask": NUM_ACTIONS,
+        "action_history": obs_cfg.action_history_length * history_event_dim(num_actions),
+        "legal_action_mask": num_actions,
     }
     if obs_cfg.include_opponent_card_slots:
         dims["opponent_cards"] = (NUM_REL_PLAYERS - 1) * NUM_HOLE_CARDS * CARD_DIM
@@ -115,15 +121,21 @@ def build_spec(obs_cfg: ObsConfig) -> ObservationSpec:
         group_dims=group_dims,
         group_slices=group_slices,
         total_dim=cursor,
+        num_actions=num_actions,
     )
 
 
 class ObservationEncoder:
     """Turns observation dictionaries into fixed-shape arrays."""
 
-    def __init__(self, obs_cfg: ObsConfig) -> None:
+    def __init__(self, obs_cfg: ObsConfig, num_actions: int = NUM_ACTIONS) -> None:
         self.obs_cfg = obs_cfg
-        self.spec = build_spec(obs_cfg)
+        self.spec = build_spec(obs_cfg, num_actions)
+
+    @classmethod
+    def from_config(cls, cfg) -> "ObservationEncoder":
+        """Build an encoder whose action count matches the env configuration."""
+        return cls(cfg.obs, action_space_for(cfg.env).num_actions)
 
     @property
     def observation_dim(self) -> int:

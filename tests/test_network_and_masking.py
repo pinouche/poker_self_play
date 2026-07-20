@@ -49,14 +49,33 @@ def test_forward_returns_logits_and_q_values_per_action(batch_size):
     assert torch.isfinite(q_values).all()
 
 
-def test_q_head_is_bounded_when_configured():
+@pytest.mark.parametrize(
+    "reward_mode,expected_scale", [("binary", 1.0), ("normalized_chip_return", 2.0)]
+)
+def test_q_head_is_bounded_by_the_reward_range(reward_mode, expected_scale):
+    """The squash must reach the full return range, not an arbitrary +-1.
+
+    Three-handed normalised chip returns reach +2, so a plain tanh would make
+    the largest legitimate wins unrepresentable by the critic.
+    """
     cfg = small_config()
+    cfg.env.reward_mode = reward_mode
     network = build_network(cfg)
-    _, q_values = network(torch.randn(32, network.spec.total_dim) * 50)
-    assert q_values.min() >= -1.0 and q_values.max() <= 1.0
+    assert network.q_head.bounded
+    assert network.q_head.scale == expected_scale
+
+    _, q_values = network(torch.randn(64, network.spec.total_dim) * 50)
+    assert q_values.min() >= -expected_scale
+    assert q_values.max() <= expected_scale
 
 
-def test_unbounded_q_head_can_exceed_one():
+def test_unbounded_reward_modes_get_a_linear_q_head():
+    cfg = small_config()
+    cfg.env.reward_mode = "bb_normalized"
+    assert not build_network(cfg).q_head.bounded
+
+
+def test_bounded_q_can_be_overridden_explicitly():
     cfg = small_config()
     cfg.model.bounded_q = False
     network = build_network(cfg)
@@ -207,3 +226,54 @@ def test_observation_spec_matches_the_encoder():
     network = build_network(small_config())
     assert network.spec.total_dim == encoder.observation_dim
     assert sum(encoder.spec.group_dims.values()) == encoder.observation_dim
+
+
+# --- reward-scale invariance of the improvement operator -------------------
+def test_improvement_operator_is_invariant_to_reward_rescaling():
+    """alpha and beta must be dimensionless.
+
+    Rescaling the reward (and therefore Q) must not change the improved policy,
+    otherwise switching reward modes silently changes the operator temperature.
+    """
+    mask = np.ones(NUM_ACTIONS, dtype=np.float32)
+    reference = np_masked_softmax(np.linspace(-1, 1, NUM_ACTIONS), mask)
+    q_unit = np.linspace(-1.0, 1.0, NUM_ACTIONS)
+
+    base = improved_policy_np(q_unit, reference, mask, 0.5, 0.5, q_scale=1.0)
+    for factor in (10.0, 50.0, 1000.0):
+        scaled = improved_policy_np(
+            q_unit * factor, reference, mask, 0.5, 0.5, q_scale=factor
+        )
+        np.testing.assert_allclose(base, scaled, atol=1e-9)
+
+
+def test_unscaled_large_q_values_collapse_the_policy():
+    """Documents the failure the q_scale correction prevents."""
+    mask = np.ones(NUM_ACTIONS, dtype=np.float32)
+    reference = np_masked_softmax(np.zeros(NUM_ACTIONS), mask)
+    q_big = np.linspace(-50.0, 50.0, NUM_ACTIONS)
+
+    collapsed = improved_policy_np(q_big, reference, mask, 0.5, 0.5, q_scale=1.0)
+    healthy = improved_policy_np(q_big, reference, mask, 0.5, 0.5, q_scale=50.0)
+
+    assert collapsed.max() > 0.999          # effectively deterministic
+    assert healthy.max() < 0.6              # still a distribution
+    assert _entropy(healthy) > _entropy(collapsed) * 50
+
+
+def _entropy(p):
+    p = np.clip(np.asarray(p, dtype=np.float64), 1e-12, None)
+    return float(-(p * np.log(p)).sum())
+
+
+def test_reward_scale_matches_the_reward_mode():
+    from config import Config, reward_scale
+
+    cfg = Config()
+    assert reward_scale(cfg.env) == 1.0  # normalized_chip_return
+    cfg.env.reward_mode = "binary"
+    assert reward_scale(cfg.env) == 1.0
+    cfg.env.reward_mode = "bb_normalized"
+    assert reward_scale(cfg.env) == cfg.env.starting_stack / cfg.env.big_blind
+    cfg.env.reward_mode = "chip_return"
+    assert reward_scale(cfg.env) == float(cfg.env.starting_stack)

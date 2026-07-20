@@ -33,8 +33,13 @@ def improved_policy_np(
     alpha: float,
     beta: float,
     temperature: float = 1.0,
+    q_scale: float = 1.0,
 ) -> np.ndarray:
-    """Improved distribution for one state; illegal actions are exactly zero."""
+    """Improved distribution for one state; illegal actions are exactly zero.
+
+    ``q_scale`` divides Q before exponentiation so that ``alpha`` and ``beta``
+    are dimensionless and portable across reward modes.
+    """
     q_values = np.asarray(q_values, dtype=np.float64)
     legal = np.asarray(legal_mask, dtype=np.float64) > 0
     if not legal.any():
@@ -46,7 +51,7 @@ def improved_policy_np(
     log_reference = np.log(np.clip(reference, _LOG_EPS, None))
 
     denominator = max(alpha + beta, _LOG_EPS)
-    scores = (q_values + beta * log_reference) / denominator
+    scores = (q_values / max(q_scale, _LOG_EPS) + beta * log_reference) / denominator
 
     if temperature <= 0:
         out = np.zeros_like(scores)
@@ -68,6 +73,7 @@ def improved_policy_torch(
     legal_mask: torch.Tensor,
     alpha: float,
     beta: float,
+    q_scale: float = 1.0,
 ) -> torch.Tensor:
     """Batched improved policy target, shape ``[batch, action_count]``.
 
@@ -77,7 +83,7 @@ def improved_policy_torch(
     """
     denominator = max(alpha + beta, _LOG_EPS)
     log_reference = torch.clamp(log_reference_policy, min=-30.0)
-    scores = (q_values + beta * log_reference) / denominator
+    scores = (q_values / max(q_scale, _LOG_EPS) + beta * log_reference) / denominator
     scores = scores.masked_fill(legal_mask <= 0, NEG_INF)
     probs = torch.softmax(scores, dim=-1)
     probs = probs * (legal_mask > 0)

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import List, Optional, Tuple
+from functools import lru_cache
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .cards import Card
 
@@ -46,38 +47,129 @@ BOARD_CARDS_BY_STREET = {
 MAX_BOARD_CARDS = 5
 NUM_HOLE_CARDS = 2
 
-# --- fixed action space ---------------------------------------------------
+# --- action space ---------------------------------------------------------
+# The space is fixed for a given configuration -- the network needs a constant
+# output width -- but its *size* is derived from the number of bet and raise
+# sizings in EnvConfig rather than hardcoded.  Layout:
+#
+#     0 FOLD, 1 CHECK, 2 CALL, then the bet sizings, then the raise sizings,
+#     then ALL_IN last.
+#
+# With the default three bets and three raises this reproduces the documented
+# ten-action space exactly, ids included.
 FOLD = 0
 CHECK = 1
 CALL = 2
-BET_SMALL = 3
-BET_MEDIUM = 4
-BET_LARGE = 5
-RAISE_SMALL = 6
-RAISE_MEDIUM = 7
-RAISE_LARGE = 8
-ALL_IN = 9
+NUM_FIXED_LEADING_ACTIONS = 3
 
-NUM_ACTIONS = 10
+#: Names used when there are exactly three sizings, so the public API is stable.
+LEGACY_SIZING_NAMES = ("SMALL", "MEDIUM", "LARGE")
 
-ACTION_NAMES = [
-    "FOLD",
-    "CHECK",
-    "CALL",
-    "BET_SMALL",
-    "BET_MEDIUM",
-    "BET_LARGE",
-    "RAISE_SMALL",
-    "RAISE_MEDIUM",
-    "RAISE_LARGE",
-    "ALL_IN",
-]
 
-ACTION_ID_FROM_NAME = {name: i for i, name in enumerate(ACTION_NAMES)}
+@dataclass(frozen=True)
+class ActionSpace:
+    """Concrete action ids and names for one betting abstraction."""
 
-BET_ACTIONS = (BET_SMALL, BET_MEDIUM, BET_LARGE)
-RAISE_ACTIONS = (RAISE_SMALL, RAISE_MEDIUM, RAISE_LARGE)
-AGGRESSIVE_ACTIONS = BET_ACTIONS + RAISE_ACTIONS + (ALL_IN,)
+    bet_names: Tuple[str, ...]
+    raise_names: Tuple[str, ...]
+
+    @property
+    def num_bets(self) -> int:
+        return len(self.bet_names)
+
+    @property
+    def num_raises(self) -> int:
+        return len(self.raise_names)
+
+    @property
+    def num_actions(self) -> int:
+        return NUM_FIXED_LEADING_ACTIONS + self.num_bets + self.num_raises + 1
+
+    @property
+    def bet_ids(self) -> Tuple[int, ...]:
+        start = NUM_FIXED_LEADING_ACTIONS
+        return tuple(range(start, start + self.num_bets))
+
+    @property
+    def raise_ids(self) -> Tuple[int, ...]:
+        start = NUM_FIXED_LEADING_ACTIONS + self.num_bets
+        return tuple(range(start, start + self.num_raises))
+
+    @property
+    def all_in(self) -> int:
+        return self.num_actions - 1
+
+    @property
+    def aggressive_ids(self) -> Tuple[int, ...]:
+        return self.bet_ids + self.raise_ids + (self.all_in,)
+
+    @property
+    def names(self) -> Tuple[str, ...]:
+        return (
+            "FOLD",
+            "CHECK",
+            "CALL",
+            *self.bet_names,
+            *self.raise_names,
+            "ALL_IN",
+        )
+
+    def name(self, action_id: int) -> str:
+        return self.names[action_id]
+
+    def id_from_name(self, name: str) -> int:
+        return self.names.index(name)
+
+    @property
+    def name_to_id(self) -> Dict[str, int]:
+        return {name: i for i, name in enumerate(self.names)}
+
+
+def _sizing_names(prefix: str, sizings: Sequence[float], percent: bool) -> Tuple[str, ...]:
+    """SMALL/MEDIUM/LARGE for the classic three, otherwise size-derived names."""
+    if len(sizings) == 3:
+        return tuple(f"{prefix}_{suffix}" for suffix in LEGACY_SIZING_NAMES)
+    if percent:
+        return tuple(f"{prefix}_{int(round(value * 100))}" for value in sizings)
+    return tuple(f"{prefix}_{value:g}X".replace(".", "_") for value in sizings)
+
+
+def build_action_space(
+    bet_fractions: Sequence[float], raise_multipliers: Sequence[float]
+) -> ActionSpace:
+    return ActionSpace(
+        bet_names=_sizing_names("BET", bet_fractions, percent=True),
+        raise_names=_sizing_names("RAISE", raise_multipliers, percent=False),
+    )
+
+
+@lru_cache(maxsize=32)
+def _action_space_cached(bet_fractions: tuple, raise_multipliers: tuple) -> ActionSpace:
+    return build_action_space(bet_fractions, raise_multipliers)
+
+
+def action_space_for(env_cfg) -> ActionSpace:
+    """Action space implied by an :class:`~config.EnvConfig` (memoised)."""
+    return _action_space_cached(
+        tuple(env_cfg.bet_fractions), tuple(env_cfg.raise_multipliers)
+    )
+
+
+#: The default space, used wherever no configuration is in scope.  Identical to
+#: the documented ten-action layout.
+DEFAULT_ACTION_SPACE = build_action_space((0.33, 0.66, 1.00), (2.0, 3.0, 4.0))
+
+NUM_ACTIONS = DEFAULT_ACTION_SPACE.num_actions
+ACTION_NAMES = list(DEFAULT_ACTION_SPACE.names)
+ACTION_ID_FROM_NAME = DEFAULT_ACTION_SPACE.name_to_id
+
+BET_SMALL, BET_MEDIUM, BET_LARGE = DEFAULT_ACTION_SPACE.bet_ids
+RAISE_SMALL, RAISE_MEDIUM, RAISE_LARGE = DEFAULT_ACTION_SPACE.raise_ids
+ALL_IN = DEFAULT_ACTION_SPACE.all_in
+
+BET_ACTIONS = DEFAULT_ACTION_SPACE.bet_ids
+RAISE_ACTIONS = DEFAULT_ACTION_SPACE.raise_ids
+AGGRESSIVE_ACTIONS = DEFAULT_ACTION_SPACE.aggressive_ids
 
 
 @dataclass
@@ -139,7 +231,10 @@ class GameState:
     initial_stacks: List[int] = field(default_factory=list)
     hand_over: bool = False
     went_to_showdown: bool = False
-    payouts: List[int] = field(default_factory=list)
+    payouts: List[float] = field(default_factory=list)
+    # True when the pot was settled on the expected value over remaining
+    # boards rather than on the single board that was dealt.
+    expected_value_runout: bool = False
 
     # --- derived quantities ------------------------------------------------
     @property

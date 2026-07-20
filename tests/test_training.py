@@ -204,3 +204,41 @@ def test_reference_policy_modes_both_run():
     cfg.train.reference_policy = "nonsense"
     with pytest.raises(ValueError):
         Trainer(cfg, build_network(cfg), device="cpu").train_step(batch)
+
+
+def test_bb_normalized_training_stays_conditioned():
+    """Large-magnitude rewards must not blow up the Q loss or kill exploration.
+
+    Without normalising Q by the reward scale this configuration collapses:
+    entropy -> 0.13 and the Q term outweighs the policy term by ~50x.
+    """
+    cfg = small_config()
+    cfg.env.reward_mode = "bb_normalized"
+    network = build_network(cfg)
+    encoder = ObservationEncoder(cfg.obs)
+    worker = SelfPlayWorker(cfg, network, encoder, seed=7)
+    buffer = ReplayBuffer(
+        capacity=4000, observation_dim=encoder.observation_dim, num_actions=NUM_ACTIONS
+    )
+    while len(buffer) < 512:
+        transitions, _ = worker.generate(40)
+        buffer.extend(transitions)
+
+    trainer = Trainer(cfg, network, device="cpu")
+    assert trainer.q_scale == cfg.env.starting_stack / cfg.env.big_blind
+
+    rng = np.random.default_rng(0)
+    for _ in range(30):
+        metrics = trainer.train_step(buffer.sample(128, rng))
+        assert np.isfinite(metrics["loss"])
+    # Q and policy terms stay within an order of magnitude of each other, and
+    # the policy has not collapsed to a point mass.
+    assert metrics["q_loss"] < 10 * metrics["policy_loss"]
+    assert metrics["entropy"] > 0.5
+
+
+def test_q_scale_is_one_for_already_normalized_modes():
+    for mode in ("binary", "normalized_chip_return"):
+        cfg = small_config()
+        cfg.env.reward_mode = mode
+        assert Trainer(cfg, build_network(cfg), device="cpu").q_scale == 1.0

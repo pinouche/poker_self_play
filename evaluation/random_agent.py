@@ -14,7 +14,7 @@ from typing import Dict
 
 import numpy as np
 
-from environment.state import ALL_IN, CALL, CHECK, FOLD, NUM_ACTIONS
+from environment.state import CALL, CHECK, FOLD
 from training.self_play import ActionChoice, Agent
 
 
@@ -27,7 +27,7 @@ def _uniform_over_legal(legal_mask: np.ndarray) -> np.ndarray:
 
 
 def _choose(probs: np.ndarray, rng: random.Random) -> int:
-    return int(rng.choices(range(NUM_ACTIONS), weights=probs.tolist(), k=1)[0])
+    return int(rng.choices(range(len(probs)), weights=probs.tolist(), k=1)[0])
 
 
 class RandomAgent(Agent):
@@ -50,7 +50,7 @@ class CallingStationAgent(Agent):
     name = "calling_station"
 
     def act(self, observation, flat_observation, legal_mask, rng) -> ActionChoice:
-        probs = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        probs = np.zeros(len(legal_mask), dtype=np.float32)
         for action in (CHECK, CALL):
             if legal_mask[action]:
                 probs[action] = 1.0
@@ -65,8 +65,9 @@ class AlwaysFoldAgent(Agent):
     name = "always_fold"
 
     def act(self, observation, flat_observation, legal_mask, rng) -> ActionChoice:
-        probs = np.zeros(NUM_ACTIONS, dtype=np.float32)
-        for action in (FOLD, CHECK, CALL, ALL_IN):
+        probs = np.zeros(len(legal_mask), dtype=np.float32)
+        all_in = len(legal_mask) - 1  # ALL_IN is always the last action
+        for action in (FOLD, CHECK, CALL, all_in):
             if legal_mask[action]:
                 probs[action] = 1.0
                 return ActionChoice(action=action, policy=probs, value=0.0)

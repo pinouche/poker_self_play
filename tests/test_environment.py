@@ -303,15 +303,16 @@ def test_a_board_that_plays_splits_three_ways():
 
 
 def test_chips_are_conserved_over_many_random_hands():
+    """Zero-sum to floating point: EV runouts settle pots on expectations."""
     env = make_env()
     rng = random.Random(11)
     for _ in range(200):
         env.reset()
         while not env.is_terminal:
             env.step(rng.choice(env.legal_actions().legal_ids()))
-        assert sum(env.chip_deltas()) == 0
+        assert sum(env.chip_deltas()) == pytest.approx(0.0, abs=1e-6)
         for player in env.state.players:
-            assert player.stack >= 0
+            assert player.stack >= -1e-9
 
 
 def test_no_player_can_bet_more_than_their_stack():
@@ -492,3 +493,77 @@ def test_unknown_reward_mode_is_rejected():
     env.step(FOLD)
     with pytest.raises(ValueError):
         env.terminal_rewards()
+
+
+# --- all-in EV runouts -----------------------------------------------------
+def test_ev_runout_is_unbiased_and_lower_variance():
+    """Same expectation as dealing one board, much less noise.
+
+    That noise flows straight into the Q targets, so halving it is worth as
+    much as quadrupling the number of hands.
+    """
+    import numpy as np
+
+    results = {}
+    for label, enabled in (("concrete", False), ("ev", True)):
+        env = make_env(all_in_ev_runout=enabled)
+        rng = random.Random(3)
+        rewards = []
+        for _ in range(800):
+            env.reset()
+            while not env.is_terminal:
+                env.step(rng.choice(env.legal_actions().legal_ids()))
+            rewards.extend(env.terminal_rewards())
+        results[label] = np.array(rewards)
+
+    assert results["ev"].mean() == pytest.approx(0.0, abs=0.05)
+    assert results["concrete"].mean() == pytest.approx(0.0, abs=0.05)
+    assert results["ev"].std() < 0.75 * results["concrete"].std()
+
+
+def test_ev_runout_still_conserves_chips():
+    env = make_env(all_in_ev_runout=True)
+    rng = random.Random(9)
+    settled = 0
+    for _ in range(200):
+        env.reset()
+        while not env.is_terminal:
+            env.step(rng.choice(env.legal_actions().legal_ids()))
+        assert sum(env.chip_deltas()) == pytest.approx(0.0, abs=1e-6)
+        settled += env.state.expected_value_runout
+    assert settled > 0, "no hand reached an all-in runout"
+
+
+def test_preset_boards_always_take_the_concrete_path():
+    """Scripted hands must stay exactly reproducible."""
+    env = make_env(all_in_ev_runout=True)
+    env.reset(
+        dealer=0,
+        stacks=[100, 100, 100],
+        hole_cards=[cards("Ac", "Ad"), cards("Kc", "Kd"), cards("Qc", "Qd")],
+        board=cards("Ah", "7d", "2s", "3c", "9h"),
+    )
+    env.step(ALL_IN); env.step(CALL); env.step(CALL)
+    assert not env.state.expected_value_runout
+    assert env.chip_deltas() == [200, -100, -100]
+
+
+def test_ev_runout_pays_the_exact_split_on_the_river():
+    """One card to come is enumerated exactly, not sampled."""
+    env = make_env(all_in_ev_runout=True, all_in_ev_exact_threshold=100)
+    env.reset(dealer=0, stacks=[100, 100, 100])
+    # Drive to an all-in on the turn so a single card remains.
+    env.step(ALL_IN); env.step(CALL); env.step(CALL)
+    assert env.is_terminal
+    assert sum(env.chip_deltas()) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_ev_runout_can_be_disabled():
+    env = make_env(all_in_ev_runout=False)
+    rng = random.Random(9)
+    for _ in range(60):
+        env.reset()
+        while not env.is_terminal:
+            env.step(rng.choice(env.legal_actions().legal_ids()))
+        assert not env.state.expected_value_runout
+        assert sum(env.chip_deltas()) == pytest.approx(0.0, abs=1e-6)

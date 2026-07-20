@@ -37,7 +37,7 @@ def test_one_hundred_hands_of_self_play_complete_without_errors():
     for _ in range(100):
         result = play_hand(env, agents, encoder, rng, gamma=cfg.train.gamma, lam=cfg.train.lam)
         assert result.num_decisions > 0
-        assert sum(result.chip_deltas) == 0
+        assert sum(result.chip_deltas) == pytest.approx(0.0, abs=1e-6)
         assert len(result.transitions) == result.num_decisions
         hands += 1
     assert hands == 100
@@ -63,7 +63,7 @@ def test_mixed_agents_can_share_a_table():
     table = [agents[0], RandomAgent(), CallingStationAgent()]
     for _ in range(25):
         result = play_hand(env, table, encoder, rng, collect=False)
-        assert sum(result.chip_deltas) == 0
+        assert sum(result.chip_deltas) == pytest.approx(0.0, abs=1e-6)
 
 
 # --- perspective correctness ----------------------------------------------
@@ -154,6 +154,7 @@ def test_chosen_actions_are_always_legal():
 def test_binary_rewards_sum_correctly_for_a_three_player_pot():
     """One winner means (+1, -1, -1); a seat that risked nothing scores 0."""
     cfg, env, encoder, agents = make_pieces(seed=10)
+    env.cfg.reward_mode = "binary"
     rng = random.Random(10)
 
     for _ in range(80):
@@ -164,3 +165,260 @@ def test_binary_rewards_sum_correctly_for_a_three_player_pot():
         # Reward sign must agree with the chip outcome for every seat.
         for reward, chips in zip(result.rewards, result.chip_deltas):
             assert reward == float((chips > 0) - (chips < 0))
+
+
+def test_default_normalized_rewards_track_chips_and_stay_in_range():
+    cfg, env, encoder, agents = make_pieces(seed=11)
+    assert env.cfg.reward_mode == "normalized_chip_return"
+    rng = random.Random(11)
+
+    for _ in range(60):
+        result = play_hand(env, agents, encoder, rng, collect=False)
+        for seat, (reward, chips) in enumerate(zip(result.rewards, result.chip_deltas)):
+            # Reward is a strictly increasing function of chips won.
+            assert reward == pytest.approx(chips / env.state.initial_stacks[seat])
+            assert -1.0 <= reward <= 2.0
+
+
+# --- mixed-opponent training ----------------------------------------------
+def test_collect_seats_restricts_which_transitions_are_stored():
+    """Fixed opponents share the table but must never become training data."""
+    cfg, env, encoder, agents = make_pieces(seed=20)
+    rng = random.Random(20)
+    table = [agents[0], RandomAgent(), CallingStationAgent()]
+
+    for _ in range(30):
+        result = play_hand(env, table, encoder, rng, collect_seats=[0])
+        seats = {t.player_perspective for t in result.transitions}
+        assert seats <= {0}
+
+
+def test_opponent_pool_is_built_from_names():
+    from training.self_play import build_opponent_pool
+
+    cfg = small_config()
+    cfg.train.opponent_pool = ("random", "calling_station", "tight_aggressive", "checkpoint")
+    pool = build_opponent_pool(cfg, build_network(cfg))
+    # "checkpoint" is added by the training loop, not here.
+    assert [a.name for a in pool] == ["random", "calling_station", "tight_aggressive"]
+
+
+def test_unknown_opponent_name_is_rejected():
+    from training.self_play import build_opponent_pool
+
+    cfg = small_config()
+    cfg.train.opponent_pool = ("nonexistent_bot",)
+    with pytest.raises(ValueError):
+        build_opponent_pool(cfg, build_network(cfg))
+
+
+def test_snapshot_agent_is_frozen_and_independent():
+    import torch
+
+    from training.self_play import snapshot_agent
+
+    cfg = small_config()
+    network = build_network(cfg)
+    frozen = snapshot_agent(cfg, network)
+
+    assert all(not p.requires_grad for p in frozen.network.parameters())
+
+    observation = np.zeros(network.spec.total_dim, dtype=np.float32)
+    before = frozen.network.infer(observation)[1].copy()
+    with torch.no_grad():  # mutate the live network
+        for parameter in network.parameters():
+            parameter.add_(1.0)
+    after = frozen.network.infer(observation)[1]
+    np.testing.assert_array_equal(before, after)
+
+
+def test_worker_with_a_pool_only_collects_learner_transitions():
+    from training.self_play import build_opponent_pool
+
+    cfg = small_config()
+    cfg.train.opponent_pool = ("calling_station", "random")
+    cfg.train.opponent_mix_prob = 1.0  # always seat opponents
+    network = build_network(cfg)
+    encoder = ObservationEncoder(cfg.obs)
+    pool = build_opponent_pool(cfg, network)
+    worker = SelfPlayWorker(cfg, network, encoder, seed=21, opponent_pool=pool)
+
+    # Per hand, the learner holds only the seats not taken by the pool.  (Across
+    # many hands it still visits every seat, so this must be checked per hand.)
+    for _ in range(40):
+        seated, learner_seats = worker._seat_agents()
+        assert 1 <= len(learner_seats) <= 2
+        assert learner_seats == [s for s, a in enumerate(seated) if a is worker.agent]
+        for seat, agent in enumerate(seated):
+            if seat not in learner_seats:
+                assert agent in pool
+
+    transitions, stats = worker.generate(30)
+    assert stats["mixed_opponent_rate"] == 1.0
+    assert transitions, "the learner still occupies at least one seat"
+
+
+def test_pure_self_play_remains_the_default():
+    cfg = small_config()
+    network = build_network(cfg)
+    worker = SelfPlayWorker(cfg, network, ObservationEncoder(cfg.obs), seed=22)
+    _, stats = worker.generate(10)
+    assert stats["mixed_opponent_rate"] == 0.0
+
+
+# --- recency-weighted league ----------------------------------------------
+def _snapshot(cfg, network, tag):
+    from training.self_play import snapshot_agent
+
+    agent = snapshot_agent(cfg, network)
+    agent.tag = tag
+    return agent
+
+
+def test_league_evicts_the_oldest_snapshots():
+    cfg = small_config()
+    cfg.train.league_size = 3
+    network = build_network(cfg)
+    worker = SelfPlayWorker(cfg, network, ObservationEncoder(cfg.obs), seed=0)
+
+    for i in range(6):
+        worker.add_snapshot(_snapshot(cfg, network, i))
+    assert [a.tag for a in worker.opponent_pool] == [3, 4, 5]
+
+
+def test_recent_snapshots_are_sampled_more_often():
+    import collections
+
+    cfg = small_config()
+    cfg.train.opponent_pool = ("checkpoint",)
+    cfg.train.league_size = 4
+    cfg.train.league_recency_decay = 0.5
+    network = build_network(cfg)
+    worker = SelfPlayWorker(cfg, network, ObservationEncoder(cfg.obs), seed=0)
+    for i in range(4):
+        worker.add_snapshot(_snapshot(cfg, network, i))
+
+    # Geometric in age: newest 1, then 1/2, 1/4, 1/8.
+    assert worker._opponent_weights() == pytest.approx([0.125, 0.25, 0.5, 1.0])
+
+    counts = collections.Counter(worker._choose_opponent().tag for _ in range(4000))
+    shares = [counts[i] / 4000 for i in range(4)]
+    assert shares == sorted(shares), "share must increase with recency"
+    assert shares[3] > 0.45 and shares[0] < 0.12
+
+
+def test_uniform_league_when_decay_is_one():
+    cfg = small_config()
+    cfg.train.league_size = 4
+    cfg.train.league_recency_decay = 1.0
+    network = build_network(cfg)
+    worker = SelfPlayWorker(cfg, network, ObservationEncoder(cfg.obs), seed=0)
+    for i in range(4):
+        worker.add_snapshot(_snapshot(cfg, network, i))
+    assert worker._opponent_weights() == pytest.approx([1.0, 1.0, 1.0, 1.0])
+
+
+def test_fixed_bots_keep_unit_weight_alongside_snapshots():
+    from evaluation.random_agent import RandomAgent
+    from training.self_play import build_opponent_pool
+
+    cfg = small_config()
+    cfg.train.opponent_pool = ("random", "calling_station", "checkpoint")
+    cfg.train.league_recency_decay = 0.5
+    network = build_network(cfg)
+    worker = SelfPlayWorker(
+        cfg, network, ObservationEncoder(cfg.obs), seed=0,
+        opponent_pool=build_opponent_pool(cfg, network),
+    )
+    worker.add_snapshot(_snapshot(cfg, network, 0))
+    worker.add_snapshot(_snapshot(cfg, network, 1))
+    # random, calling_station stay at 1.0; snapshots decay by age.
+    assert worker._opponent_weights() == pytest.approx([1.0, 1.0, 0.5, 1.0])
+    assert isinstance(worker.opponent_pool[0], RandomAgent)
+
+
+# --- batched self-play -----------------------------------------------------
+def _fresh_env(cfg, seed):
+    from environment.poker_env import PokerEnv
+
+    return PokerEnv(cfg.env, cfg.obs, seed=seed)
+
+
+def test_batched_matches_sequential_under_a_deterministic_policy():
+    """Batching must change throughput, never behaviour.
+
+    At temperature 0 action selection is an argmax, so no RNG is consumed and
+    the two code paths must agree transition for transition on the same deal.
+    """
+    from training.self_play import BatchedSelfPlayWorker
+
+    cfg = small_config()
+    cfg.train.sampling_temperature = 0.0
+    network = build_network(cfg)
+    encoder = ObservationEncoder(cfg.obs)
+
+    sequential = SelfPlayWorker(cfg, network, encoder, seed=0)
+    sequential.env = _fresh_env(cfg, 0)
+    expected, _ = sequential.generate(20)
+
+    batched = BatchedSelfPlayWorker(cfg, network, encoder, seed=0, num_envs=1)
+    batched.envs = [_fresh_env(cfg, 0)]
+    actual, _ = batched.generate(20)
+
+    assert len(actual) == len(expected)
+    for a, b in zip(expected, actual):
+        assert a.action == b.action
+        assert a.player_perspective == b.player_perspective
+        assert a.q_target == pytest.approx(b.q_target)
+        np.testing.assert_allclose(a.observation, b.observation)
+
+
+@pytest.mark.parametrize("num_envs", [1, 8, 32])
+def test_batched_worker_produces_well_formed_transitions(num_envs):
+    from training.self_play import BatchedSelfPlayWorker
+
+    cfg = small_config()
+    network = build_network(cfg)
+    worker = BatchedSelfPlayWorker(
+        cfg, network, ObservationEncoder(cfg.obs), seed=1, num_envs=num_envs
+    )
+    transitions, stats = worker.generate(24)
+
+    assert stats["hands"] == 24
+    assert stats["num_envs"] == num_envs
+    assert stats["transitions"] == len(transitions)
+    assert sum(stats["mean_chips_per_seat"]) == pytest.approx(0.0, abs=1e-6)
+    for transition in transitions:
+        assert transition.legal_action_mask[transition.action] == 1.0
+        assert transition.old_policy.sum() == pytest.approx(1.0, abs=1e-5)
+
+
+def test_batched_worker_respects_the_requested_hand_count():
+    from training.self_play import BatchedSelfPlayWorker
+
+    cfg = small_config()
+    worker = BatchedSelfPlayWorker(
+        cfg, build_network(cfg), ObservationEncoder(cfg.obs), seed=2, num_envs=16
+    )
+    # Fewer hands than envs must not overshoot.
+    assert worker.generate(5)[1]["hands"] == 5
+
+
+def test_batched_worker_supports_the_opponent_pool():
+    from training.self_play import BatchedSelfPlayWorker, build_opponent_pool
+
+    cfg = small_config()
+    cfg.train.opponent_pool = ("calling_station",)
+    cfg.train.opponent_mix_prob = 1.0
+    network = build_network(cfg)
+    worker = BatchedSelfPlayWorker(
+        cfg,
+        network,
+        ObservationEncoder(cfg.obs),
+        seed=3,
+        num_envs=8,
+        opponent_pool=build_opponent_pool(cfg, network),
+    )
+    transitions, stats = worker.generate(16)
+    assert stats["mixed_opponent_rate"] == 1.0
+    assert transitions

@@ -33,14 +33,14 @@ from environment.state import (  # noqa: F401  (re-exported)
 NEG_INF = -1e9
 
 
-def action_one_hot(action_id: int) -> np.ndarray:
-    vec = np.zeros(NUM_ACTIONS, dtype=np.float32)
+def action_one_hot(action_id: int, num_actions: int = NUM_ACTIONS) -> np.ndarray:
+    vec = np.zeros(num_actions, dtype=np.float32)
     vec[action_id] = 1.0
     return vec
 
 
-def mask_from_ids(ids: Sequence[int]) -> np.ndarray:
-    mask = np.zeros(NUM_ACTIONS, dtype=np.float32)
+def mask_from_ids(ids: Sequence[int], num_actions: int = NUM_ACTIONS) -> np.ndarray:
+    mask = np.zeros(num_actions, dtype=np.float32)
     for i in ids:
         mask[i] = 1.0
     return mask
@@ -88,13 +88,18 @@ def sample_action(probs: np.ndarray, rng) -> int:
     if total <= 0:
         raise ValueError("cannot sample from an all-zero distribution")
     probs = probs / total
-    return int(rng.choices(range(NUM_ACTIONS), weights=probs.tolist(), k=1)[0])
+    return int(rng.choices(range(len(probs)), weights=probs.tolist(), k=1)[0])
 
 
-def probs_to_dict(probs: Sequence[float], mask: Optional[Sequence[float]] = None) -> Dict[str, float]:
+def probs_to_dict(
+    probs: Sequence[float],
+    mask: Optional[Sequence[float]] = None,
+    names: Optional[Sequence[str]] = None,
+) -> Dict[str, float]:
     """Public-API view: every action named, illegal ones exactly 0.0."""
+    names = names if names is not None else ACTION_NAMES
     out: Dict[str, float] = {}
-    for i, name in enumerate(ACTION_NAMES):
+    for i, name in enumerate(names):
         if mask is not None and not mask[i]:
             out[name] = 0.0
         else:
@@ -103,14 +108,19 @@ def probs_to_dict(probs: Sequence[float], mask: Optional[Sequence[float]] = None
 
 
 def q_values_to_dict(
-    q_values: Sequence[float], mask: Sequence[float]
+    q_values: Sequence[float],
+    mask: Sequence[float],
+    names: Optional[Sequence[str]] = None,
 ) -> Dict[str, Optional[float]]:
     """Public-API view: illegal actions report ``None`` rather than a number."""
+    names = names if names is not None else ACTION_NAMES
     return {
-        name: (float(q_values[i]) if mask[i] else None)
-        for i, name in enumerate(ACTION_NAMES)
+        name: (float(q_values[i]) if mask[i] else None) for i, name in enumerate(names)
     }
 
 
-def legal_action_names(mask: Sequence[float]) -> List[str]:
-    return [name for i, name in enumerate(ACTION_NAMES) if mask[i]]
+def legal_action_names(
+    mask: Sequence[float], names: Optional[Sequence[str]] = None
+) -> List[str]:
+    names = names if names is not None else ACTION_NAMES
+    return [name for i, name in enumerate(names) if mask[i]]

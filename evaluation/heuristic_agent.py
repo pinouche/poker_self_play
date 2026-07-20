@@ -18,26 +18,34 @@ from typing import Dict, Optional, Sequence
 import numpy as np
 
 from environment.state import (
-    ALL_IN,
-    BET_LARGE,
-    BET_MEDIUM,
-    BET_SMALL,
     CALL,
     CHECK,
+    DEFAULT_ACTION_SPACE,
     FOLD,
-    NUM_ACTIONS,
-    RAISE_LARGE,
-    RAISE_MEDIUM,
-    RAISE_SMALL,
+    ActionSpace,
 )
 from representation.canonicalizer import estimate_equity
 from training.self_play import ActionChoice, Agent
 
-VALUE_RAISE = (RAISE_MEDIUM, RAISE_SMALL, BET_MEDIUM, BET_SMALL, CALL, CHECK)
-BIG_RAISE = (RAISE_LARGE, RAISE_MEDIUM, BET_LARGE, BET_MEDIUM, CALL, CHECK)
-SMALL_BET = (BET_SMALL, BET_MEDIUM, CHECK, CALL)
-PASSIVE = (CHECK, CALL, FOLD)
-GIVE_UP = (CHECK, FOLD, CALL)
+
+def _preferences(space: ActionSpace) -> Dict[str, Sequence[int]]:
+    """Preference orders expressed over whatever sizings the space provides.
+
+    The bot thinks in terms of "biggest available raise" rather than fixed
+    action ids, so it keeps working when the bet abstraction is made finer.
+    """
+    bets, raises = space.bet_ids, space.raise_ids
+    big_bets = tuple(reversed(bets))          # largest first
+    big_raises = tuple(reversed(raises))
+    mid = lambda ids: ids[len(ids) // 2 :][::-1] + ids[: len(ids) // 2][::-1]
+    return {
+        "big_raise": (*big_raises, *big_bets, CALL, CHECK),
+        "value_raise": (*mid(raises), *mid(bets), CALL, CHECK),
+        "small_bet": (*bets, CHECK, CALL),
+        "passive": (CHECK, CALL, FOLD),
+        "give_up": (CHECK, FOLD, CALL),
+        "fallback": (CHECK, CALL, FOLD, *bets, *raises, space.all_in),
+    }
 
 
 class HeuristicAgent(Agent):
@@ -56,13 +64,28 @@ class HeuristicAgent(Agent):
         aggression: float = 0.0,
         seed: int = 0,
         name: Optional[str] = None,
+        action_space: Optional[ActionSpace] = None,
     ) -> None:
+        self.space = action_space or DEFAULT_ACTION_SPACE
+        self.preferences = _preferences(self.space)
         self.samples = samples
         self.tightness = tightness
         self.aggression = aggression
+        self.seed = seed
         self.rng = random.Random(seed)
         if name:
             self.name = name
+
+    def reset(self) -> None:
+        """Restore the internal RNG so a hand replays identically.
+
+        This agent draws from its own RNG (bluff frequency and the Monte-Carlo
+        equity rollouts), so without a reset the same deal played at different
+        points in a sequence gives different decisions.  Duplicate-deal scoring
+        depends on the opponent being reproducible, otherwise the pairing it
+        buys is destroyed.
+        """
+        self.rng = random.Random(self.seed)
 
     # --- helpers -----------------------------------------------------------
     @staticmethod
@@ -77,7 +100,7 @@ class HeuristicAgent(Agent):
         if action is not None:
             return action
         # Fall back to anything legal; ALL_IN last so we do not stack off blindly.
-        for action in (CHECK, CALL, FOLD, BET_SMALL, RAISE_SMALL, ALL_IN):
+        for action in self.preferences["fallback"]:
             if legal_mask[action]:
                 return int(action)
         return int(np.flatnonzero(legal_mask)[0])
@@ -91,7 +114,9 @@ class HeuristicAgent(Agent):
         to_call = meta["to_call"]
         pot = meta["pot"]
 
-        equity = estimate_equity(hole, board, opponents, self.samples, self.rng)
+        # No rng argument: this takes the memoised, suit-isomorphic path.
+        # Bluff frequency below still uses self.rng.
+        equity = estimate_equity(hole, board, opponents, self.samples)
         pot_odds = to_call / float(pot + to_call) if to_call > 0 else 0.0
 
         if to_call <= 0:
@@ -99,7 +124,7 @@ class HeuristicAgent(Agent):
         else:
             action = self._choose_facing_bet(equity, pot_odds, legal_mask)
 
-        policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        policy = np.zeros(len(legal_mask), dtype=np.float32)
         policy[action] = 1.0
         return ActionChoice(action=action, policy=policy, value=float(2.0 * equity - 1.0))
 
@@ -107,40 +132,44 @@ class HeuristicAgent(Agent):
         strong = 0.70 + self.tightness - self.aggression
         decent = 0.55 + self.tightness - self.aggression
         if equity >= strong:
-            return self._pick(BIG_RAISE, legal_mask)
+            return self._pick(self.preferences["big_raise"], legal_mask)
         if equity >= decent:
-            return self._pick(VALUE_RAISE, legal_mask)
+            return self._pick(self.preferences["value_raise"], legal_mask)
         if equity >= 0.45 + self.tightness and self.rng.random() < 0.2 + self.aggression:
-            return self._pick(SMALL_BET, legal_mask)
-        return self._pick(PASSIVE, legal_mask)
+            return self._pick(self.preferences["small_bet"], legal_mask)
+        return self._pick(self.preferences["passive"], legal_mask)
 
     def _choose_facing_bet(
         self, equity: float, pot_odds: float, legal_mask: np.ndarray
     ) -> int:
         if equity >= 0.80 + self.tightness - self.aggression:
-            return self._pick(BIG_RAISE, legal_mask)
+            return self._pick(self.preferences["big_raise"], legal_mask)
         if equity >= 0.65 + self.tightness - self.aggression:
-            return self._pick(VALUE_RAISE, legal_mask)
+            return self._pick(self.preferences["value_raise"], legal_mask)
         # Call whenever the price is right, with a margin scaled by tightness.
         if equity >= pot_odds + 0.02 + self.tightness:
             return self._pick((CALL, CHECK, FOLD), legal_mask)
-        return self._pick(GIVE_UP, legal_mask)
+        return self._pick(self.preferences["give_up"], legal_mask)
 
 
-def tight_aggressive(seed: int = 0, samples: int = 60) -> HeuristicAgent:
+def tight_aggressive(seed: int = 0, samples: int = 60, action_space=None) -> HeuristicAgent:
     return HeuristicAgent(
-        samples=samples, tightness=0.05, aggression=0.05, seed=seed, name="tight_aggressive"
+        samples=samples, tightness=0.05, aggression=0.05, seed=seed,
+        name="tight_aggressive", action_space=action_space,
     )
 
 
-def loose_passive(seed: int = 0, samples: int = 60) -> HeuristicAgent:
+def loose_passive(seed: int = 0, samples: int = 60, action_space=None) -> HeuristicAgent:
     return HeuristicAgent(
-        samples=samples, tightness=-0.10, aggression=-0.10, seed=seed, name="loose_passive"
+        samples=samples, tightness=-0.10, aggression=-0.10, seed=seed,
+        name="loose_passive", action_space=action_space,
     )
 
 
 HEURISTIC_AGENTS: Dict[str, callable] = {
-    "heuristic": lambda seed=0: HeuristicAgent(seed=seed),
+    "heuristic": lambda seed=0, samples=60, action_space=None: HeuristicAgent(
+        seed=seed, samples=samples, action_space=action_space
+    ),
     "tight_aggressive": tight_aggressive,
     "loose_passive": loose_passive,
 }

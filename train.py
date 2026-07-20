@@ -24,7 +24,12 @@ from evaluation.evaluate import evaluate_suite, format_results, summarize_headli
 from model.network import build_network, load_checkpoint, save_checkpoint
 from representation.observation_encoder import ObservationEncoder
 from training.replay_buffer import ReplayBuffer
-from training.self_play import SelfPlayWorker
+from training.self_play import (
+    BatchedSelfPlayWorker,
+    SelfPlayWorker,
+    build_opponent_pool,
+    snapshot_agent,
+)
 from training.trainer import Trainer
 
 
@@ -66,6 +71,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--config", type=str, default=None, help="load a saved config JSON")
     parser.add_argument("--resume", type=str, default=None, help="resume from a checkpoint")
+    parser.add_argument(
+        "--opponent-pool",
+        type=str,
+        default=None,
+        help="comma-separated opponents to mix into self-play, e.g. "
+        "'tight_aggressive,checkpoint,calling_station'",
+    )
+    parser.add_argument("--opponent-mix-prob", type=float, default=None)
+    parser.add_argument(
+        "--self-play-envs",
+        type=int,
+        default=None,
+        help="hands advanced in lockstep to batch the network (1 = sequential)",
+    )
+    parser.add_argument("--league-snapshot-every", type=int, default=None)
+    parser.add_argument("--league-size", type=int, default=None)
+    parser.add_argument("--league-recency-decay", type=float, default=None)
     parser.add_argument("--no-eval", action="store_true")
     return parser.parse_args()
 
@@ -81,6 +103,7 @@ def build_config(args: argparse.Namespace) -> Config:
         ("learning_rate", "train"),
         ("replay_capacity", "train"),
         ("min_buffer_before_training", "train"),
+        ("self_play_envs", "train"),
         ("alpha", "train"),
         ("beta", "train"),
         ("gamma", "train"),
@@ -91,6 +114,10 @@ def build_config(args: argparse.Namespace) -> Config:
         ("eval_hands", "train"),
         ("checkpoint_every", "train"),
         ("checkpoint_dir", "train"),
+        ("opponent_mix_prob", "train"),
+        ("league_snapshot_every", "train"),
+        ("league_size", "train"),
+        ("league_recency_decay", "train"),
         ("reward_mode", "env"),
         ("reward_clip", "env"),
         ("starting_stack", "env"),
@@ -98,6 +125,13 @@ def build_config(args: argparse.Namespace) -> Config:
         value = getattr(args, name, None)
         if value is not None:
             setattr(getattr(cfg, target), name, value)
+
+    if args.opponent_pool:
+        cfg.train.opponent_pool = tuple(
+            name.strip() for name in args.opponent_pool.split(",") if name.strip()
+        )
+        if cfg.train.opponent_mix_prob <= 0:
+            cfg.train.opponent_mix_prob = 0.5
 
     # The Q head bounding is derived from the reward mode by `build_network`;
     # only an explicit --unbounded-q overrides it (experiment B).
@@ -122,7 +156,7 @@ def main() -> None:
     device = resolve_device(cfg.train.device)
     set_seeds(cfg.train.seed)
 
-    encoder = ObservationEncoder(cfg.obs)
+    encoder = ObservationEncoder.from_config(cfg)
     print(encoder.describe())
 
     if args.resume:
@@ -153,7 +187,22 @@ def main() -> None:
     )
     print(f"replay capacity={buffer.capacity:,}  ({buffer.memory_bytes() / 1e6:.0f} MB reserved)\n")
 
-    worker = SelfPlayWorker(cfg, network, encoder, device=device, seed=cfg.train.seed)
+    pool = build_opponent_pool(cfg, network, device=device)
+    use_league = "checkpoint" in cfg.train.opponent_pool
+    worker_class = BatchedSelfPlayWorker if cfg.train.self_play_envs > 1 else SelfPlayWorker
+    worker_kwargs = dict(device=device, seed=cfg.train.seed, opponent_pool=pool)
+    if worker_class is BatchedSelfPlayWorker:
+        worker_kwargs["num_envs"] = cfg.train.self_play_envs
+    worker = worker_class(cfg, network, encoder, **worker_kwargs)
+    print(
+        f"self-play: {worker_class.__name__}"
+        + (f" ({cfg.train.self_play_envs} envs in lockstep)" if cfg.train.self_play_envs > 1 else "")
+    )
+    if cfg.train.opponent_pool:
+        print(
+            f"opponent pool: {', '.join(cfg.train.opponent_pool)}  "
+            f"(mixed into {cfg.train.opponent_mix_prob:.0%} of hands)"
+        )
     trainer = Trainer(cfg, network, device=device)
     sample_rng = np.random.default_rng(cfg.train.seed)
 
@@ -167,6 +216,9 @@ def main() -> None:
     try:
         for iteration in range(start_iteration + 1, cfg.train.iterations + 1):
             tic = time.time()
+            if use_league and iteration % max(1, cfg.train.league_snapshot_every) == 0:
+                worker.add_snapshot(snapshot_agent(cfg, network, device=device))
+
             transitions, sp_stats = worker.generate(cfg.train.hands_per_iteration)
             buffer.extend(transitions)
             metrics = trainer.train_iteration(buffer, rng=sample_rng)

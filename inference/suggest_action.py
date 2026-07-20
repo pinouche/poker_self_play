@@ -28,18 +28,17 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from config import Config, EnvConfig
+from config import Config, EnvConfig, reward_scale
 from environment.betting import legal_actions
 from environment.cards import Card, parse_cards
 from environment.poker_env import SEAT_FROM_NAME, SEAT_NAMES
 from environment.state import (
-    ACTION_ID_FROM_NAME,
-    ACTION_NAMES,
     BOARD_CARDS_BY_STREET,
     ActionRecord,
     GameState,
     PlayerState,
     STREET_FROM_NAME,
+    action_space_for,
 )
 from model.network import PokerNet, load_checkpoint
 from representation.action_encoder import (
@@ -60,10 +59,13 @@ class TableStateError(ValueError):
 
 # --- parsing ---------------------------------------------------------------
 def parse_table_state(
-    table_state: Dict, env_cfg: Optional[EnvConfig] = None
+    table_state: Dict,
+    env_cfg: Optional[EnvConfig] = None,
+    action_space=None,
 ) -> Tuple[GameState, int, EnvConfig]:
     """Convert the public table-state JSON into an internal ``GameState``."""
     env_cfg = env_cfg or EnvConfig()
+    action_space = action_space or action_space_for(env_cfg)
     if not isinstance(table_state, dict):
         raise TableStateError("table state must be a JSON object")
 
@@ -145,7 +147,9 @@ def parse_table_state(
         to_act=acting_seat,
         initial_stacks=[p.stack + p.contributed for p in players],
     )
-    state.history = _parse_history(table_state.get("action_history", []), state)
+    state.history = _parse_history(
+        table_state.get("action_history", []), state, action_space
+    )
 
     env_cfg = EnvConfig(**{**env_cfg.__dict__, "small_blind": small_blind, "big_blind": big_blind})
     return state, acting_seat, env_cfg
@@ -175,12 +179,15 @@ def _check_duplicate_cards(players: Sequence[PlayerState], board: Sequence[Card]
         seen[card] = "board"
 
 
-def _parse_history(raw_history: Sequence[Dict], state: GameState) -> List[ActionRecord]:
+def _parse_history(
+    raw_history: Sequence[Dict], state: GameState, action_space
+) -> List[ActionRecord]:
     records: List[ActionRecord] = []
+    name_to_id = action_space.name_to_id
     running_pot = 0
     for entry in raw_history:
         action_name = str(entry.get("action", "")).upper()
-        if action_name not in ACTION_ID_FROM_NAME:
+        if action_name not in name_to_id:
             raise TableStateError(f"unknown action in history: {action_name!r}")
         seat = _resolve_seat(entry.get("player", "hero"), "action_history.player")
         amount = int(entry.get("amount", 0))
@@ -192,7 +199,7 @@ def _parse_history(raw_history: Sequence[Dict], state: GameState) -> List[Action
         records.append(
             ActionRecord(
                 seat=seat,
-                action_id=ACTION_ID_FROM_NAME[action_name],
+                action_id=name_to_id[action_name],
                 amount=amount,
                 to_amount=amount,
                 street=STREET_FROM_NAME[street_name],
@@ -216,7 +223,8 @@ class SuggestionEngine:
         self.network = network
         self.cfg = cfg
         self.device = device
-        self.encoder = ObservationEncoder(cfg.obs)
+        self.action_space = action_space_for(cfg.env)
+        self.encoder = ObservationEncoder.from_config(cfg)
         self.network.to(device)
         self.network.eval()
 
@@ -247,7 +255,9 @@ class SuggestionEngine:
         reported and, in sample mode, drawn from; ``temperature = 0`` collapses
         it onto the best action.
         """
-        state, acting_seat, env_cfg = parse_table_state(table_state, self.cfg.env)
+        state, acting_seat, env_cfg = parse_table_state(
+            table_state, self.cfg.env, self.action_space
+        )
         legal = legal_actions(state, acting_seat, env_cfg)
         if not legal.any_legal():
             raise TableStateError(
@@ -269,6 +279,7 @@ class SuggestionEngine:
             self.cfg.train.alpha,
             self.cfg.train.beta,
             temperature=1.0,
+            q_scale=reward_scale(self.cfg.env),
         )
 
         # Reported distribution honours the requested temperature.
@@ -297,11 +308,12 @@ class SuggestionEngine:
             None if to_amount is None else int(to_amount - state.players[acting_seat].street_bet)
         )
 
+        names = self.action_space.names
         return {
-            "action": ACTION_NAMES[action],
-            "probabilities": probs_to_dict(probabilities, mask),
-            "q_values": q_values_to_dict(q_values, mask),
-            "legal_actions": legal_action_names(mask),
+            "action": names[action],
+            "probabilities": probs_to_dict(probabilities, mask, names),
+            "q_values": q_values_to_dict(q_values, mask, names),
+            "legal_actions": legal_action_names(mask, names),
             # Extras beyond the required contract.
             "acting_player": SEAT_NAMES[acting_seat],
             "bet_to": to_amount,

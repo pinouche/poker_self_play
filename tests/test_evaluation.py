@@ -1,5 +1,6 @@
 """Baseline agents and the match-play harness."""
 
+import numpy as np
 import pytest
 
 from config import Config, ModelConfig
@@ -100,3 +101,71 @@ def test_results_format_without_error():
 def test_wrong_number_of_agents_is_rejected():
     with pytest.raises(ValueError):
         evaluate_match([RandomAgent(), RandomAgent()], small_config(), num_hands=3)
+
+
+# --- duplicate-deal scoring ------------------------------------------------
+def test_duplicate_deals_replay_the_same_cards_for_every_hero():
+    """The whole point: two heroes are scored on identical deck orders."""
+    from evaluation.evaluate import duplicate_deal_scores
+
+    cfg = small_config()
+    seeds = list(range(1, 21))
+    first = duplicate_deal_scores(RandomAgent(), [CallingStationAgent()] * 2, cfg, seeds)
+    again = duplicate_deal_scores(RandomAgent(), [CallingStationAgent()] * 2, cfg, seeds)
+    assert len(first) == len(seeds)
+    # Same agent, same deals, same rngs -> bit-identical, so differences between
+    # two *different* agents are attributable to the agents, not the cards.
+    np.testing.assert_array_equal(first, again)
+
+
+def test_duplicate_deal_scoring_reduces_variance():
+    """Seat-averaging must shrink the spread versus scoring one seat only.
+
+    Card luck is the dominant term in a poker result; rotating the hero through
+    every seat on the same deck order cancels much of it.
+    """
+    import random
+
+    from environment.poker_env import PokerEnv
+    from evaluation.evaluate import duplicate_deal_scores
+    from representation.observation_encoder import ObservationEncoder
+    from training.self_play import play_hand
+
+    cfg = small_config()
+    seeds = list(range(1, 201))
+    hero, opponents = CallingStationAgent(), [RandomAgent(), RandomAgent()]
+
+    averaged = duplicate_deal_scores(hero, opponents, cfg, seeds)
+
+    encoder = ObservationEncoder(cfg.obs)
+    single = []
+    for seed in seeds:
+        env = PokerEnv(cfg.env, cfg.obs, seed=seed)
+        result = play_hand(
+            env, [hero] + opponents, encoder, random.Random(seed * 7), collect=False
+        )
+        single.append(result.chip_deltas[0])
+
+    assert averaged.std() < np.std(single)
+
+
+def test_confidence_interval_shrinks_with_more_deals():
+    from evaluation.evaluate import bb_per_100_interval
+
+    rng = np.random.default_rng(0)
+    small = bb_per_100_interval(rng.normal(0, 100, size=100), 20)
+    large = bb_per_100_interval(rng.normal(0, 100, size=10_000), 20)
+    assert large["ci_half_width"] < small["ci_half_width"] / 5
+    assert small["deals"] == 100 and large["deals"] == 10_000
+
+
+def test_paired_comparison_reports_a_difference():
+    from evaluation.evaluate import compare_agents_paired
+
+    cfg = small_config()
+    result = compare_agents_paired(
+        CallingStationAgent(), AlwaysFoldAgent(), [RandomAgent()] * 2, cfg, num_deals=40
+    )
+    assert set(result) == {"calling_station", "always_fold", "difference"}
+    expected = result["calling_station"]["bb_per_100"] - result["always_fold"]["bb_per_100"]
+    assert result["difference"]["bb_per_100"] == pytest.approx(expected, abs=1e-6)

@@ -12,7 +12,9 @@ import random
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from config import Config
+import numpy as np
+
+from config import Config, reward_scale
 from environment.poker_env import PokerEnv
 from representation.observation_encoder import ObservationEncoder
 from training.self_play import Agent, NetworkAgent, play_hand
@@ -68,7 +70,7 @@ def evaluate_match(
     if len(agents) != num_players:
         raise ValueError(f"expected {num_players} agents, got {len(agents)}")
 
-    encoder = encoder or ObservationEncoder(cfg.obs)
+    encoder = encoder or ObservationEncoder.from_config(cfg)
     env = PokerEnv(cfg.env, cfg.obs, seed=seed)
     rng = random.Random(seed)
 
@@ -123,6 +125,7 @@ def make_network_agent(
         beta=cfg.train.beta,
         temperature=temperature,
         device=device,
+        q_scale=reward_scale(cfg.env),
     )
     agent.name = name
     return agent
@@ -141,7 +144,7 @@ def evaluate_suite(
     from .heuristic_agent import tight_aggressive
     from .random_agent import CallingStationAgent, RandomAgent
 
-    encoder = ObservationEncoder(cfg.obs)
+    encoder = ObservationEncoder.from_config(cfg)
     hero = make_network_agent(network, cfg, temperature=0.0, device=device)
 
     results: Dict[str, Dict] = {}
@@ -177,7 +180,7 @@ def evaluate_against_checkpoint(
     device: Optional[str] = None,
 ) -> Dict[str, object]:
     """Current network in one seat against an older checkpoint in the other two."""
-    encoder = ObservationEncoder(cfg.obs)
+    encoder = ObservationEncoder.from_config(cfg)
     hero = make_network_agent(network, cfg, temperature=0.0, device=device, name="current")
     old = make_network_agent(
         opponent_network, cfg, temperature=0.0, device=device, name="checkpoint"
@@ -222,3 +225,84 @@ def summarize_headline(results: Dict[str, Dict], agent_name: str = "network") ->
             headline[f"{label}/bb_per_100"] = stats["bb_per_100"]
             headline[f"{label}/win_rate"] = stats["win_rate"]
     return headline
+
+
+# --- duplicate-deal scoring ------------------------------------------------
+def duplicate_deal_scores(
+    hero: Agent,
+    opponents: Sequence[Agent],
+    cfg: Config,
+    deal_seeds: Sequence[int],
+    encoder: Optional[ObservationEncoder] = None,
+) -> np.ndarray:
+    """Per-deal chip result for ``hero``, averaged over all three seats.
+
+    bb/100 measured on independent hands is dominated by card luck: at ~900
+    hands the 95% interval is wider than any effect worth detecting.  Each deal
+    here is replayed three times from the *same* deck order with the hero
+    rotated through every seat, which cancels most of the "who was dealt aces"
+    component.
+
+    Because the deck order is fixed by the seed, the returned array is
+    comparable deal-for-deal across different heroes -- so two agents can be
+    compared as a paired difference rather than as two independent samples.
+    """
+    encoder = encoder or ObservationEncoder.from_config(cfg)
+    scores = np.empty(len(deal_seeds), dtype=np.float64)
+
+    for i, seed in enumerate(deal_seeds):
+        total = 0.0
+        for hero_seat in range(cfg.env.num_players):
+            env = PokerEnv(cfg.env, cfg.obs, seed=seed)
+            table = list(opponents)
+            table.insert(hero_seat, hero)
+            # Stateful agents must start each replay from the same point, or
+            # the deal is no longer identical across heroes.
+            for agent in table[: cfg.env.num_players]:
+                agent.reset()
+            result = play_hand(
+                env,
+                table[: cfg.env.num_players],
+                encoder,
+                random.Random(seed * 7 + hero_seat),
+                collect=False,
+            )
+            total += result.chip_deltas[hero_seat]
+        scores[i] = total / cfg.env.num_players
+    return scores
+
+
+def bb_per_100_interval(
+    scores: np.ndarray, big_blind: int, confidence: float = 1.96
+) -> Dict[str, float]:
+    """Mean bb/100 with a normal-approximation confidence interval."""
+    per_100 = np.asarray(scores, dtype=np.float64) / max(1, big_blind) * 100.0
+    mean = float(per_100.mean())
+    half = float(confidence * per_100.std(ddof=1) / np.sqrt(len(per_100))) if len(per_100) > 1 else float("inf")
+    return {
+        "bb_per_100": mean,
+        "ci_half_width": half,
+        "significant": abs(mean) > half,
+        "deals": int(len(per_100)),
+    }
+
+
+def compare_agents_paired(
+    hero: Agent,
+    rival: Agent,
+    opponents: Sequence[Agent],
+    cfg: Config,
+    num_deals: int = 1000,
+    seed_offset: int = 1,
+) -> Dict[str, Dict[str, float]]:
+    """Score two agents on identical deals and report the paired difference."""
+    encoder = ObservationEncoder(cfg.obs)
+    deal_seeds = list(range(seed_offset, seed_offset + num_deals))
+    hero_scores = duplicate_deal_scores(hero, opponents, cfg, deal_seeds, encoder)
+    rival_scores = duplicate_deal_scores(rival, opponents, cfg, deal_seeds, encoder)
+    bb = cfg.env.big_blind
+    return {
+        _agent_key(hero): bb_per_100_interval(hero_scores, bb),
+        _agent_key(rival): bb_per_100_interval(rival_scores, bb),
+        "difference": bb_per_100_interval(hero_scores - rival_scores, bb),
+    }

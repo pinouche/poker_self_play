@@ -16,7 +16,9 @@ opt-in ``reveal_at_showdown`` path.
 from __future__ import annotations
 
 import random
-from typing import Dict, Optional, Sequence
+from functools import lru_cache
+from itertools import permutations
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -30,6 +32,7 @@ from environment.state import (
     NUM_HOLE_CARDS,
     GameState,
     Street,
+    action_space_for,
 )
 
 # --- relative seat indices -------------------------------------------------
@@ -46,7 +49,13 @@ POT_FEATURE_DIM = 12
 POSITION_FEATURE_DIM = 6
 DERIVED_FEATURE_DIM = 38
 EQUITY_FEATURE_DIM = 2
-HISTORY_EVENT_DIM = NUM_REL_PLAYERS + NUM_ACTIONS + 2 + NUM_BETTING_STREETS + 1 + 1  # 21
+def history_event_dim(num_actions: int = NUM_ACTIONS) -> int:
+    """Width of one action-history slot; grows with the action abstraction."""
+    return NUM_REL_PLAYERS + num_actions + 2 + NUM_BETTING_STREETS + 1 + 1
+
+
+#: Width for the default ten-action space (21).
+HISTORY_EVENT_DIM = history_event_dim()
 
 _EPS = 1e-6
 
@@ -243,7 +252,8 @@ def encode_action_history(
     """
     length = obs_cfg.action_history_length
     bb = float(env_cfg.big_blind)
-    out = np.zeros((length, HISTORY_EVENT_DIM), dtype=np.float32)
+    num_actions = action_space_for(env_cfg).num_actions
+    out = np.zeros((length, history_event_dim(num_actions)), dtype=np.float32)
 
     events = state.history[-length:]
     for i, rec in enumerate(events):
@@ -252,7 +262,7 @@ def encode_action_history(
         out[i, offset + rel] = 1.0
         offset += NUM_REL_PLAYERS
         out[i, offset + rec.action_id] = 1.0
-        offset += NUM_ACTIONS
+        offset += num_actions
         out[i, offset] = _safe_div(rec.amount, bb)
         out[i, offset + 1] = _safe_div(rec.amount, max(rec.pot_before, 1))
         offset += 2
@@ -352,6 +362,48 @@ def equity_features(state: GameState, self_seat: int, obs_cfg) -> np.ndarray:
     return np.array([equity, 1.0], dtype=np.float32)
 
 
+_SUIT_PERMUTATIONS = list(permutations(range(NUM_SUITS)))
+
+
+def canonical_equity_key(
+    hole: Sequence[Card], board: Sequence[Card], num_opponents: int
+) -> Tuple:
+    """Suit-isomorphic key for an equity query.
+
+    Equity is invariant under any relabelling of suits, so hands that differ
+    only by suit share an answer.  Taking the lexicographically smallest image
+    over all 24 suit permutations gives a canonical form: preflop this collapses
+    1326 hole combinations to 169, and it merges every board with the same
+    suit *pattern*.  The 24 relabellings cost far less than one rollout.
+    """
+    best = None
+    for perm in _SUIT_PERMUTATIONS:
+        candidate = (
+            tuple(sorted((c.rank, perm[c.suit]) for c in hole)),
+            tuple(sorted((c.rank, perm[c.suit]) for c in board)),
+        )
+        if best is None or candidate < best:
+            best = candidate
+    return (*best, num_opponents)
+
+
+@lru_cache(maxsize=500_000)
+def _equity_from_key(key: Tuple, samples: int) -> float:
+    hole_key, board_key, num_opponents = key
+    hole = [Card(rank=r, suit=s) for r, s in hole_key]
+    board = [Card(rank=r, suit=s) for r, s in board_key]
+    return _estimate_equity_uncached(hole, board, num_opponents, samples, random.Random(0))
+
+
+def equity_cache_info():
+    """Hit/miss statistics for the equity memo (diagnostics)."""
+    return _equity_from_key.cache_info()
+
+
+def clear_equity_cache() -> None:
+    _equity_from_key.cache_clear()
+
+
 def estimate_equity(
     hole: Sequence[Card],
     board: Sequence[Card],
@@ -359,8 +411,25 @@ def estimate_equity(
     samples: int,
     rng: Optional[random.Random] = None,
 ) -> float:
-    """Win probability (ties counted fractionally) by Monte-Carlo rollout."""
-    rng = rng or random.Random(0)
+    """Win probability (ties counted fractionally) by Monte-Carlo rollout.
+
+    Memoised on a suit-isomorphic key.  Passing an explicit ``rng`` bypasses the
+    cache, since the caller is then asking for a specific random draw.
+    """
+    if rng is None:
+        return _equity_from_key(
+            canonical_equity_key(hole, board, num_opponents), samples
+        )
+    return _estimate_equity_uncached(hole, board, num_opponents, samples, rng)
+
+
+def _estimate_equity_uncached(
+    hole: Sequence[Card],
+    board: Sequence[Card],
+    num_opponents: int,
+    samples: int,
+    rng: random.Random,
+) -> float:
     known = set(hole) | set(board)
     deck = [Card.from_id(i) for i in range(NUM_CARDS) if Card.from_id(i) not in known]
     needed_board = MAX_BOARD_CARDS - len(board)

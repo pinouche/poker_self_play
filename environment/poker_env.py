@@ -14,6 +14,7 @@ The environment holds perfect information (it must, to evaluate showdowns) but
 
 from __future__ import annotations
 
+import itertools
 import random
 from typing import Dict, List, Optional, Sequence
 
@@ -27,15 +28,17 @@ from .betting import (
     legal_actions,
     next_to_act,
 )
-from .cards import Card, Deck
+from .cards import NUM_CARDS, Card, Deck
 from .hand_evaluator import evaluate_hand
 from .state import (
     BOARD_CARDS_BY_STREET,
+    MAX_BOARD_CARDS,
     NUM_HOLE_CARDS,
     ActionRecord,
     GameState,
     PlayerState,
     Street,
+    action_space_for,
 )
 
 SEAT_NAMES = ["hero", "villain_left", "villain_right"]
@@ -179,14 +182,73 @@ class PokerEnv:
             player.reset_for_street()
 
     def _runout(self) -> None:
-        """No further betting is possible: deal the rest of the board."""
+        """No further betting is possible: complete the board.
+
+        With ``all_in_ev_runout`` the payout is the *expectation* over every
+        possible completion rather than the result of one random one.  Both are
+        unbiased; the expectation has far lower variance, which matters because
+        that noise flows straight into the Q targets.  A concrete board is still
+        dealt so observations, history and inspection stay meaningful -- only
+        the chips are settled on the expectation.
+
+        A preset board (tests, replays) always takes the concrete path so that
+        scripted hands stay exactly reproducible.
+        """
         state = self.state
         assert state is not None
+
+        use_ev = (
+            self.cfg.all_in_ev_runout
+            and not self._preset_board
+            and len(state.board) < MAX_BOARD_CARDS
+            and len(state.active_players()) >= 2
+        )
+        expected = self._expected_runout_payouts() if use_ev else None
+
         while state.street != Street.RIVER:
             self._deal_next_street()
-        self._end_hand(showdown=True)
+        self._end_hand(showdown=True, payouts=expected)
 
-    def _end_hand(self, showdown: bool) -> None:
+    def _expected_runout_payouts(self) -> Optional[List[float]]:
+        """Average payouts over the possible board completions.
+
+        Enumerates exactly when the number of completions is small (the river
+        card alone is 45 or fewer); otherwise samples.  Returns ``None`` if the
+        situation is degenerate, in which case the caller falls back to a
+        concrete runout.
+        """
+        state = self.state
+        assert state is not None
+
+        active = state.active_players()
+        if len(active) < 2:
+            return None
+
+        known = set(state.board)
+        for player in state.players:
+            known.update(player.hole)
+        unseen = [Card.from_id(i) for i in range(NUM_CARDS) if Card.from_id(i) not in known]
+        slots = MAX_BOARD_CARDS - len(state.board)
+        if slots <= 0 or slots > len(unseen):
+            return None
+
+        total_combinations = _num_combinations(len(unseen), slots)
+        if total_combinations <= self.cfg.all_in_ev_exact_threshold:
+            completions = itertools.combinations(unseen, slots)
+            count = total_combinations
+        else:
+            count = self.cfg.all_in_ev_samples
+            completions = (tuple(self.rng.sample(unseen, slots)) for _ in range(count))
+
+        totals = [0.0] * state.num_players
+        for completion in completions:
+            board = state.board + list(completion)
+            ranks = {p.seat: evaluate_hand(list(p.hole) + board) for p in active}
+            for seat, amount in enumerate(distribute_pot(state, ranks)):
+                totals[seat] += amount
+        return [total / count for total in totals]
+
+    def _end_hand(self, showdown: bool, payouts: Optional[Sequence[float]] = None) -> None:
         state = self.state
         assert state is not None
         state.to_act = None
@@ -203,7 +265,11 @@ class PokerEnv:
                 hand_ranks[player.seat] = (0,)
             state.went_to_showdown = False
 
-        payouts = distribute_pot(state, hand_ranks)
+        if payouts is None:
+            payouts = distribute_pot(state, hand_ranks)
+        else:
+            state.expected_value_runout = True
+        payouts = list(payouts)
         for seat, amount in enumerate(payouts):
             state.players[seat].stack += amount
         state.payouts = payouts
@@ -218,14 +284,24 @@ class PokerEnv:
     def is_terminal(self) -> bool:
         return self.state is None or self.state.hand_over
 
+    @property
+    def action_space(self):
+        """Action ids and names implied by this environment's configuration."""
+        return action_space_for(self.cfg)
+
     def legal_actions(self, seat: Optional[int] = None) -> LegalActions:
         state = self.state
         assert state is not None, "call reset() first"
         if seat is None:
             seat = state.to_act
         if seat is None:
-            return LegalActions(mask=_zeros_mask(), to_amounts={})
+            return LegalActions(mask=self._zeros_mask(), to_amounts={})
         return legal_actions(state, seat, self.cfg)
+
+    def _zeros_mask(self):
+        import numpy as np
+
+        return np.zeros(self.action_space.num_actions, dtype=np.float32)
 
     def step(self, action_id: int) -> ActionRecord:
         """Apply ``action_id`` for the seat to act and advance the hand."""
@@ -267,7 +343,7 @@ class PokerEnv:
         legal = (
             self.legal_actions(acting_player_id)
             if state.to_act == acting_player_id
-            else LegalActions(mask=_zeros_mask(), to_amounts={})
+            else LegalActions(mask=self._zeros_mask(), to_amounts={})
         )
         return build_observation(state, acting_player_id, legal, self.cfg, self.obs_cfg)
 
@@ -340,6 +416,12 @@ class PokerEnv:
             },
             "folded": [p.folded for p in state.players],
         }
+
+
+def _num_combinations(n: int, k: int) -> int:
+    import math
+
+    return math.comb(n, k) if 0 <= k <= n else 0
 
 
 def _zeros_mask():

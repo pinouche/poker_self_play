@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from config import Config
+from config import Config, reward_scale
 from model.network import PokerNet, masked_log_softmax
 
 from .policy_improvement import improved_policy_torch, masked_entropy, masked_kl
@@ -42,6 +42,7 @@ class Trainer:
         self.network = network
         self.device = torch.device(device)
         self.network.to(self.device)
+        self.q_scale = reward_scale(cfg.env)
         self.optimizer = optimizer or torch.optim.Adam(
             network.parameters(),
             lr=cfg.train.learning_rate,
@@ -81,14 +82,25 @@ class Trainer:
         log_pi = masked_log_softmax(policy_logits, legal_mask)
 
         # --- Q loss on the taken action only ------------------------------
+        # Both sides are divided by the reward scale so that `huber_delta`,
+        # `q_weight` and `policy_weight` mean the same thing in every reward
+        # mode.  Unnormalised, bb-scale targets (~+-50) sit far outside the
+        # Huber knee and the Q term swamps the policy term by ~50x.
         q_taken = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
-        q_loss = F.huber_loss(q_taken, q_targets, delta=cfg.huber_delta)
+        q_loss = F.huber_loss(
+            q_taken / self.q_scale, q_targets / self.q_scale, delta=cfg.huber_delta
+        )
 
         # --- improved policy target ---------------------------------------
         with torch.no_grad():
             reference_log_policy = self._reference_log_policy(log_pi, old_policy, legal_mask)
             target_policy = improved_policy_torch(
-                q_values.detach(), reference_log_policy, legal_mask, cfg.alpha, cfg.beta
+                q_values.detach(),
+                reference_log_policy,
+                legal_mask,
+                cfg.alpha,
+                cfg.beta,
+                q_scale=self.q_scale,
             )
         policy_loss = -(target_policy * log_pi.clamp_min(-30.0)).sum(dim=-1).mean()
 

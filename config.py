@@ -54,6 +54,17 @@ class EnvConfig:
     # Rotate the button between hands during self-play.
     rotate_dealer: bool = True
 
+    # --- all-in EV runouts --------------------------------------------------
+    # When betting is closed and no further decisions are possible, pay the
+    # *expected* split over the remaining boards instead of dealing one random
+    # runout.  Identical in expectation, far lower variance -- the single
+    # largest noise reduction available in the learning signal.  A concrete
+    # board is still dealt for the record; only the payout is the expectation.
+    all_in_ev_runout: bool = True
+    # Enumerate every completion when there are at most this many, else sample.
+    all_in_ev_exact_threshold: int = 200
+    all_in_ev_samples: int = 100
+
 
 @dataclass
 class ObsConfig:
@@ -66,9 +77,11 @@ class ObsConfig:
     # public board, so they leak nothing.
     use_derived_card_features: bool = True
 
-    # Monte-Carlo equity.  Disabled by default per the specification.
-    use_equity_feature: bool = False
-    equity_samples: int = 200
+    # Monte-Carlo equity against random opponent ranges, computed only from the
+    # acting player's own cards and the public board.  Memoised on a
+    # suit-isomorphic key, so the cost amortises to near zero.
+    use_equity_feature: bool = True
+    equity_samples: int = 120
 
     # Keep fixed (always-masked) slots for opponent hole cards.  They are zero
     # during normal play and exist so that the leakage test has an explicit
@@ -138,6 +151,30 @@ class TrainConfig:
     updates_per_iteration: int = 32
     min_buffer_before_training: int = 2_000
     sampling_temperature: float = 1.0
+    # Number of hands advanced in lockstep so their decisions batch into one
+    # forward pass.  1 falls back to the sequential worker.  Behaviour is
+    # identical either way; only throughput changes.
+    self_play_envs: int = 64
+
+    # --- opponent pool ------------------------------------------------------
+    # Fraction of self-play hands in which one or two seats are played by an
+    # external opponent instead of the learner.  Pure self-play (0.0) calibrates
+    # the critic against the self-play population and nothing else.
+    opponent_mix_prob: float = 0.0
+    # Names from evaluation.random_agent / evaluation.heuristic_agent, plus
+    # "checkpoint" for frozen snapshots of the learner itself (league play).
+    opponent_pool: tuple = ()
+    # Monte-Carlo samples for heuristic opponents used *during training*.
+    # Evaluation bots keep their own (higher) setting.
+    opponent_heuristic_samples: int = 25
+    league_snapshot_every: int = 50
+    league_size: int = 5
+    # Recency weighting for league snapshots.  Snapshot i (0 = oldest of those
+    # retained) is sampled with weight `league_recency_decay ** (age)`, where
+    # age counts back from the newest.  1.0 = uniform over the league; smaller
+    # values concentrate on recent, stronger versions.  0.5 means the newest
+    # snapshot is twice as likely as the one before it.
+    league_recency_decay: float = 0.5
 
     # --- replay buffer ------------------------------------------------------
     # The specification suggests 1_000_000.  That is supported, but the default
@@ -203,6 +240,21 @@ def reward_bound(env: EnvConfig) -> Optional[float]:
             return float(env.reward_clip)
         return float(env.num_players - 1)
     return None  # bb_normalized and chip_return are unbounded
+
+
+def reward_scale(env: EnvConfig) -> float:
+    """Typical magnitude of the terminal reward, used to make alpha/beta dimensionless.
+
+    The improvement operator computes ``exp(Q / (alpha + beta))``, so ``alpha``
+    and ``beta`` silently carry the units of the reward unless Q is normalised
+    first.  With `bb_normalized` rewards reaching +-50, an unnormalised operator
+    exponentiates +-50 and collapses instantly to a deterministic policy.
+    """
+    if env.reward_mode == "bb_normalized":
+        return max(1.0, env.starting_stack / max(1, env.big_blind))
+    if env.reward_mode == "chip_return":
+        return max(1.0, float(env.starting_stack))
+    return 1.0  # binary and normalized_chip_return are already O(1)
 
 
 def resolve_q_head(cfg: "Config") -> tuple:

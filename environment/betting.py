@@ -21,15 +21,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .state import (
-    ALL_IN,
-    BET_ACTIONS,
     CALL,
     CHECK,
     FOLD,
-    NUM_ACTIONS,
-    RAISE_ACTIONS,
     ActionRecord,
     GameState,
+    action_space_for,
 )
 
 
@@ -55,7 +52,8 @@ def legal_actions(state: GameState, seat: int, cfg) -> LegalActions:
 
     ``cfg`` is an :class:`~config.EnvConfig`.
     """
-    mask = np.zeros(NUM_ACTIONS, dtype=np.float32)
+    space = action_space_for(cfg)
+    mask = np.zeros(space.num_actions, dtype=np.float32)
     to_amounts: Dict[int, int] = {}
 
     player = state.players[seat]
@@ -98,14 +96,14 @@ def legal_actions(state: GameState, seat: int, cfg) -> LegalActions:
     # blind's option preflop is correctly treated as a raise.
     if has_live_opponent:
         if bet_exists:
-            sizing_ids = RAISE_ACTIONS
+            sizing_ids = space.raise_ids
             min_legal_to = state.min_raise_to()
             candidates = [
                 int(round(mult * state.current_bet)) for mult in cfg.raise_multipliers
             ]
             allowed = can_reopen and max_to > state.current_bet
         else:
-            sizing_ids = BET_ACTIONS
+            sizing_ids = space.bet_ids
             min_legal_to = player.street_bet + cfg.big_blind
             pot = state.pot
             candidates = [
@@ -131,11 +129,11 @@ def legal_actions(state: GameState, seat: int, cfg) -> LegalActions:
         # in more than the call, and it is only permitted if raising is.
         if bet_exists:
             if max_to > state.current_bet and can_reopen:
-                mask[ALL_IN] = 1.0
-                to_amounts[ALL_IN] = max_to
+                mask[space.all_in] = 1.0
+                to_amounts[space.all_in] = max_to
         else:
-            mask[ALL_IN] = 1.0
-            to_amounts[ALL_IN] = max_to
+            mask[space.all_in] = 1.0
+            to_amounts[space.all_in] = max_to
 
     return LegalActions(mask, to_amounts)
 
