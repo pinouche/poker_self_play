@@ -807,3 +807,187 @@ class PopulationSelfPlayWorker:
             "entry_street_fractions": [entry_counts[i] / max(1, num_hands) for i in range(4)],
         }
         return transitions, stats
+
+
+# ============================================================================
+# Co-evolving population self-play
+# ============================================================================
+class CoevolutionSelfPlayWorker:
+    """Self-play among a co-evolving population of *live* networks.
+
+    The other workers in this module drive all three seats with a single network
+    (plus, optionally, frozen opponents) and improve only that one network.  Here
+    every one of ``num_policies`` networks is being optimised at once.  Each hand
+    samples one network per seat, uniformly and **with replacement**, so a
+    network faces other members of the population as well as fresh copies of
+    itself.  Every seat's decisions become training data for the network that
+    produced them, and :meth:`generate` returns the transitions grouped by
+    owning network so the caller can route each group to that network's own
+    replay buffer and optimiser.
+
+    ``num_envs`` hands are advanced in lockstep as in
+    :class:`BatchedSelfPlayWorker`.  Seats can hold different networks, so a
+    single forward pass no longer covers a whole step; instead the step's pending
+    decisions are grouped by network and each network runs one batched pass over
+    the rows it owns.  Semantics do not depend on ``num_envs`` -- the hands are
+    independent and each carries its own RNG -- only throughput does.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        networks: Sequence[PokerNet],
+        encoder: ObservationEncoder,
+        device: Optional[str] = None,
+        seed: int = 0,
+        num_envs: int = 1,
+    ) -> None:
+        if len(networks) < 1:
+            raise ValueError("co-evolution needs at least one network")
+        self.cfg = cfg
+        self.networks = list(networks)
+        self.num_policies = len(self.networks)
+        self.encoder = encoder
+        self.device = device
+        self.num_envs = max(1, num_envs)
+        # alpha/beta/temperature/q_scale are shared config, applied directly in
+        # ``network_action_choice`` -- the seats differ only in which network's
+        # forward pass feeds them, so no per-network ``NetworkAgent`` is needed.
+        self.q_scale = reward_scale(cfg.env)
+        self.rng = random.Random(seed)
+        self.envs = [
+            PokerEnv(cfg.env, cfg.obs, seed=seed * 1000 + i) for i in range(self.num_envs)
+        ]
+        self.rngs = [random.Random(seed * 7919 + i) for i in range(self.num_envs)]
+
+    def _sample_seat_owners(self) -> List[int]:
+        """One network index per seat, drawn uniformly with replacement.
+
+        With replacement means the same network can occupy several seats and thus
+        play against copies of itself.
+        """
+        n = self.cfg.env.num_players
+        return [self.rng.randrange(self.num_policies) for _ in range(n)]
+
+    def _start_hand(self, index: int) -> dict:
+        self.envs[index].reset()
+        return {
+            "seat_owner": self._sample_seat_owners(),
+            "chains": {seat: [] for seat in range(self.cfg.env.num_players)},
+        }
+
+    def generate(self, num_hands: int) -> Tuple[List[List[Transition]], dict]:
+        """Play ``num_hands`` and return transitions grouped by owning network.
+
+        The return value is ``(per_network_transitions, stats)`` where
+        ``per_network_transitions[k]`` holds the transitions produced by seats
+        that network ``k`` played this batch.
+        """
+        cfg = self.cfg.train
+        per_network: List[List[Transition]] = [[] for _ in range(self.num_policies)]
+        completed = showdowns = decisions = 0
+        reward_sums = np.zeros(self.cfg.env.num_players, dtype=np.float64)
+        chip_sums = np.zeros(self.cfg.env.num_players, dtype=np.float64)
+
+        active_envs = min(self.num_envs, num_hands)
+        slots: List[Optional[dict]] = [None] * self.num_envs
+        for index in range(active_envs):
+            slots[index] = self._start_hand(index)
+        started = active_envs
+
+        while any(slot is not None for slot in slots):
+            # Gather every pending decision across the active envs.  Every seat is
+            # network-controlled here, so each row needs a (network) forward pass.
+            pending = []  # (index, seat, flat, mask, owner)
+            for index, slot in enumerate(slots):
+                if slot is None:
+                    continue
+                env = self.envs[index]
+                if env.is_terminal:
+                    continue
+                seat = env.to_act
+                observation = env.get_observation(seat)
+                mask = observation["legal_action_mask"]
+                if mask.sum() <= 0:
+                    raise RuntimeError(f"seat {seat} has no legal actions")
+                flat = self.encoder.encode_flat(observation)
+                pending.append((index, seat, flat, mask, slot["seat_owner"][seat]))
+
+            if not pending:
+                break
+
+            # One batched forward pass per network, over the rows it owns.
+            outputs = {}  # (index, seat) -> (logits, q_values)
+            for net_idx in range(self.num_policies):
+                rows = [row for row in pending if row[4] == net_idx]
+                if not rows:
+                    continue
+                observations = np.stack([row[2] for row in rows])
+                logits, q_values = self.networks[net_idx].infer_batch(
+                    observations, device=self.device
+                )
+                for offset, row in enumerate(rows):
+                    outputs[(row[0], row[1])] = (logits[offset], q_values[offset])
+
+            for index, seat, flat, mask, _owner in pending:
+                logit_row, q_row = outputs[(index, seat)]
+                choice = network_action_choice(
+                    logit_row,
+                    q_row,
+                    mask,
+                    cfg.alpha,
+                    cfg.beta,
+                    cfg.sampling_temperature,
+                    self.q_scale,
+                    self.rngs[index],
+                )
+                slots[index]["chains"][seat].append(
+                    _Step(
+                        observation=flat,
+                        legal_mask=mask.copy(),
+                        action=choice.action,
+                        policy=choice.policy.copy(),
+                        value=choice.value,
+                    )
+                )
+                decisions += 1
+                self.envs[index].step(choice.action)
+
+            for index, slot in enumerate(slots):
+                if slot is None or not self.envs[index].is_terminal:
+                    continue
+                env = self.envs[index]
+                rewards = env.terminal_rewards()
+                # Route each seat's transitions to the network that played it.
+                for seat, chain in slot["chains"].items():
+                    if not chain:
+                        continue
+                    owner = slot["seat_owner"][seat]
+                    per_network[owner].extend(
+                        build_transitions(
+                            {seat: chain}, rewards, cfg.gamma, cfg.lam, cfg.store_next_obs
+                        )
+                    )
+                showdowns += int(env.state.went_to_showdown)
+                reward_sums += rewards
+                chip_sums += env.chip_deltas()
+                completed += 1
+                if started < num_hands:
+                    slots[index] = self._start_hand(index)
+                    started += 1
+                else:
+                    slots[index] = None
+
+        transitions_per_network = [len(group) for group in per_network]
+        stats = {
+            "hands": completed,
+            "transitions": sum(transitions_per_network),
+            "transitions_per_network": transitions_per_network,
+            "decisions_per_hand": decisions / max(1, completed),
+            "showdown_rate": showdowns / max(1, completed),
+            "mean_reward_per_seat": (reward_sums / max(1, completed)).tolist(),
+            "mean_chips_per_seat": (chip_sums / max(1, completed)).tolist(),
+            "num_policies": self.num_policies,
+            "num_envs": self.num_envs,
+        }
+        return per_network, stats

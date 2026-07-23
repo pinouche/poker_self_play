@@ -95,14 +95,17 @@ class ObsConfig:
 
 @dataclass
 class ModelConfig:
-    hidden_dim: int = 128
-    num_residual_blocks: int = 6
-    embed_cards: int = 64
-    embed_board: int = 64
-    embed_players: int = 64
-    embed_pot_history: int = 128
-    embed_position: int = 32
-    head_hidden: int = 128
+    # Defaults are the "medium" baseline from the research plan (~1.6M params):
+    # 256-wide trunk, 8 residual blocks.  Named presets live in
+    # ``MODEL_PRESETS`` (tiny / medium / large) for controlled size comparisons.
+    hidden_dim: int = 256
+    num_residual_blocks: int = 8
+    embed_cards: int = 128
+    embed_board: int = 128
+    embed_players: int = 128
+    embed_pot_history: int = 256
+    embed_position: int = 64
+    head_hidden: int = 256
     dropout: float = 0.0
     # Squash Q-values through `q_scale * tanh(.)`.  Only correct when the
     # return target is itself bounded -- rewards are terminal-only, so that
@@ -140,15 +143,23 @@ class TrainConfig:
     huber_delta: float = 1.0
 
     # --- optimisation -------------------------------------------------------
+    optimizer: str = "adamw"          # "adamw" | "adam"
     learning_rate: float = 3e-4
-    weight_decay: float = 1e-5
-    batch_size: int = 256
+    weight_decay: float = 1e-2         # AdamW decoupled decay; larger than Adam's
+    batch_size: int = 512
     grad_clip: float = 5.0
+
+    # Replay ratio, expressed as *new environment transitions collected per
+    # gradient update* (the research plan's primary knob, target 256-2048).
+    # The number of updates each iteration is derived from this and the number
+    # of transitions generated.  None falls back to the fixed
+    # ``updates_per_iteration`` below (legacy behaviour).
+    transitions_per_update: Optional[int] = 512
 
     # --- self-play loop -----------------------------------------------------
     iterations: int = 200
-    hands_per_iteration: int = 64
-    updates_per_iteration: int = 32
+    hands_per_iteration: int = 256
+    updates_per_iteration: int = 32   # only used when transitions_per_update is None
     min_buffer_before_training: int = 2_000
     sampling_temperature: float = 1.0
     # Number of hands advanced in lockstep so their decisions batch into one
@@ -197,12 +208,25 @@ class TrainConfig:
     # Order: preflop, flop, turn, river.  Normalised if it does not sum to 1.
     entry_street_probs: tuple = (0.75, 0.13, 0.08, 0.04)
 
+    # --- co-evolving population (multi-network self-play) ------------------
+    # Number of live networks trained *simultaneously*.  With num_policies > 1
+    # the run switches to co-evolution: every hand samples one network per seat,
+    # uniformly and with replacement, from the population -- so a network faces
+    # other members and fresh copies of itself -- and every seat's decisions
+    # train whichever network produced them.  This is a departure from the rest
+    # of the file, where a single network drives all three seats and only the
+    # learner seats yield data.  Each network keeps its own optimiser and replay
+    # buffer; ``replay_capacity`` is split evenly between them so the total
+    # memory footprint is unchanged.  num_policies == 1 is ordinary
+    # shared-network self-play and leaves every other code path untouched.
+    num_policies: int = 1
+
     # --- replay buffer ------------------------------------------------------
     # The specification suggests 1_000_000.  That is supported, but the default
     # is smaller so that `python train.py` is comfortable on a laptop
     # (observations dominate memory: ~910 float16 per transition, x2 with
     # next-observations stored).
-    replay_capacity: int = 100_000
+    replay_capacity: int = 1_000_000
     store_next_obs: bool = True
 
     # --- bookkeeping --------------------------------------------------------
@@ -286,6 +310,47 @@ def resolve_q_head(cfg: "Config") -> tuple:
         return False, 1.0
     scale = cfg.model.q_scale if cfg.model.q_scale is not None else (bound or 1.0)
     return True, float(scale)
+
+
+#: Named trunk sizes for controlled capacity comparisons (research plan §1).
+MODEL_PRESETS = {
+    "tiny": dict(
+        hidden_dim=128, num_residual_blocks=4, head_hidden=128,
+        embed_cards=64, embed_board=64, embed_players=64,
+        embed_pot_history=128, embed_position=32,
+    ),
+    "medium": dict(
+        hidden_dim=256, num_residual_blocks=8, head_hidden=256,
+        embed_cards=128, embed_board=128, embed_players=128,
+        embed_pot_history=256, embed_position=64,
+    ),
+    "large": dict(
+        hidden_dim=512, num_residual_blocks=10, head_hidden=512,
+        embed_cards=256, embed_board=256, embed_players=256,
+        embed_pot_history=512, embed_position=128,
+    ),
+}
+
+
+def model_config(preset: str, **overrides) -> ModelConfig:
+    """A :class:`ModelConfig` for a named size preset (tiny/medium/large)."""
+    if preset not in MODEL_PRESETS:
+        raise ValueError(f"unknown model preset {preset!r}; choose from {list(MODEL_PRESETS)}")
+    return ModelConfig(**{**MODEL_PRESETS[preset], **overrides})
+
+
+def updates_for_transitions(train_cfg, new_transitions: int) -> int:
+    """Number of gradient updates for a batch of freshly collected transitions.
+
+    Derived from ``transitions_per_update`` (the replay-ratio knob); falls back
+    to the fixed ``updates_per_iteration`` when that is unset.  At least one
+    update whenever any data was collected.
+    """
+    if train_cfg.transitions_per_update is None:
+        return train_cfg.updates_per_iteration
+    if new_transitions <= 0:
+        return 0
+    return max(1, round(new_transitions / train_cfg.transitions_per_update))
 
 
 def resolve_device(name: str) -> str:

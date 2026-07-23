@@ -1136,6 +1136,42 @@ batch the way single-network self-play does -- each seat acts with its own
 forward pass -- so it runs at the sequential rate rather than the batched one.
 Design and rationale live in `training/population.py`.
 
+## Co-evolving population (`--num-policies n`)
+
+`--population` above trains **one** network against *frozen* copies of its past
+self.  `--num-policies n` is a different regime: `n` networks are all **live**
+and **all optimised at once**.
+
+```bash
+python train.py --num-policies 4          # 4 co-evolving networks
+python train.py --num-policies 4 --self-play-envs 64   # batched
+```
+
+Each hand samples one network per seat -- **uniformly, with replacement** --
+from the population of `n`.  With replacement means a network can be dealt into
+several seats and so play against copies of itself; two seats can also draw two
+different members that then play each other.  Every seat's decisions become
+training data for the network that produced them (not just one "hero" seat), so
+all three seated networks improve from the same hand.  The seat perspective and
+lambda-return bookkeeping are exactly the ordinary per-seat machinery; only the
+*owner* of each chain differs.
+
+Each network is otherwise independent: its own random initialisation (so the
+population starts diverse), its own AdamW optimiser, and its own replay buffer.
+The configured `replay_capacity` is split evenly across the `n` buffers, so the
+total memory footprint matches a single-network run, and because each network
+sees ~`1/n` of the transitions and does ~`1/n` of the updates, its replay ratio
+still matches the single-network case.  `--num-policies 1` is exactly ordinary
+shared-network self-play and leaves every other code path untouched.
+
+Unlike frozen-library population play, the heterogeneous seats **do** batch:
+within each lockstep step the pending decisions are grouped by network and each
+network runs a single forward pass over the rows it owns, so `--self-play-envs`
+still buys throughput.  Checkpoints are written per network as
+`latest_net<k>.pt` (and `iter_<it>_net<k>.pt`); evaluation reports a headline
+line per network.  `--num-policies` and `--population` are mutually exclusive.
+The worker is `CoevolutionSelfPlayWorker` in `training/self_play.py`.
+
 ## Does population self-play beat the heuristic? (measured: no)
 
 The population feature was built because the trajectory result -- strength vs a
@@ -1203,6 +1239,126 @@ The blunt summary: population self-play as specified made the agent a more
 robust generalist but did **not** beat the heuristic, and did not stabilise the
 matchup against it. The evidence continues to point at *style* diversity held
 out from evaluation as the missing ingredient -- not more self-derived opponents.
+
+## Research program: neural self-play vs. search (staged)
+
+The system is being evolved through a sequence of independently-evaluable
+experiments toward the question: *how far does a small model-free self-play
+system get in 3-player poker, and how much does explicit search / game-theoretic
+structure add?*  Stages: (1) baseline size comparison, (2) blueprint policies,
+(3) depth-limited search, (4) belief-aware search, (5) local subgame solving,
+(6) hybrid agent.  Each stage is switchable and measured before the next begins.
+
+### Current architecture and training loop (baseline being evolved)
+
+* **Environment** (`environment/`): 3-handed no-limit hold'em with per-hand
+  blinds and stacks, EV all-in runouts, a configurable bet abstraction, and
+  strict information hiding (leakage tests in `tests/test_information_leakage.py`).
+* **Representation** (`representation/`): structured features -> a fixed vector,
+  canonicalised to the acting seat (SELF / OPPONENT_LEFT / OPPONENT_RIGHT).
+* **Model** (`model/`): per-group feature encoders -> a residual-MLP trunk ->
+  a policy head and a per-action Q head.  Default is now the **medium** preset
+  (256-wide, 8 blocks, ~1.6M params); `tiny` and `large` presets exist for
+  controlled comparison.
+* **Training** (`training/`): batched self-play fills a replay buffer; the
+  trainer regresses Q(s, a_taken) onto a lambda-return and moves the policy
+  toward the KL/entropy-regularised improvement of the current Q.  Opponent
+  diversity via checkpoint leagues and full population self-play already exist.
+
+### The biggest measured bottlenecks (not model capacity)
+
+Prior experiments in this file establish, with confidence intervals, that the
+ceiling is **not** representational capacity:
+
+* **Capacity does not help.** A 250-iteration size sweep showed bigger trunks
+  fit the critic better (lower q_loss) but play the same or worse.
+* **More hands do not monotonically help.** Strength against a fixed opponent
+  *oscillates* over training (correlation with iteration ~0.04) -- classic
+  self-play non-stationarity, not a data ceiling.
+* **Population self-play helps generalisation but not the heuristic gap.** It
+  resists un-learning against weak opponents but stays ~230 bb/100 below the
+  equity heuristic, because a library of past selves is a *style* monoculture.
+
+So the likely bottlenecks are sample efficiency, imperfect-information
+reasoning, and the absence of look-ahead -- which is why the program adds
+*search*, not parameters.
+
+### Stage 1: baseline size comparison (implemented, running)
+
+Two things the research plan flagged were fixed first:
+
+* **Replay ratio is now a first-class knob.** Training was doing ~12 new
+  transitions per gradient update (each transition reused ~21x) -- a very high
+  replay ratio that amplifies overfitting to stale self-play data.
+  `transitions_per_update` (default 512) now drives the number of updates, so
+  the ratio is ~1 and configurable.  Every run logs cumulative hands,
+  transitions, updates and the realised replay ratio.
+* **AdamW** replaces Adam, and **medium (256/8)** is the default baseline.
+
+Stage 1 trains `tiny` / `medium` / `large` on the *same number of self-play
+hands* (not equal gradient updates), self-play only, and compares strength over
+hands against the three fixed baselines.  Configs: `stage1_tiny`,
+`stage1_medium`, `stage1_large` in `benchmark.py`.
+
+### Stage 1 results
+
+3 sizes x 2 seeds, ~1.02M self-play hands each, self-play only, replay ratio ~1,
+scored on 500 duplicate deals per checkpoint against the three baselines.
+
+![size comparison](benchmark_results/stage1/size_comparison.png)
+
+Final strength (mean over last 2 checkpoints x 2 seeds):
+
+| size | params | vs heuristic | vs random | vs calling station |
+|---|---:|---:|---:|---:|
+| tiny | 0.34M | **−6 ±17** | +445 | +375 |
+| medium | 1.6M | −110 ±159 | +533 | +777 |
+| large | 7.0M | −18 ±60 | +572 | +373 |
+
+Two findings, one of them a correction.
+
+**1. Size does not matter, confirmed at 1M hands.** All three trunks converge to
+roughly break-even against the heuristic; `tiny` is the tightest (−6 ±17) and
+`large` is not better than `tiny`.  With hands and replay ratio held fixed, a
+20x parameter range makes no difference to final strength.  This is the
+controlled comparison the earlier capacity sweep only approximated, and it holds.
+
+**2. More hands *do* help -- which revises an earlier claim.** Against the
+heuristic every size climbs steadily over training:
+
+| size | early (0.13-0.26M hands) | late (0.9-1.02M hands) |
+|---|---:|---:|
+| tiny | −393 | −6 |
+| medium | −458 | −110 |
+| large | −124 | −18 |
+
+That is a **+350-390 bb/100 improvement over ~1M hands**, and the curve rises
+across the whole range rather than plateauing.  Earlier in this file I concluded
+"more hands do not help" from flat results between 16k and 64k hands.  **That
+conclusion was confounded by the replay ratio.**  At ~21x reuse the network
+overfit stale self-play data and could not benefit from more hands; at ~1x reuse
+(fresh data) the same additional hands drive a large, monotone improvement to
+break-even -- the first time anything in this project reached break-even against
+a held-out opponent.
+
+**Caveat -- it is a bundled change.** Versus the earlier baseline, three things
+changed together: replay ratio (21 -> 1), hand count (64k -> 1M), and the
+optimizer (Adam -> AdamW).  The learning curve (improvement accruing with hands,
+not appearing instantly) points at the *data* as the driver, unlocked by the low
+replay ratio, but a clean attribution needs an ablation -- low replay ratio at
+64k hands, or high replay ratio at 1M -- which has not been run.  Per-seed
+oscillation is also still visible (e.g. medium seed0 swings from −781 to +1 to
+−383); the low replay ratio raised the *level* to break-even without eliminating
+the non-stationarity.
+
+**Where this leaves the program.** Stage 1 establishes a real, reproducible
+break-even baseline against the heuristic with a 0.34M-parameter model -- and
+confirms, at 1M hands, that scaling the network is not the lever.  That is
+exactly the setup the plan wants before adding search: a small, well-trained
+model-free agent whose remaining gap (still losing outright to the heuristic on
+its bad-variance seeds, still oscillating) is plausibly a *reasoning* gap rather
+than a capacity or data gap.  Stage 2 (blueprint policies) and Stage 3
+(depth-limited search) follow.
 
 ## Plotting results
 

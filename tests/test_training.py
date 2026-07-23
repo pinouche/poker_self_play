@@ -242,3 +242,67 @@ def test_q_scale_is_one_for_already_normalized_modes():
         cfg = small_config()
         cfg.env.reward_mode = mode
         assert Trainer(cfg, build_network(cfg), device="cpu").q_scale == 1.0
+
+
+# --- replay-ratio control (research plan Stage 1) --------------------------
+def test_updates_are_derived_from_transitions_per_update():
+    from config import updates_for_transitions
+
+    cfg = small_config()
+    cfg.train.transitions_per_update = 512
+    # 1536 new transitions / 512 = 3 updates.
+    assert updates_for_transitions(cfg.train, 1536) == 3
+    assert updates_for_transitions(cfg.train, 256) == 1     # at least one
+    assert updates_for_transitions(cfg.train, 0) == 0       # nothing collected
+
+
+def test_transitions_per_update_none_falls_back_to_fixed_updates():
+    from config import updates_for_transitions
+
+    cfg = small_config()
+    cfg.train.transitions_per_update = None
+    cfg.train.updates_per_iteration = 7
+    assert updates_for_transitions(cfg.train, 9999) == 7
+
+
+def test_model_presets_have_increasing_size_and_valid_ranges():
+    from config import model_config
+    from model.network import build_network
+
+    counts = {}
+    for preset in ("tiny", "medium", "large"):
+        cfg = small_config()
+        cfg.model = model_config(preset)
+        counts[preset] = build_network(cfg).num_parameters()
+    assert counts["tiny"] < counts["medium"] < counts["large"]
+    # Spec ranges (10-action space): tiny 0.3-0.8M, medium 1-3M, large 5-15M.
+    assert 0.3e6 <= counts["tiny"] <= 0.9e6
+    assert 1e6 <= counts["medium"] <= 3e6
+    assert 5e6 <= counts["large"] <= 15e6
+
+
+def test_unknown_model_preset_is_rejected():
+    from config import model_config
+
+    with pytest.raises(ValueError):
+        model_config("gigantic")
+
+
+def test_trainer_builds_the_configured_optimizer():
+    import torch
+
+    cfg = small_config()
+    cfg.train.optimizer = "adamw"
+    trainer = Trainer(cfg, build_network(cfg), device="cpu")
+    assert isinstance(trainer.optimizer, torch.optim.AdamW)
+
+    cfg.train.optimizer = "adam"
+    trainer = Trainer(cfg, build_network(cfg), device="cpu")
+    assert isinstance(trainer.optimizer, torch.optim.Adam)
+
+
+def test_unknown_optimizer_is_rejected():
+    cfg = small_config()
+    cfg.train.optimizer = "sgd"
+    with pytest.raises(ValueError):
+        Trainer(cfg, build_network(cfg), device="cpu")

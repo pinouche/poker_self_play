@@ -422,3 +422,100 @@ def test_batched_worker_supports_the_opponent_pool():
     transitions, stats = worker.generate(16)
     assert stats["mixed_opponent_rate"] == 1.0
     assert transitions
+
+
+# --- co-evolving population ------------------------------------------------
+def _coevo_worker(cfg, num_policies, seed=0, num_envs=8):
+    from training.self_play import CoevolutionSelfPlayWorker
+
+    networks = [build_network(cfg) for _ in range(num_policies)]
+    worker = CoevolutionSelfPlayWorker(
+        cfg, networks, ObservationEncoder(cfg.obs), seed=seed, num_envs=num_envs
+    )
+    return networks, worker
+
+
+def test_coevolution_groups_transitions_by_owning_network():
+    cfg = small_config()
+    networks, worker = _coevo_worker(cfg, num_policies=3, seed=1)
+    per_network, stats = worker.generate(150)
+
+    assert len(per_network) == 3
+    assert stats["num_policies"] == 3
+    assert stats["hands"] == 150
+    # The per-network groups partition the transitions with nothing lost.
+    assert stats["transitions"] == sum(len(g) for g in per_network)
+    assert stats["transitions_per_network"] == [len(g) for g in per_network]
+    # Over 150 hands every network is seated many times, so each collects data.
+    assert all(len(group) > 0 for group in per_network)
+    for group in per_network:
+        for transition in group:
+            assert transition.legal_action_mask[transition.action] == 1.0
+            assert transition.old_policy.sum() == pytest.approx(1.0, abs=1e-5)
+            assert -1.0 <= transition.q_target <= 2.0
+
+
+def test_coevolution_conserves_chips_across_seats():
+    cfg = small_config()
+    _, worker = _coevo_worker(cfg, num_policies=2, seed=2, num_envs=4)
+    _, stats = worker.generate(40)
+    assert sum(stats["mean_chips_per_seat"]) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_coevolution_samples_seat_owners_with_replacement():
+    """The same network must be able to occupy several seats in one hand."""
+    cfg = small_config()
+    _, worker = _coevo_worker(cfg, num_policies=2, seed=5)
+    saw_repeat = False
+    for _ in range(200):
+        owners = worker._sample_seat_owners()
+        assert len(owners) == cfg.env.num_players
+        assert all(0 <= o < 2 for o in owners)
+        saw_repeat |= len(set(owners)) < len(owners)
+    assert saw_repeat, "with replacement, a network should sometimes take >1 seat"
+
+
+def test_coevolution_single_network_is_ordinary_self_play():
+    cfg = small_config()
+    _, worker = _coevo_worker(cfg, num_policies=1, seed=0, num_envs=4)
+    per_network, stats = worker.generate(20)
+    assert len(per_network) == 1
+    assert stats["num_policies"] == 1
+    assert stats["transitions"] == len(per_network[0])
+
+
+def test_coevolution_optimizes_every_network():
+    """Each network trains on the data it produced, and all of them move."""
+    import torch
+
+    from training.replay_buffer import ReplayBuffer
+    from training.trainer import Trainer
+
+    cfg = small_config()
+    cfg.train.batch_size = 64
+    n = 2
+    networks, worker = _coevo_worker(cfg, num_policies=n, seed=3)
+    buffers = [
+        ReplayBuffer(2000, worker.encoder.observation_dim, worker.encoder.spec.num_actions)
+        for _ in range(n)
+    ]
+    trainers = [Trainer(cfg, networks[k], device="cpu") for k in range(n)]
+    before = [[p.detach().clone() for p in net.parameters()] for net in networks]
+
+    while any(len(b) < 128 for b in buffers):
+        per_network, _ = worker.generate(40)
+        for k in range(n):
+            buffers[k].extend(per_network[k])
+
+    rng = np.random.default_rng(0)
+    for k in range(n):
+        for _ in range(20):
+            metrics = trainers[k].train_step(buffers[k].sample(64, rng))
+            assert np.isfinite(metrics["loss"])
+
+    for k in range(n):
+        moved = any(
+            not torch.equal(old, new)
+            for old, new in zip(before[k], networks[k].parameters())
+        )
+        assert moved, f"network {k} did not update"

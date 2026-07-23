@@ -120,6 +120,9 @@ def _sweep_reference(cfg: Config) -> None:
     cfg.train.league_recency_decay = 0.5
     cfg.train.self_play_envs = 64
     cfg.obs.use_equity_feature = False
+    # Pin to the original 128/6 trunk so the archived sweep/capacity/population
+    # results remain reproducible now that the default model is "medium".
+    cfg.model = ModelConfig(**CAPACITIES["base"], bounded_q=None)
     cfg.env = EnvConfig(
         **{
             **cfg.env.__dict__,
@@ -147,6 +150,40 @@ def _make_sweep_config(alpha: float) -> Callable[[Config], None]:
 #: Alpha is settled at 0.02: the sweep from 0.01 to 0.05 was flat within seed
 #: noise, so it is fixed here and everything below varies something else.
 SETTLED_ALPHA = 0.02
+
+
+def _stage1(cfg: Config, preset: str) -> None:
+    """Research-plan Stage 1: model-free self-play only, size = ``preset``.
+
+    No population, no fixed opponents -- the size effect is isolated.  Uses the
+    settled reward/critic/abstraction and the replay-ratio knob from the plan.
+    """
+    from config import model_config
+
+    cfg.model = model_config(preset, bounded_q=None)
+    cfg.train.alpha = SETTLED_ALPHA
+    cfg.train.beta = 0.5
+    cfg.train.opponent_pool = ()
+    cfg.train.opponent_mix_prob = 0.0
+    cfg.train.population_self_play = False
+    cfg.train.self_play_envs = 64
+    cfg.train.optimizer = "adamw"
+    cfg.train.transitions_per_update = 512
+    cfg.train.batch_size = 512
+    cfg.train.replay_capacity = 1_000_000
+    cfg.obs.use_equity_feature = False
+    cfg.env = EnvConfig(
+        **{
+            **cfg.env.__dict__,
+            "bet_fractions": FINE_BETS,
+            "raise_multipliers": FINE_RAISES,
+            "all_in_ev_runout": True,
+        }
+    )
+
+
+def _make_stage1(preset: str) -> Callable[[Config], None]:
+    return lambda cfg: _stage1(cfg, preset)
 
 #: Trunk sizes.  `base` is the configuration everything so far was trained
 #: with; it had never been varied, and the plateau at ~16k hands is as
@@ -252,6 +289,10 @@ CONFIGS: Dict[str, Callable[[Config], None]] = {
     "league_broad": _make_broad_league_config("base"),
     "population": _make_population_config("base"),
     "long_population": _make_population_config("base"),
+    # Research-plan Stage 1: size comparison, self-play only.
+    "stage1_tiny": _make_stage1("tiny"),
+    "stage1_medium": _make_stage1("medium"),
+    "stage1_large": _make_stage1("large"),
 }
 
 #: Order used in reports; `full` first so ablations read as deltas from it.

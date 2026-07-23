@@ -43,12 +43,20 @@ class Trainer:
         self.device = torch.device(device)
         self.network.to(self.device)
         self.q_scale = reward_scale(cfg.env)
-        self.optimizer = optimizer or torch.optim.Adam(
-            network.parameters(),
-            lr=cfg.train.learning_rate,
-            weight_decay=cfg.train.weight_decay,
-        )
+        self.optimizer = optimizer or self._build_optimizer(cfg, network)
         self.updates = 0
+
+    @staticmethod
+    def _build_optimizer(cfg, network) -> torch.optim.Optimizer:
+        kind = cfg.train.optimizer.lower()
+        params = dict(
+            lr=cfg.train.learning_rate, weight_decay=cfg.train.weight_decay
+        )
+        if kind == "adamw":
+            return torch.optim.AdamW(network.parameters(), **params)
+        if kind == "adam":
+            return torch.optim.Adam(network.parameters(), **params)
+        raise ValueError(f"unknown optimizer {cfg.train.optimizer!r}")
 
     # --- helpers -----------------------------------------------------------
     def _to_tensor(self, array: np.ndarray, dtype=torch.float32) -> torch.Tensor:
