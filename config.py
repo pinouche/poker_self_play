@@ -120,11 +120,26 @@ class TrainConfig:
     # --- policy improvement -------------------------------------------------
     # Improvement operator:
     #   pi_new  proportional to  pi_ref^(beta/(alpha+beta)) * exp(Q/(alpha+beta))
-    # Smaller (alpha + beta) makes the step greedier; a larger beta/alpha ratio
-    # keeps it closer to the reference policy.  With binary rewards Q lives in
-    # [-1, 1], so alpha + beta = 1 gives a useful spread (up to ~7x between the
-    # best and worst action) while still regularising.
-    alpha: float = 0.5   # entropy regularisation coefficient
+    # Written as softmax logits this is
+    #   score(a) = Q(a)/(alpha+beta) + [beta/(alpha+beta)] * log pi_ref(a),
+    # so there are two independent knobs: the weight on Q is 1/(alpha+beta)
+    # (greediness) and the weight on the reference is beta/(alpha+beta) (trust
+    # region).  A reference weight of 1 reproduces pi_ref exactly; below 1 the
+    # step flattens pi_ref toward uniform *every update*.
+    #
+    # Default is alpha = 0.05, beta = 0.5 (reference weight ~0.91, Q weight
+    # ~1.8).  The earlier alpha = beta = 0.5 fails on the default
+    # `normalized_chip_return` reward: early in training the Q-spread between a
+    # state's actions is tiny (~0.01-0.02), so the Q term is negligible and the
+    # reference weight of 0.5 flattens the policy toward uniform faster than the
+    # signal can sharpen it -- a self-reinforcing cold start where play stays
+    # uniform (entropy pinned near log(#legal), kl_target_vs_policy ~ 0).  With
+    # beta/(alpha+beta) ~ 0.91 the reference is preserved rather than flattened,
+    # so even small advantages accumulate and the policy escapes.  This is the
+    # measured break-even setting from the README alpha sweep and matches the
+    # benchmark's `full` config.  Binary rewards keep Q in [-1, 1] (order-1
+    # spreads), so raise alpha there -- alpha + beta ~ 1 is fine.
+    alpha: float = 0.05  # entropy regularisation coefficient
     beta: float = 0.5    # reverse-KL (trust region) coefficient
     # Reference policy for the improvement operator.  "current" anchors to the
     # live network (detached) -- i.e. the policy immediately before the update.
@@ -161,7 +176,18 @@ class TrainConfig:
     hands_per_iteration: int = 256
     updates_per_iteration: int = 32   # only used when transitions_per_update is None
     min_buffer_before_training: int = 2_000
-    sampling_temperature: float = 1.0
+    # Exploration temperature applied to the *improved* policy when acting:
+    # ``sampling(a) proportional to improved(a) ** (1/T)``.  T<1 sharpens the
+    # behaviour toward the top action (more exploitation); T>1 flattens it toward
+    # uniform (more exploration); T=1 leaves the improved policy unchanged.  It
+    # also tilts the bootstrap value V(s)=sum_a sampling(a) Q(a) that the
+    # lambda-returns use: lower T pulls V toward max-Q (a greedier, more
+    # best-response-like target).  A single-network sweep at alpha=0.05 (0.1..1.0,
+    # 3 seeds, 300 iters) put the best strength vs the tight-aggressive heuristic
+    # in a shallow 0.3-0.5 band and a sharp penalty on either side (0.1 -> -284,
+    # 0.6 -> -198 bb/100 vs ~ -40 at 0.3-0.5); 0.4 sits in that optimum.  Raising
+    # it back toward 1.0 trades chip EV for a looser, higher-variance policy.
+    sampling_temperature: float = 0.4
     # Number of hands advanced in lockstep so their decisions batch into one
     # forward pass.  1 falls back to the sequential worker.  Behaviour is
     # identical either way; only throughput changes.

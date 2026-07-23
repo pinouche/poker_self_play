@@ -269,10 +269,20 @@ pi_new  proportional to  pi_ref^(beta/(alpha+beta)) * exp(Q/(alpha+beta))
 * larger `beta/alpha` -> stays closer to the reference policy;
 * `alpha, beta -> 0` -> greedy `argmax Q`.
 
-Defaults are `alpha = beta = 0.5`. With binary rewards Q lives in `[-1, 1]`, so
-`alpha + beta = 1` spreads the best and worst action by up to ~7x while still
-regularising. (`alpha = beta = 1.0` is a valid but very conservative choice —
-it moves the policy so little that learning is slow.)
+Defaults are `alpha = 0.05`, `beta = 0.5`. Writing the operator as softmax
+logits, `score(a) = Q(a)/(alpha+beta) + [beta/(alpha+beta)]·log π_ref(a)`, so the
+weight on the reference is `beta/(alpha+beta)`: at `1.0` it reproduces `π_ref`
+exactly, below `1.0` it flattens `π_ref` toward uniform on every update. The old
+`alpha = beta = 0.5` gives a reference weight of `0.5`, which — on the default
+`normalized_chip_return` reward, where early Q-spreads between actions are tiny
+(~0.01–0.02) — flattens the policy toward uniform faster than the signal can
+sharpen it. The result is a self-reinforcing cold start: play stays uniform,
+entropy pins near `log(#legal)`, and `kl_target_vs_policy ≈ 0`. Lowering `alpha`
+to `0.05` raises the reference weight to ~`0.91` (preserve, don't flatten) and
+the Q weight to ~`1.8`, so small advantages accumulate and the policy escapes.
+This is the measured break-even setting from the alpha sweep below and matches
+the benchmark's `full` config. (With binary rewards Q lives in `[-1, 1]`, so
+`alpha + beta ≈ 1` is fine there — raise `alpha` back up for that mode.)
 
 The reference policy defaults to the **current network's policy, detached** —
 i.e. the policy immediately before the update. `reference_policy = "behavior"`
@@ -1143,9 +1153,14 @@ self.  `--num-policies n` is a different regime: `n` networks are all **live**
 and **all optimised at once**.
 
 ```bash
-python train.py --num-policies 4          # 4 co-evolving networks
-python train.py --num-policies 4 --self-play-envs 64   # batched
+python train.py --num-policies 5 --checkpoint-dir checkpoints/pop5
 ```
+
+`--num-policies` is the only flag that changes; everything else keeps its
+default, so this is the standard 200-iteration run with the medium (~1.6M
+parameter) network, batched across the default `--self-play-envs 64` -- just
+with five networks instead of one.  To match a non-default baseline, pass the
+same flags you used before (e.g. `--iterations`, `--self-play-envs`).
 
 Each hand samples one network per seat -- **uniformly, with replacement** --
 from the population of `n`.  With replacement means a network can be dealt into
@@ -1171,6 +1186,41 @@ still buys throughput.  Checkpoints are written per network as
 `latest_net<k>.pt` (and `iter_<it>_net<k>.pt`); evaluation reports a headline
 line per network.  `--num-policies` and `--population` are mutually exclusive.
 The worker is `CoevolutionSelfPlayWorker` in `training/self_play.py`.
+
+Two practical notes.  The replay budget is split, so peak memory matches a
+single-network run, but wall-clock per iteration is somewhat higher -- five
+optimisers step each iteration and the batched forward pass is split into
+per-network groups.  And `--resume` is not supported for a population (each
+network has its own checkpoint); start co-evolution runs fresh.
+
+### Evaluating each network
+
+`benchmark.py evaluate` only knows the named benchmark configs, so a co-evolution
+run's per-network checkpoints are scored with `eval_population.py`.  It loads
+every `latest_net<k>.pt` in a directory and runs the standard battery from
+`evaluation.evaluate` -- self-play, then the network in one seat against the
+random, calling-station and tight-aggressive heuristic baselines in the other
+two:
+
+```bash
+python eval_population.py --checkpoint-dir checkpoints/pop5 --hands 2000
+```
+
+It prints the full per-agent / per-seat table for each network, then a compact
+`bb/100` comparison across the population:
+
+```
+=== bb/100 vs baselines (higher is better) ===
+  net              vs_random    vs_calling_station          vs_heuristic
+  0                    588.1                -364.7               -1167.7
+  1                    978.7                 444.4                -285.2
+  ...
+```
+
+`--which iter_000200` scores a specific snapshot instead of `latest`; `--hands`
+sets the sample size (default 1000 -- raise it, since `bb/100` on independent
+deals is high-variance), and `--seed` / `--device` behave as elsewhere.  Each
+network is scored solo, so treat small net-to-net gaps with caution.
 
 ## Does population self-play beat the heuristic? (measured: no)
 
