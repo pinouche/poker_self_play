@@ -29,56 +29,8 @@ import random
 from dataclasses import dataclass
 from typing import List, Optional
 
-from config import Config, model_config
+from config import Config
 from environment.state import NUM_BETTING_STREETS, Street
-
-
-# --- heterogeneous population ----------------------------------------------
-#: Distinct "player types" for a heterogeneous co-evolving population.  Each is
-#: (model preset, alpha, sampling_temperature, reward_mode); beta and everything
-#: else come from the base config.  Diversity runs along capacity
-#: (tiny/medium/large), improvement sharpness (alpha) and exploration
-#: (temperature).  Members k cycle through this menu, so five members get one of
-#: each.  All share the base obs and action layout, so they interoperate.
-#:
-#: Every archetype optimises the *same* objective (``normalized_chip_return``).
-#: Mixing in ``binary`` (win-rate) members was measured and is a net negative:
-#: in co-evolution each member is also everyone else's opponent, so members that
-#: are deliberately bad at chip-EV poison the training distribution for the rest
-#: -- the chip-EV members decayed from ~-40 to ~-400 bb/100 while the win-rate
-#: members hit 0.83 win rate.  Diversity only helps when it raises opponent
-#: quality; differ in style, not in what you optimise.
-POPULATION_ARCHETYPES = (
-    ("medium", 0.05, 0.40, "normalized_chip_return"),  # tuned default
-    ("large", 0.05, 0.40, "normalized_chip_return"),   # high capacity
-    ("tiny", 0.10, 0.70, "normalized_chip_return"),    # small, loose, exploratory
-    ("medium", 0.03, 0.30, "normalized_chip_return"),  # sharp exploiter
-    ("tiny", 0.08, 0.55, "normalized_chip_return"),    # small, mid-exploratory
-)
-
-
-def build_population_configs(base: Config, n: int) -> List[Config]:
-    """One :class:`Config` per co-evolving member.
-
-    Homogeneous (the default) returns the base config for every member -- five
-    clones, unchanged behaviour.  When ``base.train.heterogeneous_population`` is
-    set, member ``k`` takes archetype ``k % len(POPULATION_ARCHETYPES)``: its own
-    network size, alpha, temperature and reward mode, with the observation and
-    action layout (and the rest of the config) inherited from ``base`` so the
-    members remain interoperable.
-    """
-    if not base.train.heterogeneous_population:
-        return [base] * n
-    configs: List[Config] = []
-    for k in range(n):
-        preset, alpha, temperature, reward_mode = POPULATION_ARCHETYPES[k % len(POPULATION_ARCHETYPES)]
-        cfg = Config.from_dict(base.to_dict())  # deep copy
-        cfg.model = model_config(preset)
-        cfg.train.alpha = alpha
-        cfg.train.sampling_temperature = temperature
-        cfg.env.reward_mode = reward_mode
-        configs.append(cfg)
-    return configs
 
 # --- policy library --------------------------------------------------------
 class PolicyLibrary:

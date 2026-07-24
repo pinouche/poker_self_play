@@ -102,22 +102,6 @@ def parse_args() -> argparse.Namespace:
         "at once, with one sampled per seat per hand (default 1 = shared-network "
         "self-play)",
     )
-    parser.add_argument(
-        "--heterogeneous-population", dest="heterogeneous_population",
-        action="store_true", default=None,
-        help="make the population diverse (per-member size / alpha / temperature / "
-        "reward_mode) instead of clones; only affects num-policies > 1",
-    )
-    parser.add_argument(
-        "--coevolution-league-prob", dest="coevolution_league_prob", type=float, default=None,
-        help="fraction of co-evolution seats filled by frozen league opponents "
-        "(past member snapshots + --coevolution-league-bots); 0 disables",
-    )
-    parser.add_argument(
-        "--coevolution-league-bots", type=str, default=None,
-        help="comma-separated fixed bots for the co-evolution league, e.g. "
-        "'loose_passive' (keep the eval opponent out to avoid contamination)",
-    )
     parser.add_argument("--no-eval", action="store_true")
     return parser.parse_args()
 
@@ -151,8 +135,6 @@ def build_config(args: argparse.Namespace) -> Config:
         ("league_weighting", "train"),
         ("population_self_play", "train"),
         ("num_policies", "train"),
-        ("heterogeneous_population", "train"),
-        ("coevolution_league_prob", "train"),
         ("reward_mode", "env"),
         ("reward_clip", "env"),
         ("starting_stack", "env"),
@@ -167,11 +149,6 @@ def build_config(args: argparse.Namespace) -> Config:
         )
         if cfg.train.opponent_mix_prob <= 0:
             cfg.train.opponent_mix_prob = 0.5
-
-    if args.coevolution_league_bots:
-        cfg.train.coevolution_league_bots = tuple(
-            name.strip() for name in args.coevolution_league_bots.split(",") if name.strip()
-        )
 
     # The Q head bounding is derived from the reward mode by `build_network`;
     # only an explicit --unbounded-q overrides it (experiment B).
@@ -202,18 +179,11 @@ def train_coevolution(cfg: Config, args: argparse.Namespace, encoder, device: st
     Kept separate from :func:`main`'s single-network loop on purpose: the two
     share no state, and folding them together would only obscure both.
     """
-    from training.population import build_population_configs
-
     n = int(cfg.train.num_policies)
-    heterogeneous = bool(cfg.train.heterogeneous_population)
 
-    # One config per member.  Homogeneous returns the base config n times (five
-    # clones with distinct random inits); heterogeneous gives each member its own
-    # archetype (size / alpha / temperature / reward_mode).  Each network and its
-    # trainer are built from that member's config so the Q-head bounding, q_scale
-    # and objective all match.
-    member_cfgs = build_population_configs(cfg, n)
-    networks = [build_network(mc).to(device) for mc in member_cfgs]
+    # Distinct random initialisations: each ``build_network`` call advances the
+    # global torch RNG, so the population starts diverse rather than identical.
+    networks = [build_network(cfg).to(device) for _ in range(n)]
 
     # Split the replay budget evenly so total memory matches a single-network
     # run.  Each network's replay ratio still matches the single-network case:
@@ -228,34 +198,16 @@ def train_coevolution(cfg: Config, args: argparse.Namespace, encoder, device: st
         )
         for _ in range(n)
     ]
-    trainers = [Trainer(mc, net, device=device) for mc, net in zip(member_cfgs, networks)]
+    trainers = [Trainer(cfg, net, device=device) for net in networks]
     worker = CoevolutionSelfPlayWorker(
         cfg, networks, encoder, device=device, seed=cfg.train.seed,
         num_envs=max(1, cfg.train.self_play_envs),
-        member_configs=member_cfgs if heterogeneous else None,
     )
 
-    kind = "heterogeneous" if heterogeneous else "clones"
     print(
-        f"device={device}  num_policies={n} ({kind})  "
-        f"parameters/net={[f'{net.num_parameters()/1e6:.1f}M' for net in networks]}  "
+        f"device={device}  num_policies={n}  parameters/net={networks[0].num_parameters():,}  "
         f"reward_mode={cfg.env.reward_mode}  reward_bound={reward_bound(cfg.env)}"
     )
-    if heterogeneous:
-        for k, mc in enumerate(member_cfgs):
-            print(
-                f"  net{k}: {mc.model.hidden_dim}x{mc.model.num_residual_blocks} "
-                f"({networks[k].num_parameters()/1e6:.1f}M)  alpha={mc.train.alpha} "
-                f"T={mc.train.sampling_temperature}  reward={mc.env.reward_mode}"
-            )
-    if worker.league_prob > 0:
-        print(
-            f"  league: {worker.league_prob:.0%} of seats frozen opponents "
-            f"(member snapshots every {cfg.train.population_snapshot_every} iters, "
-            f"capacity {cfg.train.population_library_size}"
-            + (f", bots {list(cfg.train.coevolution_league_bots)}" if cfg.train.coevolution_league_bots else "")
-            + ")"
-        )
     print(
         f"self-play: co-evolving population ({n} live networks, all optimised; "
         f"{worker.num_envs} envs in lockstep; per-net replay {per_net_capacity:,})\n"
@@ -280,7 +232,6 @@ def train_coevolution(cfg: Config, args: argparse.Namespace, encoder, device: st
     try:
         for iteration in range(1, cfg.train.iterations + 1):
             tic = time.time()
-            worker.maybe_snapshot()  # freeze members into the league on cadence
             per_net_transitions, sp_stats = worker.generate(cfg.train.hands_per_iteration)
 
             # Each network trains only on the data it generated, so its replay

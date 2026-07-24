@@ -1193,37 +1193,6 @@ optimisers step each iteration and the batched forward pass is split into
 per-network groups.  And `--resume` is not supported for a population (each
 network has its own checkpoint); start co-evolution runs fresh.
 
-### Heterogeneous populations (`--heterogeneous-population`)
-
-By default the five members are **clones** -- same architecture, same objective,
-different random inits -- so they co-adapt into near-identical policies and the
-population's diversity is mostly wasted.  `--heterogeneous-population` instead
-gives each member a distinct *archetype* from `POPULATION_ARCHETYPES`
-(`training/population.py`), varying four axes:
-
-* **capacity** -- a mix of `tiny` / `medium` / `large` trunks;
-* **improvement sharpness** -- different `alpha`;
-* **exploration** -- different `sampling_temperature`;
-* **objective** -- `reward_mode` per member: `normalized_chip_return` (chip-EV,
-  aggressive value-betting) vs `binary` (win-rate, tight/nitty).
-
-Mechanically it stays trivial: a member is just its own `Config`, and
-`build_population_configs` returns the base config `n` times (clones) or `n`
-archetypes (heterogeneous).  Every member still shares the observation and action
-layout, so they interoperate at one table; each acts with its own
-`(alpha, beta, temperature, q_scale)` and its transitions are scored under its
-own `reward_mode` (the pure `config.seat_reward` lets one hand be scored
-differently per seat).  The default is off, so clone behaviour is unchanged.
-
-```bash
-python train.py --num-policies 5 --heterogeneous-population --checkpoint-dir checkpoints/het5
-```
-
-All members share the same network **recipe** (`model/`): per-group feature
-embeddings (`Linear → LayerNorm → ReLU`) for cards / board / players / pot-history
-/ position, a residual-MLP trunk with `LayerNorm` + `ReLU` throughout, and
-**separate** policy and Q heads off the shared trunk.
-
 ### Evaluating each network
 
 `benchmark.py evaluate` only knows the named benchmark configs, so a co-evolution
