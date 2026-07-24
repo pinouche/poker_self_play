@@ -246,6 +246,31 @@ class TrainConfig:
     # memory footprint is unchanged.  num_policies == 1 is ordinary
     # shared-network self-play and leaves every other code path untouched.
     num_policies: int = 1
+    # Make the co-evolving population *heterogeneous* rather than five clones:
+    # each member takes a distinct archetype -- different network size
+    # (tiny/medium/large), improvement sharpness (alpha), exploration
+    # (sampling_temperature) and objective (reward_mode: chip-EV vs win-rate) --
+    # from ``training.population.POPULATION_ARCHETYPES``.  All members still share
+    # the observation and action layout, so they play at the same table.  False
+    # keeps the clone population (behaviour unchanged).
+    heterogeneous_population: bool = False
+    # --- co-evolution league -----------------------------------------------
+    # Probability that a seat is filled by a *frozen* league opponent instead of
+    # a live member.  League seats are opponents, not learners: their decisions
+    # are never collected.  The league holds recency-weighted frozen snapshots of
+    # past members (cadence ``population_snapshot_every``, capacity
+    # ``population_library_size``, weighting ``league_weighting`` /
+    # ``league_recency_decay``) plus any fixed bots named below.
+    #
+    # This is the "raise opponent quality" lever: a clone population only ever
+    # faces its own current selves, which is what lets it cycle.  Facing strong
+    # past selves and a genuinely different fixed style widens the distribution
+    # without the poisoning that deliberately-weak members cause.  0 disables.
+    coevolution_league_prob: float = 0.0
+    # Fixed bots to seat in the league, e.g. ("loose_passive",).  Keep the
+    # evaluation opponent (tight_aggressive) OUT of this or the eval is
+    # contaminated -- see the README on training on the test opponent.
+    coevolution_league_bots: tuple = ()
 
     # --- replay buffer ------------------------------------------------------
     # The specification suggests 1_000_000.  That is supported, but the default
@@ -326,6 +351,29 @@ def reward_scale(env: EnvConfig) -> float:
     if env.reward_mode == "chip_return":
         return max(1.0, float(env.starting_stack))
     return 1.0  # binary and normalized_chip_return are already O(1)
+
+
+def seat_reward(delta: int, initial_stack: int, big_blind: int, env: EnvConfig) -> float:
+    """Terminal reward for one seat's chip result under ``env.reward_mode``.
+
+    Pure function of the chip delta and the seat's own starting stack, so a
+    single hand can be scored under *different* reward modes for different seats
+    -- which is what a heterogeneous population (members optimising chip-EV vs
+    win-rate) needs.  :meth:`PokerEnv.terminal_rewards` is exactly this applied
+    at the env's own mode across all seats.
+    """
+    mode = env.reward_mode
+    if mode == "normalized_chip_return":
+        reward = delta / max(float(initial_stack), 1.0)
+        limit = reward_bound(env)
+        return float(min(max(reward, -limit), limit)) if limit is not None else float(reward)
+    if mode == "bb_normalized":
+        return float(delta) / max(float(big_blind), 1.0)
+    if mode == "chip_return":
+        return float(delta)
+    if mode == "binary":
+        return float((delta > 0) - (delta < 0))
+    raise ValueError(f"unknown reward_mode: {mode!r}")
 
 
 def resolve_q_head(cfg: "Config") -> tuple:

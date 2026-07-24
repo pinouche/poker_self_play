@@ -468,8 +468,11 @@ def test_coevolution_samples_seat_owners_with_replacement():
     _, worker = _coevo_worker(cfg, num_policies=2, seed=5)
     saw_repeat = False
     for _ in range(200):
-        owners = worker._sample_seat_owners()
-        assert len(owners) == cfg.env.num_players
+        seats = worker._sample_seats()
+        assert len(seats) == cfg.env.num_players
+        # League is off by default, so every seat is a live member.
+        owners = [payload for kind, payload in seats]
+        assert all(kind == "live" for kind, _ in seats)
         assert all(0 <= o < 2 for o in owners)
         saw_repeat |= len(set(owners)) < len(owners)
     assert saw_repeat, "with replacement, a network should sometimes take >1 seat"
@@ -519,3 +522,91 @@ def test_coevolution_optimizes_every_network():
             for old, new in zip(before[k], networks[k].parameters())
         )
         assert moved, f"network {k} did not update"
+
+
+def test_coevolution_heterogeneous_reward_routing():
+    """Each member's transitions are scored under its OWN reward_mode."""
+    from training.self_play import CoevolutionSelfPlayWorker
+
+    cfg = small_config()
+    # Two small members, same (small) architecture, different objectives.
+    ev_cfg = small_config(); ev_cfg.env.reward_mode = "normalized_chip_return"
+    bin_cfg = small_config(); bin_cfg.env.reward_mode = "binary"
+    member_cfgs = [ev_cfg, bin_cfg]
+    nets = [build_network(mc) for mc in member_cfgs]
+    worker = CoevolutionSelfPlayWorker(
+        cfg, nets, ObservationEncoder(cfg.obs), seed=2, num_envs=8, member_configs=member_cfgs
+    )
+    per_net, _ = worker.generate(120)
+
+    # Binary member: every terminal reward is exactly sign(chips).
+    bin_terminal = [t.reward for t in per_net[1] if t.done]
+    assert bin_terminal
+    assert set(bin_terminal) <= {-1.0, 0.0, 1.0}
+    # Chip-EV member: rewards are fractional, so some fall outside {-1, 0, 1}.
+    ev_terminal = [t.reward for t in per_net[0] if t.done]
+    assert any(r not in {-1.0, 0.0, 1.0} for r in ev_terminal), "chip-EV rewards should be fractional"
+
+
+def test_coevolution_league_seats_are_opponents_not_learners():
+    """League seats play but never produce training data, and stay legal."""
+    from training.self_play import CoevolutionSelfPlayWorker
+
+    cfg = small_config()
+    cfg.train.coevolution_league_prob = 0.5
+    cfg.train.coevolution_league_bots = ("loose_passive", "calling_station")
+    cfg.train.population_snapshot_every = 2
+    n = 3
+    nets = [build_network(cfg) for _ in range(n)]
+    worker = CoevolutionSelfPlayWorker(cfg, nets, ObservationEncoder(cfg.obs), seed=4, num_envs=8)
+    assert worker.league_bots, "fixed league bots should be built from names"
+
+    for _ in range(4):  # fill the frozen-snapshot library
+        worker.maybe_snapshot()
+    assert len(worker.league) > 0
+
+    per_net, stats = worker.generate(80)
+    # League seats really did act...
+    assert stats["league_decision_rate"] > 0.0
+    # ...but every collected transition still belongs to a live member and is legal.
+    assert stats["transitions"] == sum(len(g) for g in per_net)
+    assert any(len(g) > 0 for g in per_net)
+    for group in per_net:
+        for t in group:
+            assert t.legal_action_mask[t.action] == 1.0
+    assert sum(stats["mean_chips_per_seat"]) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_coevolution_league_disabled_by_default():
+    from training.self_play import CoevolutionSelfPlayWorker
+
+    cfg = small_config()
+    nets = [build_network(cfg) for _ in range(2)]
+    worker = CoevolutionSelfPlayWorker(cfg, nets, ObservationEncoder(cfg.obs), seed=5, num_envs=4)
+    worker.maybe_snapshot()  # no-op when the league is off
+    _, stats = worker.generate(20)
+    assert worker.league_prob == 0.0
+    assert stats["league_decision_rate"] == 0.0
+    assert len(worker.league) == 0
+
+
+def test_archetypes_all_optimise_the_same_objective():
+    """Mixed reward modes poison co-evolution; archetypes vary style only."""
+    from training.population import POPULATION_ARCHETYPES
+
+    assert {a[3] for a in POPULATION_ARCHETYPES} == {"normalized_chip_return"}
+    # ...while still differing in capacity, sharpness and exploration.
+    assert len({a[0] for a in POPULATION_ARCHETYPES}) >= 3
+    assert len({a[1] for a in POPULATION_ARCHETYPES}) > 1
+    assert len({a[2] for a in POPULATION_ARCHETYPES}) > 1
+
+
+def test_coevolution_member_configs_length_must_match():
+    from training.self_play import CoevolutionSelfPlayWorker
+
+    cfg = small_config()
+    nets = [build_network(cfg) for _ in range(2)]
+    with pytest.raises(ValueError):
+        CoevolutionSelfPlayWorker(
+            cfg, nets, ObservationEncoder(cfg.obs), member_configs=[cfg]
+        )

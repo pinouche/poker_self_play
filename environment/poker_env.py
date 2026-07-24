@@ -18,7 +18,7 @@ import itertools
 import random
 from typing import Dict, List, Optional, Sequence
 
-from config import EnvConfig, ObsConfig, reward_bound
+from config import EnvConfig, ObsConfig, seat_reward
 
 from .betting import (
     LegalActions,
@@ -378,35 +378,10 @@ class PokerEnv:
         """
         if not self.is_terminal:
             raise RuntimeError("hand is not over")
-        deltas = self.chip_deltas()
-        mode = self.cfg.reward_mode
-
-        if mode == "normalized_chip_return":
-            return [
-                self._clip(d / max(float(self.state.initial_stacks[seat]), 1.0))
-                for seat, d in enumerate(deltas)
-            ]
-        if mode == "bb_normalized":
-            return [float(d) / max(float(self.state.big_blind), 1.0) for d in deltas]
-        if mode == "chip_return":
-            return [float(d) for d in deltas]
-        if mode == "binary":
-            return [float((d > 0) - (d < 0)) for d in deltas]
-        raise ValueError(f"unknown reward_mode: {mode}")
-
-    def _clip(self, reward: float) -> float:
-        """Apply the symmetric reward clip.
-
-        The default limit is the tightest bound the rules allow
-        (``num_players - 1``), so it acts purely as a guard against rule or
-        side-pot bugs and never truncates a legitimate result.  Clipping tighter
-        than that is not free: it breaks the zero-sum property of the reward and
-        biases the agent toward folding.
-        """
-        limit = reward_bound(self.cfg)
-        if limit is None:
-            return float(reward)
-        return float(min(max(reward, -limit), limit))
+        return [
+            seat_reward(d, self.state.initial_stacks[seat], self.state.big_blind, self.cfg)
+            for seat, d in enumerate(self.chip_deltas())
+        ]
 
     def showdown_summary(self) -> dict:
         """Human-readable result of the finished hand (debugging/eval only)."""

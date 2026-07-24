@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from config import Config, reward_scale
+from config import Config, reward_scale, seat_reward
 from environment.poker_env import PokerEnv
 from model.network import PokerNet
 from representation.action_encoder import apply_temperature, masked_softmax, sample_action
@@ -268,18 +268,23 @@ def build_transitions(
 
 
 def build_opponent_pool(
-    cfg: Config, network: PokerNet, device: Optional[str] = None
+    cfg: Config,
+    network: Optional[PokerNet] = None,
+    device: Optional[str] = None,
+    names: Optional[Sequence[str]] = None,
 ) -> List[Agent]:
-    """Instantiate the configured fixed opponents.
+    """Instantiate fixed opponents by name.
 
-    Frozen learner snapshots ("checkpoint") are added separately by the
-    training loop via :func:`snapshot_agent`, since they change over time.
+    Defaults to ``cfg.train.opponent_pool``; pass ``names`` to build a different
+    set (the co-evolution league uses this).  Frozen learner snapshots
+    ("checkpoint") are added separately by the training loop via
+    :func:`snapshot_agent`, since they change over time.
     """
     from evaluation.heuristic_agent import HEURISTIC_AGENTS
     from evaluation.random_agent import BASELINE_AGENTS
 
     pool: List[Agent] = []
-    for index, name in enumerate(cfg.train.opponent_pool):
+    for index, name in enumerate(cfg.train.opponent_pool if names is None else names):
         if name == "checkpoint":
             continue
         if name in BASELINE_AGENTS:
@@ -841,6 +846,7 @@ class CoevolutionSelfPlayWorker:
         device: Optional[str] = None,
         seed: int = 0,
         num_envs: int = 1,
+        member_configs: Optional[Sequence[Config]] = None,
     ) -> None:
         if len(networks) < 1:
             raise ValueError("co-evolution needs at least one network")
@@ -850,29 +856,96 @@ class CoevolutionSelfPlayWorker:
         self.encoder = encoder
         self.device = device
         self.num_envs = max(1, num_envs)
-        # alpha/beta/temperature/q_scale are shared config, applied directly in
-        # ``network_action_choice`` -- the seats differ only in which network's
-        # forward pass feeds them, so no per-network ``NetworkAgent`` is needed.
         self.q_scale = reward_scale(cfg.env)
+        # Per-member acting parameters and reward mode.  A homogeneous population
+        # (member_configs=None) shares the base config, so every seat acts and is
+        # rewarded identically -- the original clone behaviour.  A heterogeneous
+        # population passes one config per member: each seat then acts with its
+        # owner's (alpha, beta, temperature, q_scale) and its transitions are
+        # rewarded under its owner's reward_mode (self.member_env, else None).
+        if member_configs is None:
+            self.member_act = [
+                (cfg.train.alpha, cfg.train.beta, cfg.train.sampling_temperature, self.q_scale)
+            ] * self.num_policies
+            self.member_env = None
+        else:
+            if len(member_configs) != self.num_policies:
+                raise ValueError("member_configs must have one config per network")
+            self.member_act = [
+                (mc.train.alpha, mc.train.beta, mc.train.sampling_temperature, reward_scale(mc.env))
+                for mc in member_configs
+            ]
+            self.member_env = [mc.env for mc in member_configs]
+        self.member_cfgs = list(member_configs) if member_configs is not None else [cfg] * self.num_policies
+
+        # League: frozen snapshots of past members plus any fixed bots.  These
+        # are opponents, not learners -- their decisions are never collected.
+        from training.population import PolicyLibrary
+
+        self.league_prob = float(cfg.train.coevolution_league_prob)
+        self.league_bots: List[Agent] = list(
+            build_opponent_pool(cfg, None, device, names=cfg.train.coevolution_league_bots)
+        ) if cfg.train.coevolution_league_bots else []
+        self.league = PolicyLibrary(
+            capacity=cfg.train.population_library_size,
+            weighting=cfg.train.league_weighting,
+            decay=cfg.train.league_recency_decay,
+        )
+        self._iteration = 0
         self.rng = random.Random(seed)
         self.envs = [
             PokerEnv(cfg.env, cfg.obs, seed=seed * 1000 + i) for i in range(self.num_envs)
         ]
         self.rngs = [random.Random(seed * 7919 + i) for i in range(self.num_envs)]
 
-    def _sample_seat_owners(self) -> List[int]:
-        """One network index per seat, drawn uniformly with replacement.
+    def maybe_snapshot(self) -> None:
+        """Freeze the current members into the league on the configured cadence.
 
-        With replacement means the same network can occupy several seats and thus
-        play against copies of itself.
+        Called once per training iteration.  Every member is snapshotted so the
+        league holds a recency-weighted spread of past selves -- strong
+        opponents that differ from the current population without being weak.
+        """
+        from training.population import freeze_policy
+
+        if self.league_prob <= 0:
+            return
+        self._iteration += 1
+        every = max(1, self.cfg.train.population_snapshot_every)
+        if self._iteration % every == 0:
+            for mc, net in zip(self.member_cfgs, self.networks):
+                self.league.add(freeze_policy(mc, net, self.device))
+
+    def _league_agent(self) -> Optional[Agent]:
+        """A frozen opponent: a recency-weighted past self, or a fixed bot."""
+        choices: List[Agent] = list(self.league_bots)
+        if not self.league.is_empty:
+            choices.append(self.league.sample(self.rng))
+        return self.rng.choice(choices) if choices else None
+
+    def _sample_seats(self) -> List[tuple]:
+        """Per-seat assignment: ``("live", member_index)`` or ``("league", agent)``.
+
+        Live members are drawn uniformly with replacement, so the same network
+        can occupy several seats and play copies of itself.  With probability
+        ``coevolution_league_prob`` a seat instead holds a frozen league
+        opponent.  At least one seat always stays live, so no hand is wasted.
         """
         n = self.cfg.env.num_players
-        return [self.rng.randrange(self.num_policies) for _ in range(n)]
+        seats: List[tuple] = []
+        for _ in range(n):
+            agent = self._league_agent() if self.rng.random() < self.league_prob else None
+            seats.append(
+                ("league", agent) if agent is not None
+                else ("live", self.rng.randrange(self.num_policies))
+            )
+        if all(kind == "league" for kind, _ in seats):
+            seats[self.rng.randrange(n)] = ("live", self.rng.randrange(self.num_policies))
+        return seats
 
     def _start_hand(self, index: int) -> dict:
         self.envs[index].reset()
         return {
-            "seat_owner": self._sample_seat_owners(),
+            "seats": self._sample_seats(),
             "chains": {seat: [] for seat in range(self.cfg.env.num_players)},
         }
 
@@ -885,7 +958,7 @@ class CoevolutionSelfPlayWorker:
         """
         cfg = self.cfg.train
         per_network: List[List[Transition]] = [[] for _ in range(self.num_policies)]
-        completed = showdowns = decisions = 0
+        completed = showdowns = decisions = league_decisions = 0
         reward_sums = np.zeros(self.cfg.env.num_players, dtype=np.float64)
         chip_sums = np.zeros(self.cfg.env.num_players, dtype=np.float64)
 
@@ -896,9 +969,11 @@ class CoevolutionSelfPlayWorker:
         started = active_envs
 
         while any(slot is not None for slot in slots):
-            # Gather every pending decision across the active envs.  Every seat is
-            # network-controlled here, so each row needs a (network) forward pass.
-            pending = []  # (index, seat, flat, mask, owner)
+            # Gather every pending decision, split by whether the seat is held by
+            # a live member (batched, collected) or a frozen league opponent
+            # (acts individually, never collected).
+            pending_live = []    # (index, seat, flat, mask, owner)
+            pending_league = []  # (index, seat, observation, flat, mask, agent)
             for index, slot in enumerate(slots):
                 if slot is None:
                     continue
@@ -911,15 +986,19 @@ class CoevolutionSelfPlayWorker:
                 if mask.sum() <= 0:
                     raise RuntimeError(f"seat {seat} has no legal actions")
                 flat = self.encoder.encode_flat(observation)
-                pending.append((index, seat, flat, mask, slot["seat_owner"][seat]))
+                kind, payload = slot["seats"][seat]
+                if kind == "live":
+                    pending_live.append((index, seat, flat, mask, payload))
+                else:
+                    pending_league.append((index, seat, observation, flat, mask, payload))
 
-            if not pending:
+            if not pending_live and not pending_league:
                 break
 
             # One batched forward pass per network, over the rows it owns.
             outputs = {}  # (index, seat) -> (logits, q_values)
             for net_idx in range(self.num_policies):
-                rows = [row for row in pending if row[4] == net_idx]
+                rows = [row for row in pending_live if row[4] == net_idx]
                 if not rows:
                     continue
                 observations = np.stack([row[2] for row in rows])
@@ -929,16 +1008,17 @@ class CoevolutionSelfPlayWorker:
                 for offset, row in enumerate(rows):
                     outputs[(row[0], row[1])] = (logits[offset], q_values[offset])
 
-            for index, seat, flat, mask, _owner in pending:
+            for index, seat, flat, mask, owner in pending_live:
                 logit_row, q_row = outputs[(index, seat)]
+                alpha, beta, temperature, q_scale = self.member_act[owner]
                 choice = network_action_choice(
                     logit_row,
                     q_row,
                     mask,
-                    cfg.alpha,
-                    cfg.beta,
-                    cfg.sampling_temperature,
-                    self.q_scale,
+                    alpha,
+                    beta,
+                    temperature,
+                    q_scale,
                     self.rngs[index],
                 )
                 slots[index]["chains"][seat].append(
@@ -953,19 +1033,65 @@ class CoevolutionSelfPlayWorker:
                 decisions += 1
                 self.envs[index].step(choice.action)
 
+            # League seats: frozen opponents, never collected.  Snapshot
+            # opponents are networks too, so group them per agent and batch the
+            # forward pass exactly like the live members (identical results to
+            # ``NetworkAgent.act``, just far fewer single-row passes); heuristic
+            # bots have no network and act individually.
+            league_outputs = {}
+            by_agent: Dict[int, List[tuple]] = {}
+            for row in pending_league:
+                if isinstance(row[5], NetworkAgent):
+                    by_agent.setdefault(id(row[5]), []).append(row)
+            for rows in by_agent.values():
+                agent = rows[0][5]
+                observations = np.stack([r[3] for r in rows])
+                logits, q_values = agent.network.infer_batch(observations, device=self.device)
+                for offset, r in enumerate(rows):
+                    league_outputs[(r[0], r[1])] = (logits[offset], q_values[offset])
+
+            for index, seat, observation, flat, mask, agent in pending_league:
+                if (index, seat) in league_outputs:
+                    logit_row, q_row = league_outputs[(index, seat)]
+                    choice = network_action_choice(
+                        logit_row, q_row, mask, agent.alpha, agent.beta,
+                        agent.temperature, agent.q_scale, self.rngs[index],
+                    )
+                else:
+                    choice = agent.act(observation, flat, mask, self.rngs[index])
+                if not mask[choice.action]:
+                    raise RuntimeError(
+                        f"league agent {getattr(agent, 'name', '?')} chose illegal action"
+                    )
+                decisions += 1
+                league_decisions += 1
+                self.envs[index].step(choice.action)
+
             for index, slot in enumerate(slots):
                 if slot is None or not self.envs[index].is_terminal:
                     continue
                 env = self.envs[index]
-                rewards = env.terminal_rewards()
-                # Route each seat's transitions to the network that played it.
+                rewards = env.terminal_rewards()  # base mode, for diagnostics
+                deltas = env.chip_deltas() if self.member_env is not None else None
+                # Route each seat's transitions to the network that played it,
+                # scored under that owner's reward mode when heterogeneous.
                 for seat, chain in slot["chains"].items():
                     if not chain:
                         continue
-                    owner = slot["seat_owner"][seat]
+                    kind, owner = slot["seats"][seat]
+                    if kind != "live":  # league seats are never collected
+                        continue
+                    if self.member_env is not None:
+                        seat_rewards = list(rewards)
+                        seat_rewards[seat] = seat_reward(
+                            deltas[seat], env.state.initial_stacks[seat],
+                            env.state.big_blind, self.member_env[owner],
+                        )
+                    else:
+                        seat_rewards = rewards
                     per_network[owner].extend(
                         build_transitions(
-                            {seat: chain}, rewards, cfg.gamma, cfg.lam, cfg.store_next_obs
+                            {seat: chain}, seat_rewards, cfg.gamma, cfg.lam, cfg.store_next_obs
                         )
                     )
                 showdowns += int(env.state.went_to_showdown)
@@ -989,5 +1115,7 @@ class CoevolutionSelfPlayWorker:
             "mean_chips_per_seat": (chip_sums / max(1, completed)).tolist(),
             "num_policies": self.num_policies,
             "num_envs": self.num_envs,
+            "league_decision_rate": league_decisions / max(1, decisions),
+            "league_size": len(self.league),
         }
         return per_network, stats
