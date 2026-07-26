@@ -822,6 +822,8 @@ python benchmark.py replot   --report runs/report                  # redraw figu
 ```
 
 `report` writes `<prefix>_histories.json` alongside the tables, holding every
+
+
 cell's per-iteration metrics for every seed. `replot` redraws both figures from
 that file and `<prefix>.json` alone, so the plots can be restyled after the run
 directories — which are large, and hold the checkpoints — have been deleted.
@@ -1192,6 +1194,83 @@ single-network run, but wall-clock per iteration is somewhat higher -- five
 optimisers step each iteration and the batched forward pass is split into
 per-network groups.  And `--resume` is not supported for a population (each
 network has its own checkpoint); start co-evolution runs fresh.
+
+## Role-structured league (`--league`)
+
+`--num-policies n` co-evolves `n` interchangeable learners.  `--league` gives the
+population *structure* — 32 networks by default, split 16 / 8 / 8:
+
+* **learners (16)** — updated every iteration; the working edge.
+* **champions (8)** — frozen snapshots, never updated.  One cheap idea that
+  addresses catastrophic forgetting, meta-game collapse, strategy cycling and
+  unstable evaluation at once: with only live members the whole population can
+  drift off a good strategy together and never notice.
+* **explorers (8)** — learners wiped and reinitialised **from scratch** every
+  `league_explorer_reset_hands`.  From scratch, not cloned: a fresh random
+  policy is genuinely off-distribution, an offspring inherits the same blind
+  spots.
+
+```bash
+python train.py --league --checkpoint-dir checkpoints/league
+```
+
+### Matchmaking
+
+Seats are filled by match type, not uniformly, so learners keep meeting history
+instead of only the newest policies: **50%** learner-vs-learner, **30%** one
+learner against two champions, **20%** mixed (learner + champion + explorer).
+Seat *order* is shuffled afterwards — otherwise a role would be pinned to a
+position and inherit its positional edge, quietly biasing every strength
+estimate.  Champions play but are never collected, so roughly 73% of decisions
+become training data.
+
+### The three metrics
+
+Deliberately not Elo: Elo assumes a two-player transitive game and three-handed
+poker is neither.
+
+| metric | definition |
+|---|---|
+| **strength** | mean chip delta per hand ÷ the seat's own starting stack, over many opponent triples (also reported as mbb/100) |
+| **diversity** | mean pairwise `KL(π_i‖π_j)` on a **fixed** bank of self-play states — "acts differently in the same spot", not "scores differently" |
+| **coverage** | distinct opponents `j` where `i`'s mean result over the hands they shared is positive |
+
+Strength and coverage accumulate from *real* league play (free, and the sample
+the promotion rules judge); diversity needs its own KL pass.
+
+Management ranks on
+
+```
+score = 0.6 * norm(strength) + 0.4 * norm(diversity)
+```
+
+Both terms are **min-max normalised first** — raw chip EV is O(0.05) and raw KL
+is O(1), so an unnormalised sum would be decided entirely by the KL term.
+Ranking on strength alone is exactly what collapses a league into 32 copies of
+one policy; the diversity term means a slightly weaker but strategically
+different network keeps its slot.  That is also why no crossover/mutation
+operators are needed.
+
+### Promotion is earned, never scheduled
+
+A learner is promoted only when it clears three gates on real play: it sustains
+`league_promotion_mbb_per_100` over at least `league_promotion_hands` hands, and
+beats `league_promotion_min_generations` of the existing champion generations.
+That last gate is the anti-over-specialisation check — a learner that beats the
+newest champion but loses badly to an old one has learned the current meta, not
+the game.  `champion_gauntlet()` reports this per learner and flags exactly that
+pattern.
+
+Each cycle freezes **two kinds**: the highest-EV candidate *and* the most
+behaviourally different one, so the ladder accumulates strong strategies and
+unusual ones rather than eight variants of one idea.  Promotion evicts stale
+champions first, then the oldest — a champion that loses badly to the whole
+league is flagged by `league_champion_retire_mbb_per_100` and recycled, so the
+pool rolls instead of carrying corpses.
+
+Code: `training/league.py` (population and management),
+`training/league_metrics.py` (the three metrics),
+`training/league_play.py` (the worker).
 
 ### Evaluating each network
 

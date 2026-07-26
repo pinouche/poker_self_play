@@ -1,11 +1,13 @@
 """Role-structured league population and its three management metrics."""
 
+import collections
+
 import numpy as np
 import pytest
 
 from config import Config, ModelConfig
 from representation.observation_encoder import ObservationEncoder
-from training.league import LeagueMember, LeaguePopulation, Role
+from training.league import LeaguePopulation, MatchType, Role
 from training.league_metrics import (
     diversity_from_kl,
     masked_softmax_rows,
@@ -23,6 +25,7 @@ def small_league_config(learners=2, champions=1, explorers=1) -> Config:
     cfg.train.league_explorers = explorers
     cfg.train.league_strength_hands = 40
     cfg.train.league_diversity_states = 60
+    cfg.train.league_gauntlet_min_hands = 1   # count small samples in tests
     return cfg
 
 
@@ -118,13 +121,86 @@ def test_champions_are_frozen():
         assert all(not p.requires_grad for p in network.parameters())
 
 
-def test_sample_seats_returns_valid_members():
+def test_sample_seats_returns_valid_members_and_a_match_type():
     cfg = small_league_config(learners=2, champions=1, explorers=1)
     pop = LeaguePopulation(cfg, seed=0)
     for _ in range(50):
-        seats = pop.sample_seats(cfg.env.num_players)
+        seats, match = pop.sample_seats(cfg.env.num_players)
         assert len(seats) == cfg.env.num_players
         assert all(0 <= s < len(pop) for s in seats)
+        assert isinstance(match, MatchType)
+
+
+# --- matchmaking -----------------------------------------------------------
+def test_matchmaking_follows_the_configured_mix():
+    cfg = small_league_config(learners=4, champions=2, explorers=2)
+    cfg.train.league_match_learner_vs_learner = 0.5
+    cfg.train.league_match_learner_vs_champion = 0.3
+    cfg.train.league_match_mixed = 0.2
+    pop = LeaguePopulation(cfg, seed=0)
+
+    counts = collections.Counter(pop.sample_seats(3)[1] for _ in range(4000))
+    assert counts[MatchType.LEARNER_VS_LEARNER] / 4000 == pytest.approx(0.5, abs=0.04)
+    assert counts[MatchType.LEARNER_VS_CHAMPION] / 4000 == pytest.approx(0.3, abs=0.04)
+    assert counts[MatchType.MIXED] / 4000 == pytest.approx(0.2, abs=0.04)
+
+
+def test_learner_vs_champion_seats_one_learner_against_champions():
+    cfg = small_league_config(learners=4, champions=2, explorers=1)
+    cfg.train.league_match_learner_vs_learner = 0.0
+    cfg.train.league_match_learner_vs_champion = 1.0
+    cfg.train.league_match_mixed = 0.0
+    pop = LeaguePopulation(cfg, seed=0)
+    learners, champions = set(pop.indices(Role.LEARNER)), set(pop.indices(Role.CHAMPION))
+
+    for _ in range(50):
+        seats, match = pop.sample_seats(3)
+        assert match is MatchType.LEARNER_VS_CHAMPION
+        assert sum(1 for s in seats if s in learners) == 1
+        assert sum(1 for s in seats if s in champions) == 2
+
+
+def test_seat_order_is_shuffled_so_roles_do_not_inherit_position():
+    """A learner pinned to one seat would inherit that seat's positional edge."""
+    cfg = small_league_config(learners=4, champions=2, explorers=1)
+    cfg.train.league_match_learner_vs_learner = 0.0
+    cfg.train.league_match_learner_vs_champion = 1.0
+    cfg.train.league_match_mixed = 0.0
+    pop = LeaguePopulation(cfg, seed=0)
+    learners = set(pop.indices(Role.LEARNER))
+
+    positions = {seat_index for _ in range(200)
+                 for seat_index, member in enumerate(pop.sample_seats(3)[0])
+                 if member in learners}
+    assert positions == {0, 1, 2}
+
+
+# --- running record from real play -----------------------------------------
+def test_record_hand_builds_running_strength_and_pair_results():
+    cfg = small_league_config(learners=2, champions=1, explorers=0)
+    pop = LeaguePopulation(cfg, seed=0)
+    pop.record_hand([0, 1, 2], [0.5, -0.25, -0.25])
+    pop.record_hand([0, 1, 2], [0.1, -0.05, -0.05])
+
+    assert pop.total_hands == 2
+    assert pop.members[0].hands_played == 2
+    assert pop.members[0].strength == pytest.approx(0.3)
+    pair = pop.running_pair_mean()
+    assert pair[0, 1] == pytest.approx(0.3)    # member 0's mean when 1 also sat
+    assert pair[1, 0] == pytest.approx(-0.15)
+    assert pop.running_coverage()[0] == 2      # positive against both opponents
+
+
+def test_replacing_a_slot_forgets_its_record():
+    cfg = small_league_config(learners=2, champions=1, explorers=0)
+    pop = LeaguePopulation(cfg, seed=0)
+    pop.record_hand([0, 1, 2], [0.5, -0.25, -0.25])
+    scores = [1.0] * len(pop)
+    scores[0] = -1.0
+
+    assert pop.cull(scores) == 0
+    assert pop.members[0].hands_played == 0   # a new network did not earn that record
+    assert pop.running_pair_mean()[0, 1] == 0.0
 
 
 # --- management ------------------------------------------------------------
@@ -134,11 +210,9 @@ def test_promoted_champion_is_frozen_and_independent_of_the_live_learner():
     cfg = small_league_config(learners=2, champions=1, explorers=0)
     pop = LeaguePopulation(cfg, seed=0)
     best = pop.indices(Role.LEARNER)[1]
-    scores = [0.0] * len(pop)
-    scores[best] = 1.0
 
-    promoted, slot = pop.promote(scores)
-    assert promoted == best
+    slot = pop.promote(best, "elite")
+    assert slot in pop.indices(Role.CHAMPION)
     champion = pop.members[slot]
     assert champion.role is Role.CHAMPION
     assert all(not p.requires_grad for p in champion.network.parameters())
@@ -182,16 +256,359 @@ def test_explorers_reset_from_scratch_on_the_hand_schedule():
     assert pop.maybe_reset_explorers() == []      # not again until the next window
 
 
+# --- champion gauntlet and earned promotion --------------------------------
+def _beat(pop, learner, opponent, filler, value, times=5):
+    """Record ``times`` hands where ``learner`` scores ``value`` against ``opponent``."""
+    for _ in range(times):
+        pop.record_hand([learner, opponent, filler], [value, -value / 2, -value / 2])
+
+
+def test_gauntlet_flags_a_learner_that_only_beats_the_newest_champion():
+    """Beating the newest champion while losing to the oldest = over-specialised."""
+    cfg = small_league_config(learners=2, champions=2, explorers=0)
+    pop = LeaguePopulation(cfg, seed=0)
+    l0, l1 = pop.indices(Role.LEARNER)
+    champions = pop.indices(Role.CHAMPION)
+    pop.members[champions[0]].trained_at_hands = 0      # oldest generation
+    pop.members[champions[1]].trained_at_hands = 100    # newest generation
+    old, new = pop.champion_generations()
+
+    _beat(pop, l0, old, l1, -0.30)   # loses badly to the old guard
+    _beat(pop, l0, new, l1, +0.30)   # beats the current meta
+
+    gauntlet = pop.champion_gauntlet()
+    row = list(gauntlet["learners"]).index(l0)
+    assert gauntlet["generations"] == [old, new]
+    assert gauntlet["results"][row, 0] < 0 < gauntlet["results"][row, 1]
+    assert gauntlet["beats"][row] == 1
+    assert gauntlet["over_specialised"][row]
+
+
+def test_promotion_gate_is_the_relative_median_not_beat_all():
+    """Fix 1: beat the median champion faced, so a strong ladder can't lock."""
+    cfg = small_league_config(learners=2, champions=2, explorers=0)
+    cfg.train.league_promotion_hands = 10
+    cfg.train.league_promotion_mbb_per_100 = 0.0
+    cfg.train.league_promotion_min_generations = 0.5   # median
+    cfg.train.league_promotion_reject_over_specialised = False  # isolate the median gate
+    pop = LeaguePopulation(cfg, seed=0)
+    l0, l1 = pop.indices(Role.LEARNER)
+    c_old, c_new = pop.champion_generations()
+
+    assert pop.promotion_candidates() == []            # no hands played yet
+
+    for c in (c_old, c_new):
+        _beat(pop, l0, c, l1, +0.20, times=10)
+    assert l0 in pop.promotion_candidates()            # beats both
+
+    # Beat exactly the median (1 of 2) while a net winner -> still qualifies.
+    # The old "beat all generations" gate would have rejected this.
+    pop._clear_stats(l0)
+    _beat(pop, l0, c_old, l1, -0.10, times=10)         # small loss to one
+    _beat(pop, l0, c_new, l1, +0.40, times=10)         # big win over the other
+    assert l0 in pop.promotion_candidates()
+
+    # Beat none -> below the median, fails.
+    pop._clear_stats(l0)
+    _beat(pop, l0, c_old, l1, -0.20, times=10)
+    _beat(pop, l0, c_new, l1, -0.20, times=10)
+    assert l0 not in pop.promotion_candidates()
+
+
+def test_over_specialised_learner_is_rejected():
+    """Fix 1 (anti-over-spec): beats the newest but loses to the oldest -> no promotion."""
+    cfg = small_league_config(learners=2, champions=2, explorers=0)
+    cfg.train.league_promotion_hands = 10
+    cfg.train.league_promotion_mbb_per_100 = 0.0
+    cfg.train.league_promotion_min_generations = 0.5
+    cfg.train.league_promotion_reject_over_specialised = True
+    pop = LeaguePopulation(cfg, seed=0)
+    l0, l1 = pop.indices(Role.LEARNER)
+    c_old, c_new = pop.champion_generations()
+    pop.members[c_old].trained_at_hands = 0
+    pop.members[c_new].trained_at_hands = 100
+
+    _beat(pop, l0, c_new, l1, +0.20, times=10)   # beats newest
+    _beat(pop, l0, c_old, l1, -0.20, times=10)   # loses to oldest -> over-specialised
+    assert l0 not in pop.promotion_candidates()
+
+    cfg.train.league_promotion_reject_over_specialised = False
+    assert l0 in pop.promotion_candidates()      # same learner, gate off -> qualifies
+
+
+def test_cull_grace_protects_a_freshly_reset_learner():
+    """Fix 2: a just-culled learner is not re-culled every pass while it develops."""
+    cfg = small_league_config(learners=3, champions=1, explorers=0)
+    cfg.train.league_cull_grace_passes = 2
+    pop = LeaguePopulation(cfg, seed=0)
+    learners = pop.indices(Role.LEARNER)
+    scores = [1.0] * len(pop)
+    scores[learners[0]] = -1.0                   # learners[0] is always the weakest
+
+    r1 = pop.manage(scores)                       # pass 1: culls the weakest
+    assert r1.culled == learners[0]
+    assert pop.members[learners[0]].reset_at_pass == 1
+
+    r2 = pop.manage(scores)                        # pass 2: age 1 < grace -> protected
+    assert r2.culled != learners[0]
+
+    r3 = pop.manage(scores)                        # pass 3: age 2 >= grace -> eligible again
+    assert r3.culled == learners[0]
+
+
+def test_champion_retired_on_the_external_yardstick():
+    """Fix 3: a champion catastrophic vs the heuristic is stale even if fine in-league."""
+    cfg = small_league_config(learners=1, champions=2, explorers=0)
+    cfg.train.league_champion_retire_vs_heuristic = -100.0
+    cfg.train.league_champion_retire_mbb_per_100 = -1e12   # disable the in-league gate
+    pop = LeaguePopulation(cfg, seed=0)
+    c0, c1 = pop.indices(Role.CHAMPION)
+
+    external = [float("nan")] * len(pop)
+    external[c0] = -300.0    # catastrophic against the held-out heuristic
+    external[c1] = +20.0     # fine
+
+    assert pop.mark_stale_champions() == []               # nothing stale in-league
+    stale = pop.mark_stale_champions(external)
+    assert c0 in stale and c1 not in stale
+
+
+def test_most_different_fires_even_when_no_strict_candidate():
+    """Fix 4: diversity injection continues when the strict gate admits nobody."""
+    cfg = small_league_config(learners=3, champions=2, explorers=0)
+    cfg.train.league_promotion_hands = 1
+    cfg.train.league_most_different_top_k = 3
+    cfg.train.league_promotion_min_generations = 2.0   # impossible strict gate
+    pop = LeaguePopulation(cfg, seed=0)
+    learners = pop.indices(Role.LEARNER)
+    for c in pop.champion_generations():
+        for offset, learner in enumerate(learners):
+            _beat(pop, learner, c, learners[(offset + 1) % 3], +0.10, times=2)
+
+    assert pop.promotion_candidates() == []            # strict gate unmeetable
+    diversity = [0.0] * len(pop)
+    diversity[learners[2]] = 1.0
+    report = pop.manage([0.5] * len(pop), diversity=diversity, cull_worst=False)
+
+    reasons = {reason: learner for learner, _, reason in report.promoted}
+    assert "elite" not in reasons                      # nothing cleared the strict gate
+    assert reasons.get("most_different") == learners[2]  # ...but diversity still entered
+
+
+def test_most_different_pool_respects_a_strength_floor():
+    """Refinement: a near-random (weak) learner is never frozen for diversity."""
+    cfg = small_league_config(learners=3, champions=2, explorers=0)
+    cfg.train.league_promotion_hands = 1
+    cfg.train.league_most_different_top_k = 3
+    cfg.train.league_most_different_min_mbb_per_100 = 0.0   # must be net-positive in-league
+    pop = LeaguePopulation(cfg, seed=0)
+    l_strong, l_mid, l_weak = pop.indices(Role.LEARNER)
+    champ = pop.champion_generations()[0]
+    # strong/mid win in-league; the weak one loses (a stand-in for a fresh reset).
+    # l_weak is the filler for the winners so it is dragged down, not l_mid.
+    for c in pop.champion_generations():
+        _beat(pop, l_strong, c, l_weak, +0.30, times=5)
+        _beat(pop, l_mid, c, l_weak, +0.20, times=5)
+        _beat(pop, l_weak, c, l_mid, -0.40, times=5)
+
+    scores = [0.0] * len(pop)
+    diversity = [0.0] * len(pop)
+    diversity[l_weak] = 1.0                    # weakest is also the most diverse
+    report = pop.manage(scores, diversity=diversity, cull_worst=False)
+
+    reasons = {reason: learner for learner, _, reason in report.promoted}
+    # The weak-but-diverse learner is below the floor, so it is NOT promoted...
+    assert reasons.get("most_different") != l_weak
+    # ...but a competent learner still fills the diversity slot.
+    assert "most_different" in reasons
+
+
+def test_eviction_removes_the_most_redundant_champion_not_the_oldest():
+    """Refinement: keep distinct strategies, evict the redundant one."""
+    cfg = small_league_config(learners=1, champions=3, explorers=0)
+    pop = LeaguePopulation(cfg, seed=0)
+    learner = pop.indices(Role.LEARNER)[0]
+    c0, c1, c2 = pop.champion_generations()     # oldest -> newest
+    pop.members[c0].trained_at_hands = 0        # oldest but (below) unique
+    pop.members[c1].trained_at_hands = 10
+    pop.members[c2].trained_at_hands = 20
+
+    # No champion is stale, so eviction falls to the redundancy rule.
+    diversity = [1.0] * len(pop)
+    diversity[c0] = 0.9                          # the oldest is distinct -> keep it
+    diversity[c1] = 0.1                          # the most redundant -> evict this
+    diversity[c2] = 0.8
+
+    slot = pop.promote(learner, "elite", diversity=diversity)
+    assert slot == c1                            # redundant, not oldest (c0)
+
+    # With the rule off, eviction reverts to oldest.
+    cfg.train.league_evict_most_redundant = False
+    pop2 = LeaguePopulation(cfg, seed=1)
+    ln = pop2.indices(Role.LEARNER)[0]
+    a, b, c = pop2.champion_generations()
+    pop2.members[a].trained_at_hands = 0
+    pop2.members[b].trained_at_hands = 10
+    pop2.members[c].trained_at_hands = 20
+    assert pop2.promote(ln, "elite", diversity=[0.0, 0.0, 0.0, 0.0, 0.0][:len(pop2)]) == a
+
+
+def test_stale_champions_are_evicted_before_redundant_healthy_ones():
+    """Stale-first still holds: a bad champion goes even if it is distinct."""
+    cfg = small_league_config(learners=1, champions=3, explorers=0)
+    pop = LeaguePopulation(cfg, seed=0)
+    learner = pop.indices(Role.LEARNER)[0]
+    c0, c1, c2 = pop.champion_generations()
+    pop.members[c1].stale = True                 # one stale champion, and it is distinct
+    diversity = [1.0] * len(pop)
+    diversity[c1] = 0.9                           # high diversity, but stale
+    diversity[c0] = 0.1                           # most redundant, but healthy
+
+    assert pop.promote(learner, "elite", diversity=diversity) == c1   # stale wins
+
+
+def test_within_stale_diversity_does_not_buy_survival():
+    """A distinct-but-catastrophic champion is still evicted: evict oldest stale."""
+    cfg = small_league_config(learners=1, champions=3, explorers=0)
+    pop = LeaguePopulation(cfg, seed=0)
+    learner = pop.indices(Role.LEARNER)[0]
+    c0, c1, c2 = pop.champion_generations()
+    pop.members[c0].trained_at_hands = 0        # oldest stale
+    pop.members[c1].trained_at_hands = 10
+    pop.members[c0].stale = True
+    pop.members[c1].stale = True                 # two stale champions
+    diversity = [0.0] * len(pop)
+    diversity[c0] = 1.0                          # oldest stale is also the most diverse
+    diversity[c1] = 0.0
+
+    # Redundancy would keep c0 (diverse) and evict c1; the correct rule evicts
+    # the oldest stale (c0) -- diversity does not protect a bad champion.
+    assert pop.promote(learner, "elite", diversity=diversity) == c0
+
+
+def test_most_different_panel_filter_excludes_externally_weak():
+    """Panel gate: a diverse learner catastrophic vs standard opponents is dropped."""
+    cfg = small_league_config(learners=2, champions=1, explorers=0)
+    cfg.train.league_promotion_hands = 1
+    cfg.train.league_most_different_top_k = 2
+    cfg.train.league_most_different_min_panel_bb_per_100 = -100.0
+    pop = LeaguePopulation(cfg, seed=0)
+    a, b = pop.indices(Role.LEARNER)
+    champ = pop.champion_generations()[0]
+    _beat(pop, a, champ, b, +0.30, times=5)          # both net-positive in-league
+    _beat(pop, b, champ, a, +0.30, times=5)
+
+    scores = [0.0] * len(pop)
+    shortlist = pop.most_different_shortlist(scores)
+    assert a in shortlist and b in shortlist
+
+    panel = {a: -500.0, b: +20.0}                    # a catastrophic, b fine
+    pool = pop._most_different_pool(scores, panel_scores=panel)
+    assert a not in pool and b in pool
+    # No panel scores -> no filtering (backward compatible).
+    assert set(pop._most_different_pool(scores, panel_scores=None)) == set(shortlist)
+
+
+def test_evaluate_vs_panel_returns_finite_worst_case():
+    from model.network import build_network
+    from training.league_metrics import evaluate_vs_panel
+
+    cfg = small_league_config()
+    scores = evaluate_vs_panel(
+        [build_network(cfg)], cfg, ("loose_passive", "calling_station"),
+        40, ObservationEncoder(cfg.obs), seed=0,
+    )
+    assert scores.shape == (1,) and np.isfinite(scores[0])
+
+
+def test_estimate_exploitability_runs_and_returns_bb_per_100():
+    from model.network import build_network
+    from training.exploitability import estimate_exploitability
+
+    cfg = small_league_config()
+    cfg.train.batch_size = 32
+    cfg.train.min_buffer_before_training = 32
+    value = estimate_exploitability(
+        build_network(cfg), cfg, ObservationEncoder(cfg.obs),
+        iters=3, hands_per_iter=20, eval_hands=60, seed=0,
+    )
+    assert isinstance(value, float) and np.isfinite(value)
+
+
+def test_population_evaluate_is_deterministic_for_a_fixed_seed():
+    """Fix 5: a fixed eval seed gives paired (repeatable) metrics."""
+    cfg = small_league_config(learners=2, champions=1, explorers=1)
+    pop = LeaguePopulation(cfg, seed=0)
+    encoder = ObservationEncoder(cfg.obs)
+    m1 = pop.evaluate(encoder, seed=777)
+    m2 = pop.evaluate(encoder, seed=777)
+    for key in ("strength", "diversity", "coverage"):
+        np.testing.assert_allclose(m1[key], m2[key])
+
+
+def test_stale_champions_are_marked_and_evicted_before_the_oldest():
+    cfg = small_league_config(learners=2, champions=2, explorers=0)
+    cfg.train.league_champion_min_hands = 1
+    cfg.train.league_champion_retire_mbb_per_100 = -1.0
+    pop = LeaguePopulation(cfg, seed=0)
+    l0, l1 = pop.indices(Role.LEARNER)
+    oldest, newest = pop.champion_generations()
+
+    _beat(pop, l0, newest, l1, +0.30)   # the newest champion is being crushed
+    _beat(pop, l0, oldest, l1, -0.30)   # the oldest still holds up
+
+    stale = pop.mark_stale_champions()
+    assert newest in stale and oldest not in stale
+    # Staleness beats age: the newest slot is recycled even though it is younger.
+    assert pop.promote(l0, "elite") == newest
+
+
 def test_manage_reports_slots_whose_network_was_replaced():
     cfg = small_league_config(learners=3, champions=2, explorers=0)
+    cfg.train.league_promotion_hands = 1
+    cfg.train.league_promotion_mbb_per_100 = 0.0
+    cfg.train.league_promotion_min_generations = 0.0
     pop = LeaguePopulation(cfg, seed=0)
+    learners = pop.indices(Role.LEARNER)
+    for champion in pop.champion_generations():
+        _beat(pop, learners[0], champion, learners[1], +0.20, times=3)
+
     scores = list(np.linspace(0.0, 1.0, len(pop)))
-    report = pop.manage(scores)
-    assert report.promoted in pop.indices(Role.CHAMPION) + pop.indices(Role.LEARNER)
-    # The caller must rebuild the optimiser/buffer for every replaced slot.
-    assert report.champion_slot in report.rebuilt_slots
+    diversity = list(np.linspace(1.0, 0.0, len(pop)))
+    report = pop.manage(scores, diversity=diversity)
+
+    assert report.promoted, "a qualifying learner should have been promoted"
+    for learner, slot, reason in report.promoted:
+        assert reason in {"elite", "most_different"}
+        assert slot in report.rebuilt_slots      # caller rebuilds every replaced slot
     if report.culled is not None:
         assert report.culled in report.rebuilt_slots
+    assert report.describe()
+
+
+def test_manage_promotes_both_an_elite_and_a_most_different_member():
+    cfg = small_league_config(learners=3, champions=2, explorers=0)
+    cfg.train.league_promotion_hands = 1
+    cfg.train.league_promotion_mbb_per_100 = 0.0
+    cfg.train.league_promotion_min_generations = 0.5
+    cfg.train.league_most_different_top_k = 3
+    pop = LeaguePopulation(cfg, seed=0)
+    learners = pop.indices(Role.LEARNER)
+    # learners[0] beats champions hardest (highest mbb -> elite); all qualify.
+    for champion in pop.champion_generations():
+        _beat(pop, learners[0], champion, learners[2], +0.30, times=3)
+        _beat(pop, learners[1], champion, learners[2], +0.10, times=3)
+        _beat(pop, learners[2], champion, learners[0], +0.10, times=3)
+
+    scores = [0.0] * len(pop)
+    scores[learners[0]], scores[learners[1]], scores[learners[2]] = 1.0, 0.9, 0.8
+    diversity = [0.0] * len(pop)
+    diversity[learners[1]] = 1.0                 # most distinct among the top-K
+    report = pop.manage(scores, diversity=diversity, cull_worst=False)
+
+    reasons = {reason: learner for learner, _, reason in report.promoted}
+    assert reasons.get("elite") == learners[0]           # strongest strict candidate
+    assert reasons.get("most_different") == learners[1]   # most diverse of the top-K
 
 
 def test_manage_rejects_a_mismatched_score_vector():

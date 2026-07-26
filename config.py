@@ -276,6 +276,96 @@ class TrainConfig:
     league_strength_weight: float = 0.6
     league_diversity_weight: float = 0.4
 
+    # --- matchmaking --------------------------------------------------------
+    # How the three seats are filled.  Learners must keep meeting history, not
+    # just each other, or they overfit to the newest policies:
+    #   * learner_vs_learner -- all three seats learners (the working edge);
+    #   * learner_vs_champion -- one learner against two frozen champions;
+    #   * mixed -- learner + champion + explorer.
+    # Normalised if they do not sum to 1.
+    league_match_learner_vs_learner: float = 0.50
+    league_match_learner_vs_champion: float = 0.30
+    league_match_mixed: float = 0.20
+
+    # --- champion promotion and retirement ----------------------------------
+    # Champions are promoted on *performance*, never on a schedule: a learner
+    # must sustain ``league_promotion_mbb_per_100`` over at least
+    # ``league_promotion_hands`` hands of real league play, and beat the *median*
+    # champion generation it has faced (``league_promotion_min_generations``,
+    # 0.5 = median).  A relative median gate, not "beat 6 of all 8": as champions
+    # strengthen the absolute version becomes unmeetable and the ladder freezes
+    # (observed -- promotions stopped for eight passes at the strong end).
+    league_promotion_mbb_per_100: float = 35.0
+    league_promotion_hands: int = 2_000_000
+    league_promotion_min_generations: float = 0.5
+    # A generation counts as "faced" only past this many shared hands, so the
+    # median gate is judged on real samples rather than one-hand noise.
+    league_gauntlet_min_hands: int = 100
+    # A learner that beats the newest champion but loses badly to the oldest is
+    # over-specialised -- it has learned the current meta, not the game.  Such a
+    # learner is not promoted (the anti-over-specialisation gate).
+    league_promotion_reject_over_specialised: bool = True
+    # Each promotion cycle freezes two *kinds* of member, so the champion pool
+    # accumulates strong strategies and unusual ones rather than eight variants
+    # of the same idea.  The "most different" pick draws from the top
+    # ``league_most_different_top_k`` learners by score, *not* the strict
+    # promotion gate -- otherwise diversity injection stops exactly when the
+    # ladder is strong and only one learner can clear the gate.
+    league_promote_elite: bool = True
+    league_promote_most_different: bool = True
+    league_most_different_top_k: int = 4
+    # Strength floor for the "most different" pool: only learners at least this
+    # strong in-league are eligible, so diversity injection never freezes a
+    # near-random (freshly reset) learner as a champion.  0 = must be net-positive
+    # in-league; in a zero-sum league that is the upper ~half, so the pool stays
+    # populated and most_different keeps firing.
+    league_most_different_min_mbb_per_100: float = 0.0
+    # When a promotion must evict a champion, remove the most *redundant* one
+    # (lowest behavioural diversity to the rest of the pool) rather than the
+    # oldest.  This preserves genuinely distinct strategies -- including old ones
+    # -- and keeps the champion ladder from collapsing toward one style.  Stale
+    # champions are still evicted first.
+    league_evict_most_redundant: bool = True
+    # External competence panel for the "most different" gate.  The diversity
+    # slot seeks *unusual* learners, and unusual often means "loses to standard
+    # opponents"; the in-league floor cannot catch that (such a learner is
+    # in-league strong).  So a most_different candidate must also be no worse
+    # than ``league_most_different_min_panel_bb_per_100`` against the *worst* of a
+    # small fixed panel -- kept distinct from the held-out eval opponent
+    # (tight_aggressive) so evaluation stays independent.
+    league_external_panel: tuple = ("heuristic", "loose_passive")
+    league_most_different_min_panel_bb_per_100: float = -150.0
+    league_panel_hands: int = 300
+
+    # --- exploitability -----------------------------------------------------
+    # Approximate exploitability: freeze an agent in two seats, train a fresh
+    # best-responder in the third, and report how much it wins (bb/100).  0 would
+    # mean no adversary can gain -- a Nash equilibrium; a large value means the
+    # agent is far from unexploitable however strong it looks against a fixed
+    # heuristic.  A learned best response is a *lower bound* on true
+    # exploitability.  Measured at the end of a league run, and every
+    # ``league_exploitability_every`` management passes when that is > 0.
+    league_exploitability_every: int = 0
+    league_exploitability_iters: int = 300
+    # A champion is stale (evicted first, so the pool keeps rolling) if it loses
+    # this badly *in-league* OR falls below ``league_champion_retire_vs_heuristic``
+    # against the held-out heuristic.  The external gate matters because a
+    # champion catastrophic against a competent outside opponent can still look
+    # fine in-league if the league has not learned to punish its particular
+    # weirdness -- in-league strength alone is relative, not absolute.
+    league_champion_retire_mbb_per_100: float = -50_000.0
+    league_champion_retire_vs_heuristic: float = -150.0  # bb/100; NaN eval = skip
+    league_champion_min_hands: int = 5_000  # don't judge a champion on noise
+    # A freshly reset/culled learner is protected from being culled again for
+    # this many management passes, so it gets time to develop instead of being
+    # re-culled every pass while it is still the youngest (observed churn: three
+    # slots absorbed 19 of 20 culls).
+    league_cull_grace_passes: int = 2
+    # Fixed seed for the heuristic eval and the diversity validation bank, so the
+    # per-pass series is *paired* (same deals / same states).  Without it a frozen
+    # ladder alone swung +7..+158 bb/100 across passes from card variance.
+    league_eval_seed: int = 20_240
+
     # --- replay buffer ------------------------------------------------------
     # The specification suggests 1_000_000.  That is supported, but the default
     # is smaller so that `python train.py` is comfortable on a laptop

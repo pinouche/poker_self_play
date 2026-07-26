@@ -102,6 +102,16 @@ def parse_args() -> argparse.Namespace:
         "at once, with one sampled per seat per hand (default 1 = shared-network "
         "self-play)",
     )
+    parser.add_argument(
+        "--league", dest="league_population", action="store_true", default=None,
+        help="role-structured league: learners + frozen champions + explorers, "
+        "with behaviour-aware promotion (score = 0.6 strength + 0.4 diversity)",
+    )
+    parser.add_argument("--league-learners", type=int, default=None)
+    parser.add_argument("--league-champions", type=int, default=None)
+    parser.add_argument("--league-explorers", type=int, default=None)
+    parser.add_argument("--league-manage-every", type=int, default=None)
+    parser.add_argument("--league-promotion-hands", type=int, default=None)
     parser.add_argument("--no-eval", action="store_true")
     return parser.parse_args()
 
@@ -135,6 +145,12 @@ def build_config(args: argparse.Namespace) -> Config:
         ("league_weighting", "train"),
         ("population_self_play", "train"),
         ("num_policies", "train"),
+        ("league_population", "train"),
+        ("league_learners", "train"),
+        ("league_champions", "train"),
+        ("league_explorers", "train"),
+        ("league_manage_every", "train"),
+        ("league_promotion_hands", "train"),
         ("reward_mode", "env"),
         ("reward_clip", "env"),
         ("starting_stack", "env"),
@@ -315,6 +331,263 @@ def train_coevolution(cfg: Config, args: argparse.Namespace, encoder, device: st
     )
 
 
+def train_league(cfg: Config, args: argparse.Namespace, encoder, device: str) -> None:
+    """Training loop for the role-structured league.
+
+    Learners and explorers are optimised (one optimiser and replay buffer per
+    slot); champions only play.  A management pass every
+    ``league_manage_every`` iterations recomputes strength / diversity /
+    coverage, promotes earned learners into the frozen champion ladder, retires
+    stale champions and culls the weakest learner -- and any slot whose network
+    was replaced has its optimiser and buffer rebuilt here, since this loop owns
+    them.
+    """
+    from training.league import LeaguePopulation, Role
+    from training.league_play import LeagueSelfPlayWorker
+
+    population = LeaguePopulation(cfg, device=device, seed=cfg.train.seed)
+    worker = LeagueSelfPlayWorker(
+        cfg, population, encoder, device=device, seed=cfg.train.seed,
+        num_envs=max(1, cfg.train.self_play_envs),
+    )
+    trainable = population.trainable_indices()
+    per_slot_capacity = max(1_000, cfg.train.replay_capacity // max(1, len(trainable)))
+
+    def new_buffer() -> ReplayBuffer:
+        return ReplayBuffer(
+            capacity=per_slot_capacity,
+            observation_dim=encoder.observation_dim,
+            num_actions=encoder.spec.num_actions,
+            store_next_obs=cfg.train.store_next_obs,
+        )
+
+    buffers = {slot: new_buffer() for slot in trainable}
+    trainers = {
+        slot: Trainer(cfg, population.members[slot].network, device=device) for slot in trainable
+    }
+
+    counts = population.role_counts()
+    print(
+        f"device={device}  league={len(population)} networks "
+        f"({counts['learner']} learners, {counts['champion']} champions, "
+        f"{counts['explorer']} explorers)  parameters/net="
+        f"{population.networks[0].num_parameters():,}"
+    )
+    print(
+        f"  matchmaking: {cfg.train.league_match_learner_vs_learner:.0%} L-v-L / "
+        f"{cfg.train.league_match_learner_vs_champion:.0%} L-v-C / "
+        f"{cfg.train.league_match_mixed:.0%} mixed"
+    )
+    print(
+        f"  promotion: >= {cfg.train.league_promotion_mbb_per_100:.0f} mbb/100 over "
+        f"{cfg.train.league_promotion_hands:,} hands, beating the median champion "
+        f"(>= {cfg.train.league_promotion_min_generations:.0%} of generations faced)"
+    )
+    print(
+        f"  per-slot replay {per_slot_capacity:,}  ({len(trainable)} optimised slots)\n",
+        flush=True,
+    )
+
+    os.makedirs(cfg.train.checkpoint_dir, exist_ok=True)
+    cfg.save(os.path.join(cfg.train.checkpoint_dir, "config.json"))
+
+    sample_rng = np.random.default_rng(cfg.train.seed)
+    history = []
+    total_transitions = total_hands = total_updates = 0
+    started = time.time()
+    iteration = 0
+
+    try:
+        for iteration in range(1, cfg.train.iterations + 1):
+            tic = time.time()
+            per_member, sp_stats = worker.generate(cfg.train.hands_per_iteration)
+
+            iter_updates = trained = 0
+            accumulated: Dict[str, float] = {}
+            for slot in list(buffers):
+                transitions = per_member[slot]
+                buffers[slot].extend(transitions)
+                num_updates = updates_for_transitions(cfg.train, len(transitions))
+                metrics = trainers[slot].train_iteration(
+                    buffers[slot], num_updates=num_updates, rng=sample_rng
+                )
+                if metrics:
+                    trained += 1
+                    iter_updates += num_updates
+                    for key, value in metrics.items():
+                        accumulated[key] = accumulated.get(key, 0.0) + value
+            metrics = (
+                {key: value / trained for key, value in accumulated.items()} if trained else {}
+            )
+
+            total_transitions += sp_stats["transitions"]
+            total_hands += sp_stats["hands"]
+            total_updates += iter_updates
+            elapsed = time.time() - tic
+
+            # Explorers are wiped on their own hand schedule, independently of
+            # the management cadence.
+            reset = population.maybe_reset_explorers()
+            for slot in reset:
+                buffers[slot] = new_buffer()
+                trainers[slot] = Trainer(cfg, population.members[slot].network, device=device)
+            if reset:
+                print(f"  reinitialised explorers {reset} from scratch", flush=True)
+
+            if iteration % cfg.train.log_every == 0:
+                status = (
+                    f"[{iteration:>5}/{cfg.train.iterations}] "
+                    f"hands={total_hands/1e3:7.0f}k  "
+                    f"hands/s={sp_stats['hands'] / max(elapsed, 1e-6):5.0f}  "
+                    f"upd/it={iter_updates:>3}  "
+                    f"collected={sp_stats['collected_fraction']:.2f}  "
+                    f"showdown={sp_stats['showdown_rate']:.2f}"
+                )
+                status += ("  " + format_metrics(metrics)) if metrics else "  (filling buffers)"
+                print(status, flush=True)
+                history.append({
+                    "iteration": iteration, "total_hands": total_hands,
+                    "total_transitions": total_transitions, "total_updates": total_updates,
+                    **{k: v for k, v in sp_stats.items() if k != "transitions_per_member"},
+                    **metrics,
+                })
+
+            if cfg.train.league_manage_every > 0 and iteration % cfg.train.league_manage_every == 0:
+                # Fixed seed: paired trends (same validation states, same deals),
+                # so a frozen ladder reads flat instead of swinging on card luck.
+                eval_seed = int(cfg.train.league_eval_seed)
+                league_metrics = population.evaluate(encoder, seed=eval_seed)
+                gauntlet = population.champion_gauntlet(
+                    min_hands=int(cfg.train.league_gauntlet_min_hands)
+                )
+
+                # Held-out heuristic, measured *before* managing so it can retire
+                # champions that are catastrophic against an external opponent.
+                external_scores = np.full(len(population), np.nan)
+                heuristic_line = None
+                if not args.no_eval and cfg.train.eval_hands > 0:
+                    from training.league_metrics import evaluate_vs_heuristic
+
+                    champions = population.champion_generations()
+                    champ_scores = evaluate_vs_heuristic(
+                        [population.members[c].network for c in champions],
+                        cfg, cfg.train.eval_hands, encoder, device=device, seed=eval_seed,
+                    )
+                    for slot, score in zip(champions, champ_scores):
+                        external_scores[slot] = score
+                    best_learner = max(
+                        population.indices(Role.LEARNER),
+                        key=lambda i: league_metrics["score"][i],
+                    )
+                    learner_score = evaluate_vs_heuristic(
+                        [population.members[best_learner].network],
+                        cfg, cfg.train.eval_hands, encoder, device=device, seed=eval_seed,
+                    )[0]
+                    heuristic_line = (
+                        "  vs tight_aggressive (bb/100): champions oldest->newest "
+                        + " ".join(f"{s:+.0f}" for s in champ_scores)
+                        + f"  |  mean {champ_scores.mean():+.0f}  best {champ_scores.max():+.0f}"
+                        + f"  |  top learner {learner_score:+.0f}"
+                    )
+                    history.append({
+                        "iteration": iteration,
+                        "champions_vs_heuristic": champ_scores.tolist(),
+                        "champions_vs_heuristic_mean": float(champ_scores.mean()),
+                        "champions_vs_heuristic_best": float(champ_scores.max()),
+                        "top_learner_vs_heuristic": float(learner_score),
+                    })
+
+                # External competence panel: evaluate only the most_different
+                # shortlist, so a diverse-but-externally-weak learner is never
+                # frozen as a champion.
+                panel_scores = {}
+                if not args.no_eval and cfg.train.league_external_panel:
+                    from training.league_metrics import evaluate_vs_panel
+
+                    shortlist = population.most_different_shortlist(league_metrics["score"])
+                    if shortlist:
+                        worst = evaluate_vs_panel(
+                            [population.members[i].network for i in shortlist],
+                            cfg, cfg.train.league_external_panel, cfg.train.league_panel_hands,
+                            encoder, device=device, seed=eval_seed,
+                        )
+                        panel_scores = dict(zip(shortlist, worst))
+
+                report = population.manage(
+                    league_metrics["score"], diversity=league_metrics["diversity"],
+                    external_scores=external_scores, panel_scores=panel_scores,
+                )
+                for slot in report.rebuilt_slots:
+                    if population.members[slot].trainable:
+                        buffers[slot] = new_buffer()
+                        trainers[slot] = Trainer(
+                            cfg, population.members[slot].network, device=device
+                        )
+
+                over = int(gauntlet["over_specialised"].sum())
+                print(population.summary(league_metrics, top=5), flush=True)
+                print(
+                    f"  gauntlet: mean generations beaten="
+                    f"{gauntlet['beats'].mean():.1f}/{len(gauntlet['generations'])}  "
+                    f"over-specialised learners={over}", flush=True
+                )
+                if heuristic_line is not None:
+                    print(heuristic_line, flush=True)
+                print(f"  manage: {report.describe()}", flush=True)
+
+                # Approximate exploitability of the strongest champion (absolute
+                # yardstick): a trained best-responder's win rate against it.
+                every = int(cfg.train.league_exploitability_every)
+                final = iteration >= cfg.train.iterations
+                if not args.no_eval and int(cfg.train.league_exploitability_iters) > 0 and (
+                    final or (every > 0 and (iteration // cfg.train.league_manage_every) % every == 0)
+                ):
+                    from training.exploitability import estimate_exploitability
+
+                    champions = population.champion_generations()
+                    finite = [c for c in champions if np.isfinite(external_scores[c])]
+                    if finite:
+                        best_champ = max(finite, key=lambda c: external_scores[c])
+                        exploit = estimate_exploitability(
+                            population.members[best_champ].network, cfg, encoder,
+                            iters=int(cfg.train.league_exploitability_iters),
+                            device=device, seed=eval_seed,
+                        )
+                        print(
+                            f"  exploitability of best champion (slot {best_champ}, "
+                            f"{external_scores[best_champ]:+.0f} vs heuristic): a best-responder "
+                            f"wins {exploit:+.0f} bb/100  (0 = unexploitable)", flush=True
+                        )
+                        history.append({"iteration": iteration, "exploitability_bb_per_100": exploit,
+                                        "exploited_champion_vs_heuristic": float(external_scores[best_champ])})
+                print("", flush=True)
+
+            if cfg.train.checkpoint_every > 0 and iteration % cfg.train.checkpoint_every == 0:
+                for slot, member in enumerate(population.members):
+                    save_checkpoint(
+                        os.path.join(cfg.train.checkpoint_dir, f"latest_slot{slot:02d}.pt"),
+                        member.network, cfg,
+                        extra={"iteration": iteration, "slot": slot, "role": member.role.value},
+                    )
+                print(f"  saved {len(population)} league checkpoints", flush=True)
+
+    except KeyboardInterrupt:
+        print("\ninterrupted; saving the league")
+
+    for slot, member in enumerate(population.members):
+        save_checkpoint(
+            os.path.join(cfg.train.checkpoint_dir, f"latest_slot{slot:02d}.pt"),
+            member.network, cfg,
+            extra={"iteration": iteration, "slot": slot, "role": member.role.value},
+        )
+    with open(os.path.join(cfg.train.checkpoint_dir, "history.json"), "w") as fh:
+        json.dump(history, fh, indent=2)
+    print(
+        f"done: {iteration} iterations in {time.time() - started:.1f}s; "
+        f"{len(population)} league networks saved to {cfg.train.checkpoint_dir}"
+    )
+
+
 def main() -> None:
     args = parse_args()
     cfg = build_config(args)
@@ -323,6 +596,20 @@ def main() -> None:
 
     encoder = ObservationEncoder.from_config(cfg)
     print(encoder.describe())
+
+    # The role-structured league is its own loop: learners + frozen champions +
+    # explorers, with behaviour-aware promotion and culling.
+    if cfg.train.league_population:
+        if cfg.train.population_self_play or cfg.train.num_policies > 1:
+            raise SystemExit(
+                "--league is mutually exclusive with --population and --num-policies > 1"
+            )
+        if args.resume:
+            raise SystemExit(
+                "--resume is not supported for the league; each slot has its own checkpoint"
+            )
+        train_league(cfg, args, encoder, device)
+        return
 
     # Co-evolving population is a distinct training loop: n live networks, all
     # optimised at once.  It shares nothing with the single-network path below.

@@ -1,29 +1,38 @@
-"""A role-structured league population.
+"""A role-structured league population with behaviour-aware management.
 
-Instead of N interchangeable learners the population is split into three roles:
+The population is split into three roles:
 
 * **learners** -- updated continuously; the working edge of the league.
-* **champions** -- frozen historical snapshots, never updated.  They stop the
-  league drifting off strategies that already worked, which is precisely the
-  failure that lets naive self-play cycle: with only live members, the whole
-  population can walk away from a good strategy together and never notice.
-* **explorers** -- learners that are periodically wiped and reinitialised *from
-  scratch*.  From scratch matters: a fresh random policy is genuinely
-  off-distribution, whereas an offspring of an incumbent inherits its blind
-  spots and adds little.
+* **champions** -- frozen historical snapshots, never updated.  They are the
+  cheap fix for four problems at once: catastrophic forgetting, meta-game
+  collapse, strategy cycling, and unstable evaluation.  With only live members
+  the whole population can walk away from a good strategy together and never
+  notice; a frozen ladder of past elites makes that impossible to hide.
+* **explorers** -- learners periodically wiped and reinitialised *from scratch*.
+  From scratch matters: a fresh random policy is genuinely off-distribution,
+  whereas an offspring of an incumbent inherits its blind spots.
 
-Management is behaviour-aware.  Members are ranked by
+Two rules keep the champion pool useful rather than random:
 
-    score = w_strength * norm(strength) + w_diversity * norm(diversity)
+1. **Promotion is earned, never scheduled.**  A learner must sustain a real
+   win rate over a large sample of actual league play *and* beat most existing
+   champion generations.  The generation gate is the anti-over-specialisation
+   check: a learner that beats the newest champion but loses badly to an old one
+   has learned the current meta, not the game.
+2. **Freeze different kinds.**  Each cycle promotes the highest-EV learner *and*
+   the most behaviourally different one, so the pool accumulates strong
+   strategies and unusual ones instead of eight variants of a single idea.
 
-(:mod:`training.league_metrics`) rather than by strength alone.  A slightly
-weaker but strategically distinct network therefore keeps its slot, which is
-what stops the league converging to N copies of one policy -- and is why no
-crossover or mutation operators are needed.
+Champions still go stale -- one that loses badly to everyone is marked and is
+first in line to be evicted, so the pool rolls rather than carrying corpses.
 
-Slots whose network is replaced (a culled learner, a reset explorer) are
-reported back by :meth:`LeaguePopulation.manage`, because the caller owns the
-per-slot optimiser and replay buffer and must rebuild them.
+Ranking everywhere uses ``score = w_s * norm(strength) + w_d * norm(diversity)``
+(:mod:`training.league_metrics`), not strength alone.  That is what stops the
+league collapsing into N copies of one policy, and why no crossover or mutation
+operators are needed.
+
+Slots whose network is replaced are reported by :meth:`LeaguePopulation.manage`,
+because the caller owns the per-slot optimiser and replay buffer.
 """
 
 from __future__ import annotations
@@ -46,6 +55,12 @@ class Role(str, Enum):
     EXPLORER = "explorer"
 
 
+class MatchType(str, Enum):
+    LEARNER_VS_LEARNER = "learner_vs_learner"
+    LEARNER_VS_CHAMPION = "learner_vs_champion"
+    MIXED = "mixed"
+
+
 @dataclass
 class LeagueMember:
     index: int
@@ -53,21 +68,34 @@ class LeagueMember:
     network: PokerNet
     agent: object                 # NetworkAgent (imported lazily)
     generation: int = 0           # bumped every time the slot is reinitialised
-    born_at_hands: int = 0
+    born_at_hands: int = 0        # league hands elapsed when this slot was filled
+    trained_at_hands: int = 0     # for champions: how much training the snapshot had
+    reset_at_pass: int = -10**9   # management pass a learner was last reset (cull grace)
+
+    # Running record from *real* league play, so promotion is judged on the games
+    # actually played rather than on a separate evaluation pass.
+    hands_played: int = 0
+    return_sum: float = 0.0       # sum of chip delta / own starting stack
+    stale: bool = False           # champion flagged for eviction
 
     @property
     def trainable(self) -> bool:
         """Champions are opponents only; learners and explorers are optimised."""
         return self.role is not Role.CHAMPION
 
+    @property
+    def strength(self) -> float:
+        """Mean normalised chip return per hand over this slot's lifetime."""
+        return self.return_sum / self.hands_played if self.hands_played else 0.0
+
 
 @dataclass
 class ManagementReport:
     """What a management pass changed, so the caller can rebuild slot state."""
 
-    promoted: Optional[int] = None          # learner index snapshotted into a champion slot
-    champion_slot: Optional[int] = None     # champion slot that was overwritten
-    culled: Optional[int] = None            # learner slot reinitialised from scratch
+    promoted: List[tuple] = field(default_factory=list)   # (learner, champion_slot, reason)
+    retired: List[int] = field(default_factory=list)      # stale champion slots evicted
+    culled: Optional[int] = None                          # learner reinitialised from scratch
     reset_explorers: List[int] = field(default_factory=list)
 
     @property
@@ -76,9 +104,20 @@ class ManagementReport:
         slots = list(self.reset_explorers)
         if self.culled is not None:
             slots.append(self.culled)
-        if self.champion_slot is not None:
-            slots.append(self.champion_slot)
+        slots.extend(slot for _, slot, _ in self.promoted)
+        slots.extend(self.retired)
         return sorted(set(slots))
+
+    def describe(self) -> str:
+        parts = [f"promote learner {i} -> champion slot {s} ({why})"
+                 for i, s, why in self.promoted]
+        if self.retired:
+            parts.append(f"retire stale champions {self.retired}")
+        if self.culled is not None:
+            parts.append(f"cull learner {self.culled}")
+        if self.reset_explorers:
+            parts.append(f"reset explorers {self.reset_explorers}")
+        return "; ".join(parts) if parts else "no changes"
 
 
 class LeaguePopulation:
@@ -91,6 +130,7 @@ class LeaguePopulation:
         self.total_hands = 0
         self._last_explorer_reset = 0
         self._generation = 0
+        self._manage_pass = 0
 
         self.members: List[LeagueMember] = []
         layout = (
@@ -103,6 +143,18 @@ class LeaguePopulation:
                 self.members.append(self._new_member(role))
         if not self.members:
             raise ValueError("league population is empty; check the league_* sizes")
+
+        size = len(self.members)
+        self._pair_sum = np.zeros((size, size), dtype=np.float64)
+        self._pair_count = np.zeros((size, size), dtype=np.float64)
+
+        weights = np.array([
+            max(0.0, cfg.train.league_match_learner_vs_learner),
+            max(0.0, cfg.train.league_match_learner_vs_champion),
+            max(0.0, cfg.train.league_match_mixed),
+        ], dtype=np.float64)
+        total = weights.sum()
+        self.match_weights = (weights / total) if total > 0 else np.array([1.0, 0.0, 0.0])
 
     # --- construction ------------------------------------------------------
     def _build_agent(self, network: PokerNet):
@@ -135,6 +187,7 @@ class LeaguePopulation:
             agent=self._build_agent(network),
             generation=self._generation,
             born_at_hands=self.total_hands,
+            trained_at_hands=self.total_hands,
         )
 
     def _freeze(self, network: PokerNet) -> PokerNet:
@@ -169,28 +222,132 @@ class LeaguePopulation:
     def role_counts(self) -> dict:
         return {role.value: len(self.indices(role)) for role in Role}
 
-    # --- play --------------------------------------------------------------
-    def sample_seats(self, num_players: int) -> List[int]:
-        """One member index per seat, uniform with replacement.
+    # --- matchmaking -------------------------------------------------------
+    def sample_match(self) -> MatchType:
+        return MatchType(
+            self.rng.choices(list(MatchType), weights=list(self.match_weights), k=1)[0]
+        )
 
-        Every role is seatable -- champions are exactly the strong, static
-        opponents the learners need -- but only ``trainable`` seats are ever
-        collected, which the caller enforces.
+    def _pick(self, role: Role) -> int:
+        """One member of ``role``, falling back to a learner then to anyone."""
+        pool = self.indices(role) or self.indices(Role.LEARNER) or list(range(len(self.members)))
+        return self.rng.choice(pool)
+
+    def sample_seats(self, num_players: int) -> tuple:
+        """``(seats, match_type)`` -- one member index per seat.
+
+        Seat *order* is shuffled after the roles are chosen: without that the
+        learner would always sit in the same position and inherit that seat's
+        positional edge, which would quietly bias every strength estimate.
         """
-        return [self.rng.randrange(len(self.members)) for _ in range(num_players)]
+        match = self.sample_match()
+        if match is MatchType.LEARNER_VS_LEARNER:
+            seats = [self._pick(Role.LEARNER) for _ in range(num_players)]
+        elif match is MatchType.LEARNER_VS_CHAMPION:
+            seats = [self._pick(Role.LEARNER)]
+            seats += [self._pick(Role.CHAMPION) for _ in range(num_players - 1)]
+        else:  # mixed: learner + champion + explorer, then top up with learners
+            wanted = [Role.LEARNER, Role.CHAMPION, Role.EXPLORER][:num_players]
+            seats = [self._pick(role) for role in wanted]
+            seats += [self._pick(Role.LEARNER) for _ in range(num_players - len(seats))]
+        self.rng.shuffle(seats)
+        return seats, match
+
+    # --- running record from real play -------------------------------------
+    def record_hand(self, seated: Sequence[int], normalised_returns: Sequence[float]) -> None:
+        """Fold one played hand into the running per-member and pairwise records."""
+        for seat, member in enumerate(seated):
+            value = float(normalised_returns[seat])
+            entry = self.members[member]
+            entry.hands_played += 1
+            entry.return_sum += value
+            for other in seated:
+                if other != member:  # never your own opponent
+                    self._pair_sum[member, other] += value
+                    self._pair_count[member, other] += 1
+        self.total_hands += 1
+
+    def _clear_stats(self, index: int) -> None:
+        """Forget a slot's record -- a replaced network did not earn it."""
+        member = self.members[index]
+        member.hands_played = 0
+        member.return_sum = 0.0
+        member.stale = False
+        self._pair_sum[index, :] = 0.0
+        self._pair_sum[:, index] = 0.0
+        self._pair_count[index, :] = 0.0
+        self._pair_count[:, index] = 0.0
+
+    def running_strength(self) -> np.ndarray:
+        return np.array([m.strength for m in self.members], dtype=np.float64)
+
+    def running_pair_mean(self) -> np.ndarray:
+        return self._pair_sum / np.maximum(self._pair_count, 1.0)
+
+    def running_coverage(self) -> np.ndarray:
+        pair_mean = self.running_pair_mean()
+        return ((pair_mean > 0.0) & (self._pair_count > 0)).sum(axis=1).astype(np.float64)
+
+    def strength_mbb_per_100(self) -> np.ndarray:
+        from training.league_metrics import strength_to_mbb_per_100
+
+        return strength_to_mbb_per_100(self.running_strength(), self.cfg.env)
+
+    # --- champion gauntlet -------------------------------------------------
+    def champion_generations(self) -> List[int]:
+        """Champion slots ordered oldest -> newest snapshot."""
+        return sorted(self.indices(Role.CHAMPION), key=lambda i: self.members[i].trained_at_hands)
+
+    def champion_gauntlet(self, min_hands: int = 1) -> dict:
+        """How every learner fares against each champion *generation*.
+
+        A learner that beats the newest champion but loses badly to an older one
+        is over-specialised: it has learned the current meta rather than the
+        game.  ``beats`` counts generations with a positive result, and
+        ``over_specialised`` flags exactly that pattern.
+        """
+        generations = self.champion_generations()
+        learners = self.trainable_indices()
+        pair_mean = self.running_pair_mean()
+        results = np.zeros((len(learners), len(generations)), dtype=np.float64)
+        seen = np.zeros_like(results, dtype=bool)
+
+        for row, learner in enumerate(learners):
+            for column, champion in enumerate(generations):
+                results[row, column] = pair_mean[learner, champion]
+                seen[row, column] = self._pair_count[learner, champion] >= min_hands
+
+        beats = ((results > 0) & seen).sum(axis=1)
+        played = seen.sum(axis=1)
+        over_specialised = np.zeros(len(learners), dtype=bool)
+        if len(generations) >= 2:
+            newest, oldest = -1, 0
+            over_specialised = (
+                seen[:, newest] & seen[:, oldest]
+                & (results[:, newest] > 0) & (results[:, oldest] < 0)
+            )
+        return {
+            "learners": learners,
+            "generations": generations,
+            "results": results,
+            "evaluated": seen,
+            "beats": beats,
+            "generations_played": played,
+            "over_specialised": over_specialised,
+        }
 
     # --- management --------------------------------------------------------
     def _reset_slot(self, index: int) -> None:
         """Reinitialise a slot from scratch, keeping its role."""
-        member = self.members[index]
-        self.members[index] = self._new_member(member.role, index=index)
+        role = self.members[index].role
+        self.members[index] = self._new_member(role, index=index)
+        self.members[index].reset_at_pass = self._manage_pass  # start the cull grace window
+        self._clear_stats(index)
 
     def maybe_reset_explorers(self) -> List[int]:
         """Wipe the explorers once ``league_explorer_reset_hands`` have passed."""
         every = int(self.cfg.train.league_explorer_reset_hands)
-        if every <= 0:
-            return []
-        if self.total_hands - self._last_explorer_reset < every:
+        if every <= 0 or self.total_hands - self._last_explorer_reset < every:
             return []
         self._last_explorer_reset = self.total_hands
         reset = self.indices(Role.EXPLORER)
@@ -198,75 +355,253 @@ class LeaguePopulation:
             self._reset_slot(index)
         return reset
 
-    def promote(self, scores: Sequence[float]) -> tuple:
-        """Freeze the best-scoring learner into the oldest champion slot.
+    def mark_stale_champions(self, external_scores: Optional[Sequence[float]] = None) -> List[int]:
+        """Flag champions to evict first, so the pool rolls rather than rots.
 
-        Returns ``(promoted_index, champion_slot)``, or ``(None, None)`` when
-        there is nothing to promote into.
+        A champion is stale if it loses badly *in-league* OR (when
+        ``external_scores`` -- bb/100 vs the held-out heuristic per member -- is
+        given) falls below ``league_champion_retire_vs_heuristic``.  The external
+        gate catches champions that are catastrophic against a competent outside
+        opponent yet survive in-league because the league has not learned to
+        punish them: in-league strength is relative, the heuristic is absolute.
         """
-        learners = self.indices(Role.LEARNER)
-        champions = self.indices(Role.CHAMPION)
-        if not learners or not champions:
-            return None, None
-        best = max(learners, key=lambda i: scores[i])
-        oldest = min(champions, key=lambda i: self.members[i].born_at_hands)
+        train = self.cfg.train
+        threshold = float(train.league_champion_retire_mbb_per_100)
+        min_hands = int(train.league_champion_min_hands)
+        external_threshold = float(train.league_champion_retire_vs_heuristic)
+        mbb = self.strength_mbb_per_100()
+        stale = []
+        for index in self.indices(Role.CHAMPION):
+            member = self.members[index]
+            in_league_bad = member.hands_played >= min_hands and mbb[index] <= threshold
+            external_bad = (
+                external_scores is not None
+                and index < len(external_scores)
+                and np.isfinite(external_scores[index])
+                and external_scores[index] <= external_threshold
+            )
+            if in_league_bad or external_bad:
+                member.stale = True
+                stale.append(index)
+        return stale
 
+    def _eviction_slot(
+        self, exclude: Sequence[int] = (), diversity: Optional[Sequence[float]] = None
+    ) -> Optional[int]:
+        """Which champion to make room for a promotion.
+
+        Stale champions go first (they are bad opponents).  Within the eviction
+        pool, prefer the *most redundant* champion -- lowest behavioural
+        diversity to the rest, when ``diversity`` is given -- rather than the
+        oldest, so distinct strategies (including old, unusual ones) survive and
+        the ladder keeps its spread.  Falls back to oldest when no diversity is
+        available (e.g. before any hands are played).
+        """
+        champions = [i for i in self.indices(Role.CHAMPION) if i not in exclude]
+        if not champions:
+            return None
+        stale = [i for i in champions if self.members[i].stale]
+        if stale:
+            # Among bad champions, diversity must NOT buy survival -- a distinct
+            # but catastrophic champion is still a bad opponent.  Evict oldest.
+            return min(stale, key=lambda i: self.members[i].trained_at_hands)
+        # Healthy pool: sacrifice the most redundant, keeping distinct strategies.
+        if self.cfg.train.league_evict_most_redundant and diversity is not None:
+            return min(champions, key=lambda i: diversity[i])
+        return min(champions, key=lambda i: self.members[i].trained_at_hands)
+
+    def promotion_candidates(self, gauntlet: Optional[dict] = None) -> List[int]:
+        """Learners that have *earned* promotion.
+
+        Gates, all on real league play: a sustained win rate over enough hands,
+        beating at least the *median* champion generation it has faced (a
+        relative bar, so a strengthening ladder cannot lock promotions out), and
+        not being over-specialised.
+        """
+        train = self.cfg.train
+        mbb = self.strength_mbb_per_100()
+        if gauntlet is None:
+            gauntlet = self.champion_gauntlet(min_hands=int(train.league_gauntlet_min_hands))
+        generations = len(gauntlet["generations"])
+        fraction = float(train.league_promotion_min_generations)
+        reject_over = bool(train.league_promotion_reject_over_specialised)
+
+        candidates = []
+        for row, index in enumerate(gauntlet["learners"]):
+            member = self.members[index]
+            if member.role is not Role.LEARNER:
+                continue
+            if member.hands_played < int(train.league_promotion_hands):
+                continue
+            if mbb[index] < float(train.league_promotion_mbb_per_100):
+                continue
+            if generations:
+                played = gauntlet["generations_played"][row]
+                # Beat the median generation actually faced (>= fraction of them),
+                # rather than a fixed count of all eight.
+                if played < 1 or gauntlet["beats"][row] < fraction * played:
+                    continue
+                if reject_over and gauntlet["over_specialised"][row]:
+                    continue
+            candidates.append(index)
+        return candidates
+
+    def promote(
+        self,
+        index: int,
+        reason: str = "elite",
+        diversity: Optional[Sequence[float]] = None,
+        exclude: Sequence[int] = (),
+    ) -> Optional[int]:
+        """Freeze a learner into a champion slot, forever."""
+        slot = self._eviction_slot(exclude=exclude, diversity=diversity)
+        if slot is None:
+            return None
         self._generation += 1
-        frozen = self._freeze(self.members[best].network)
-        self.members[oldest] = LeagueMember(
-            index=oldest,
+        frozen = self._freeze(self.members[index].network)
+        self.members[slot] = LeagueMember(
+            index=slot,
             role=Role.CHAMPION,
             network=frozen,
             agent=self._build_agent(frozen),
             generation=self._generation,
             born_at_hands=self.total_hands,
+            trained_at_hands=self.total_hands,
         )
-        return best, oldest
+        self._clear_stats(slot)
+        return slot
 
     def cull(self, scores: Sequence[float]) -> Optional[int]:
-        """Reinitialise the lowest-*scoring* learner from scratch.
+        """Reinitialise the lowest-*scoring* eligible learner from scratch.
 
-        Scoring, not strength: culling on strength alone is what would delete
-        the weaker-but-different members and collapse the league.
+        Scoring, not strength: culling on strength alone would delete the
+        weaker-but-different members and collapse the league.  A freshly reset
+        learner is protected for ``league_cull_grace_passes`` management passes,
+        so it develops instead of being re-culled every pass while it is still
+        the youngest network at the table.
         """
+        grace = int(self.cfg.train.league_cull_grace_passes)
         learners = self.indices(Role.LEARNER)
         if len(learners) < 2:
             return None
-        worst = min(learners, key=lambda i: scores[i])
+        eligible = [
+            i for i in learners
+            if self._manage_pass - self.members[i].reset_at_pass >= grace
+        ]
+        if not eligible:
+            return None
+        worst = min(eligible, key=lambda i: scores[i])
         self._reset_slot(worst)
         return worst
 
-    def manage(self, scores: Sequence[float], cull_worst: bool = True) -> ManagementReport:
-        """One management pass: promote a champion, cull the weakest learner."""
+    def most_different_shortlist(self, scores: Sequence[float]) -> List[int]:
+        """Top-K learners by score that clear the in-league strength floor.
+
+        The caller evaluates this shortlist against the external panel, so the
+        expensive panel eval touches only a handful of networks.  The floor
+        (``league_most_different_min_mbb_per_100``) keeps a near-random, freshly
+        reset learner out even though a fresh policy scores high on diversity.
+        """
+        train = self.cfg.train
+        min_hands = int(train.league_promotion_hands)
+        min_mbb = float(train.league_most_different_min_mbb_per_100)
+        mbb = self.strength_mbb_per_100()
+        eligible = [
+            i for i in self.indices(Role.LEARNER)
+            if self.members[i].hands_played >= min_hands and mbb[i] >= min_mbb
+        ]
+        ranked = sorted(eligible, key=lambda i: scores[i], reverse=True)
+        return ranked[: int(train.league_most_different_top_k)]
+
+    def _most_different_pool(
+        self, scores: Sequence[float], panel_scores: Optional[dict] = None
+    ) -> List[int]:
+        """The most_different shortlist, filtered by the external competence panel.
+
+        Diversity is only worth freezing from a member that is not catastrophic
+        against standard opponents -- otherwise the diversity slot freezes
+        in-league-strong-but-externally-weak champions (the late-run
+        oscillation).  ``panel_scores[i]`` is member i's worst-case bb/100 across
+        the panel; a member missing from the dict is not filtered.
+        """
+        shortlist = self.most_different_shortlist(scores)
+        if not panel_scores:
+            return shortlist
+        threshold = float(self.cfg.train.league_most_different_min_panel_bb_per_100)
+        return [i for i in shortlist if panel_scores.get(i, float("inf")) >= threshold]
+
+    def manage(
+        self,
+        scores: Sequence[float],
+        diversity: Optional[Sequence[float]] = None,
+        external_scores: Optional[Sequence[float]] = None,
+        panel_scores: Optional[dict] = None,
+        cull_worst: bool = True,
+    ) -> ManagementReport:
+        """One management pass.
+
+        Order matters: flag stale champions first so promotions evict them, then
+        promote the elite (strict gate) and the most-different (relaxed top-K
+        pool), then cull the weakest eligible learner.
+        """
         if len(scores) != len(self.members):
             raise ValueError("scores must have one entry per league member")
-        promoted, champion_slot = self.promote(scores)
-        culled = self.cull(scores) if cull_worst else None
-        return ManagementReport(
-            promoted=promoted,
-            champion_slot=champion_slot,
-            culled=culled,
-            reset_explorers=[],
-        )
+        train = self.cfg.train
+        self._manage_pass += 1
+
+        report = ManagementReport()
+        report.retired = self.mark_stale_champions(external_scores)
+
+        chosen: List[tuple] = []
+        gauntlet = self.champion_gauntlet(min_hands=int(train.league_gauntlet_min_hands))
+        candidates = self.promotion_candidates(gauntlet)
+        if train.league_promote_elite and candidates:
+            mbb = self.strength_mbb_per_100()
+            chosen.append((max(candidates, key=lambda i: mbb[i]), "elite"))
+        if train.league_promote_most_different and diversity is not None:
+            taken = {c for c, _ in chosen}
+            pool = [i for i in self._most_different_pool(scores, panel_scores) if i not in taken]
+            if pool:
+                chosen.append((max(pool, key=lambda i: diversity[i]), "most_different"))
+        promoted_slots: List[int] = []
+        for index, reason in chosen:
+            slot = self.promote(index, reason, diversity=diversity, exclude=promoted_slots)
+            if slot is not None:
+                promoted_slots.append(slot)
+                report.promoted.append((index, slot, reason))
+
+        if cull_worst:
+            report.culled = self.cull(scores)
+        return report
 
     # --- metrics -----------------------------------------------------------
-    def evaluate(self, encoder, seed: int = 0) -> dict:
+    def evaluate(self, encoder, seed: int = 0, offline_strength: bool = False) -> dict:
         """Strength, diversity, coverage and the management score.
 
-        Returns a dict of ``[n]`` arrays plus the pairwise matrices, ready to
-        feed :meth:`manage` and to log.
+        Strength and coverage come from the running record of real league play
+        (free, and the sample the promotion rules care about).  Set
+        ``offline_strength`` to re-measure them with a dedicated round-robin
+        instead -- useful before any hands have been played.
         """
         from training.league_metrics import (
             behavioural_diversity,
             population_scores,
             sample_validation_states,
             strength_and_coverage,
+            strength_to_mbb_per_100,
         )
 
         train = self.cfg.train
-        strength, coverage, pair_mean, hands = strength_and_coverage(
-            self.agents, self.cfg, int(train.league_strength_hands), encoder, seed=seed
-        )
+        if offline_strength or self.total_hands == 0:
+            strength, coverage, pair_mean, hands = strength_and_coverage(
+                self.agents, self.cfg, int(train.league_strength_hands), encoder, seed=seed
+            )
+        else:
+            strength = self.running_strength()
+            coverage = self.running_coverage()
+            pair_mean = self.running_pair_mean()
+            hands = np.array([m.hands_played for m in self.members], dtype=np.float64)
+
         observations, masks = sample_validation_states(
             self.agents, self.cfg, int(train.league_diversity_states), encoder, seed=seed + 1
         )
@@ -280,6 +615,7 @@ class LeaguePopulation:
         )
         return {
             "strength": strength,
+            "strength_mbb_per_100": strength_to_mbb_per_100(strength, self.cfg.env),
             "diversity": diversity,
             "coverage": coverage,
             "score": score,
@@ -294,13 +630,11 @@ class LeaguePopulation:
     def summary(self, metrics: dict, top: int = 5) -> str:
         """A compact, sorted view of the population for training logs."""
         order = np.argsort(-np.asarray(metrics["score"]))
-        lines = [
-            f"{'slot':>5}{'role':>10}{'score':>8}{'strength':>10}{'diversity':>11}{'coverage':>10}"
-        ]
+        lines = [f"{'slot':>5}{'role':>10}{'score':>8}{'mbb/100':>12}{'diversity':>11}{'cover':>7}"]
         for index in order[:top]:
             lines.append(
                 f"{index:>5}{self.members[index].role.value:>10}"
-                f"{metrics['score'][index]:>8.3f}{metrics['strength'][index]:>10.4f}"
-                f"{metrics['diversity'][index]:>11.4f}{int(metrics['coverage'][index]):>10}"
+                f"{metrics['score'][index]:>8.3f}{metrics['strength_mbb_per_100'][index]:>12.0f}"
+                f"{metrics['diversity'][index]:>11.4f}{int(metrics['coverage'][index]):>7}"
             )
         return "\n".join(lines)

@@ -215,6 +215,87 @@ def strength_and_coverage(
     return strength, coverage, pair_mean, played
 
 
+def evaluate_vs_heuristic(
+    networks: Sequence,
+    cfg: Config,
+    num_hands: int,
+    encoder: ObservationEncoder,
+    device: Optional[str] = None,
+    seed: int = 0,
+) -> np.ndarray:
+    """bb/100 for each network against the tight-aggressive heuristic.
+
+    The heuristic is deliberately *not* a league member, so this is a genuinely
+    held-out yardstick: an absolute reference the league cannot drift relative
+    to, unlike every in-league number which only says who is beating whom.
+    """
+    from evaluation.evaluate import evaluate_match, make_network_agent
+    from evaluation.heuristic_agent import tight_aggressive
+
+    scores = []
+    for network in networks:
+        hero = make_network_agent(network, cfg, temperature=0.0, device=device)
+        opponent = tight_aggressive(seed=seed)
+        result = evaluate_match(
+            [hero, opponent, opponent], cfg, num_hands, seed=seed, encoder=encoder
+        )
+        scores.append(result["per_agent"]["network"]["bb_per_100"])
+    return np.asarray(scores, dtype=np.float64)
+
+
+def evaluate_vs_panel(
+    networks: Sequence,
+    cfg: Config,
+    panel_names: Sequence[str],
+    num_hands: int,
+    encoder: ObservationEncoder,
+    device: Optional[str] = None,
+    seed: int = 0,
+) -> np.ndarray:
+    """Worst-case bb/100 of each network across a panel of fixed opponents.
+
+    Each network plays one seat against two copies of each panel opponent, and
+    the *minimum* across the panel is returned -- a robustness signal, so a
+    policy crushed by any single standard style is caught even if it beats the
+    others.  The panel is kept separate from the held-out eval opponent.
+    """
+    from evaluation.evaluate import evaluate_match, make_network_agent
+    from evaluation.heuristic_agent import HEURISTIC_AGENTS
+    from evaluation.random_agent import BASELINE_AGENTS
+
+    def make_opponent(name: str, index: int):
+        if name in BASELINE_AGENTS:
+            return BASELINE_AGENTS[name]()
+        if name in HEURISTIC_AGENTS:
+            return HEURISTIC_AGENTS[name](seed=seed + index, samples=cfg.train.opponent_heuristic_samples)
+        raise ValueError(f"unknown panel opponent: {name!r}")
+
+    out = []
+    for network in networks:
+        hero = make_network_agent(network, cfg, temperature=0.0, device=device)
+        scores = []
+        for index, name in enumerate(panel_names):
+            opponent = make_opponent(name, index)
+            result = evaluate_match(
+                [hero, opponent, opponent], cfg, num_hands, seed=seed, encoder=encoder
+            )
+            scores.append(result["per_agent"]["network"]["bb_per_100"])
+        out.append(min(scores) if scores else float("inf"))
+    return np.asarray(out, dtype=np.float64)
+
+
+def strength_to_mbb_per_100(strength, env) -> np.ndarray:
+    """Normalised chip return per hand -> milli-big-blinds per 100 hands.
+
+    ``strength`` is in units of the seat's own starting stack, which makes
+    different stack depths comparable but is not the unit poker players use.
+    mbb/100 is, so promotion thresholds can be written the conventional way.
+    """
+    chips_per_hand = np.asarray(strength, dtype=np.float64) * float(env.starting_stack)
+    big_blinds_per_hand = chips_per_hand / max(float(env.big_blind), 1.0)
+    return big_blinds_per_hand * 100.0 * 1000.0
+
+
 # --- scoring ----------------------------------------------------------------
 def min_max_normalise(values: np.ndarray) -> np.ndarray:
     """Scale to [0, 1]; an all-equal population maps to 0.5 rather than 0/NaN."""
