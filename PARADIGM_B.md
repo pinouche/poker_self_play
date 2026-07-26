@@ -1,5 +1,28 @@
 # Paradigm B: game-theoretic solving (search over belief states)
 
+> **Status: stages 0-3 implemented and validated on Leduc hold'em.**
+> Stage 4 (heads-up no-limit) and stage 5 (three-player) are not started.
+> Code: `game/ cfr/ belief/ search/ value_net/ rebel/`, driven by `solve.py`;
+> 74 tests in `tests/test_game_tree.py`, `test_cfr.py`, `test_belief.py`,
+> `test_search.py`, `test_rebel.py`.  Full write-up with numbers and the
+> findings that mattered: the *Paradigm B* section of `README.md`.
+>
+> | milestone | target | measured |
+> |---|---|---|
+> | 0 · tabular CFR+ / DCFR, exact best response | exploitability -> 0 | **0.0014** after 1000 DCFR iterations; game value **-0.0856031** vs the known **-0.0856064**; exploitability of the analytic Kuhn equilibria **0.0** to 1e-16 |
+> | 1 · public belief states, Bayes range propagation | Bayes-consistent | range values == world-tree values and propagated beliefs == brute-force posteriors, both to **1e-12**; range-form CFR reaches **0.00048** |
+> | 2 · counterfactual value network, depth-limited re-solving | net regresses CFR values; re-solve stays low-exploitability | **R² 0.974**, MAE 0.25 chips; full-lookahead continual re-solving with safe subgame solving **0.0050**; one-round depth limit **0.047** |
+> | 3 · ReBeL self-play loop | exploitability -> near 0 | **0.0164** at 10,000 search iterations per decision — *beating* exactly-solved leaves (0.0293) at ~1000x less cost per query, which is the ReBeL claim itself |
+>
+> Three things cost most of the debugging and are worth carrying into stage 4:
+> leaf values must be the **average of per-iteration values**, not the values of
+> the average strategy (12x difference in exploitability); **re-solving from
+> ranges alone is unsafe** — it takes an exact equilibrium from 0.0019 to 0.117,
+> and the CFR-D gadget recovers it to 0.013; and **an agent whose policy comes
+> out of search has no single exploitability** — the same network measures 0.058
+> at 300 search iterations and 0.0164 at 10,000, so a quoted number without a
+> search budget attached means nothing.
+
 Paradigm A (self-play RL + league) is done. Its ceiling was measured: the
 strongest agent beats a fixed tight-aggressive heuristic by +57 bb/100 but a
 best-responder beats *it* by ~+160 bb/100 — a strong **exploitative** bot,

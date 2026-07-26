@@ -12,3 +12,8 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: end-to-end training runs; minutes rather than seconds",
+]
