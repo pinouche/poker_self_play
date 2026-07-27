@@ -350,3 +350,218 @@ def test_strengths_and_ranges_survive_relabelling():
     moved = canonicalise_range(weights, relabelling)
     assert moved.sum() == pytest.approx(weights.sum())
     assert (moved * (1 - board_mask(canonical))).sum() == pytest.approx(0.0)
+
+
+# --- fast data generation --------------------------------------------------
+def test_values_scale_linearly_with_the_pot():
+    """Gate 1: at a fixed stack-to-pot ratio the pot is a pure scale factor.
+
+    This is what lets one solve label examples at every pot size, and it is
+    exact — until integer chip rounding bites, which is why generation uses a
+    reference pot large enough that it does not.
+    """
+    from holdem.public_tree import build_endgame_tree
+    from holdem.sampling import sample_range
+
+    board = TURN_BOARD
+    space = TurnEndgameSpace(board)
+    rng = np.random.default_rng(0)
+    reach = np.stack([sample_range(rng, board, "dirichlet") for _ in range(2)])
+
+    values = {}
+    for pot, stack in ((20, 100), (80, 400)):
+        root = PublicState(
+            betting=Betting(starting_pot=pot, stack=stack, max_raises=1), board=board
+        )
+        solver = SubgameSolver(
+            build_endgame_tree(root, depth_limit=None), config=CFRConfig.dcfr(), space=space
+        )
+        solver.solve(reach=reach, iterations=30)
+        values[pot] = solver.root_values()
+
+    assert np.abs(values[80] - 4.0 * values[20]).max() < 1e-9
+
+
+def test_batched_river_solver_matches_solving_one_at_a_time():
+    """Gate 2: batching is a performance change, not a numerical one."""
+    from holdem.batched import BatchedRiverSolver
+    from holdem.generation import river_state
+    from holdem.public_tree import build_endgame_tree
+    from holdem.sampling import sample_range
+
+    board = RIVER_BOARD
+    space = TurnEndgameSpace(TURN_BOARD)
+    root = PublicState(betting=river_state(100, 300, 1), board=board)
+    rng = np.random.default_rng(1)
+    batch = 6
+    reaches = np.stack(
+        [np.stack([sample_range(rng, board, "dirichlet") for _ in range(2)]) for _ in range(batch)]
+    )
+
+    one_at_a_time = []
+    for reach in reaches:
+        solver = SubgameSolver(
+            build_endgame_tree(root, depth_limit=None), config=CFRConfig.dcfr(), space=space
+        )
+        solver.solve(reach=reach, iterations=40)
+        one_at_a_time.append(solver.root_values())
+
+    batched = BatchedRiverSolver(space, root, batch_size=batch, config=CFRConfig.dcfr())
+    together = batched.solve(reaches, 40)
+    assert np.abs(np.stack(one_at_a_time) - together).max() < 1e-9
+
+
+def test_batched_showdown_matches_the_single_version():
+    from holdem.showdown import showdown_values, showdown_values_batch
+
+    rng = np.random.default_rng(2)
+    reaches = np.stack(
+        [rng.random(NUM_COMBOS) * board_mask(RIVER_BOARD) for _ in range(5)]
+    )
+    single = np.stack([showdown_values(RIVER_BOARD, r, 9.0) for r in reaches])
+    assert np.abs(single - showdown_values_batch(RIVER_BOARD, reaches, 9.0)).max() < 1e-9
+
+
+def test_generated_examples_are_well_formed():
+    from holdem.generation import GenerationConfig, generate
+
+    config = GenerationConfig(situations_per_board=8, cfr_iterations=20)
+    examples = generate(16, config, seed=0, workers=1)
+    assert len(examples) == 16
+    assert np.isfinite(examples.targets).all()
+    # Nothing may be predicted for a hand the board rules out.
+    assert np.abs(examples.targets * (1 - examples.masks[:, None, :])).max() == 0.0
+    # Ranges live in the first block of the feature vector and are distributions.
+    ranges = examples.features[:, : 2 * NUM_COMBOS].reshape(-1, 2, NUM_COMBOS)
+    assert np.allclose(ranges.sum(axis=2), 1.0, atol=1e-5)
+
+
+def test_generated_targets_are_zero_sum():
+    """One player's chips are the other's, whatever the pot was scaled to."""
+    from holdem.generation import GenerationConfig, generate
+
+    examples = generate(
+        16, GenerationConfig(situations_per_board=8, cfr_iterations=40), seed=3, workers=1
+    )
+    ranges = examples.features[:, : 2 * NUM_COMBOS].reshape(-1, 2, NUM_COMBOS)
+    totals = (ranges * examples.targets).sum(axis=(1, 2))
+    assert np.abs(totals).max() < 0.5, totals
+
+
+# --- layered data: bootstrap and curriculum --------------------------------
+def test_bootstrapped_examples_are_well_formed():
+    from holdem.bootstrap import BootstrapConfig, generate_bootstrapped
+    from holdem.values import ZeroLeafValues
+
+    config = BootstrapConfig(situations_per_board=4, cfr_iterations=10)
+    examples = generate_bootstrapped(ZeroLeafValues(), 8, config, seed=0)
+    assert len(examples) >= 8
+    assert np.isfinite(examples.targets).all()
+    assert np.abs(examples.targets * (1 - examples.masks[:, None, :])).max() == 0.0
+    ranges = examples.features[:, : 2 * NUM_COMBOS].reshape(-1, 2, NUM_COMBOS)
+    assert np.allclose(ranges.sum(axis=2), 1.0, atol=1e-5)
+
+
+def test_bootstrapping_works_from_the_flop_too():
+    """The generator is generic over street: three board cards, not four."""
+    from holdem.bootstrap import BootstrapConfig, generate_bootstrapped
+    from holdem.values import ZeroLeafValues
+
+    config = BootstrapConfig(
+        board_cards=3, num_rounds=3, situations_per_board=2, cfr_iterations=6
+    )
+    examples = generate_bootstrapped(ZeroLeafValues(), 2, config, seed=0)
+    assert len(examples) >= 2
+    # A three-card board leaves more combinations live than a four-card one.
+    assert examples.masks[0].sum() == 1176
+
+
+@pytest.mark.slow
+def test_bootstrapped_target_matches_an_exact_solve():
+    """The gate: with exact river values, bootstrapping must reproduce truth.
+
+    This separates "is the bootstrap arithmetic right" from "is the network
+    good" — the confusion that is otherwise impossible to untangle, and the only
+    check of the turn layer that does not depend on a trained network.
+    """
+    from holdem.bootstrap import BootstrapConfig, normalise_values, street_state
+    from holdem.public_tree import build_endgame_tree
+    from holdem.sampling import sample_range
+    from holdem.values import RiverLeafValues
+
+    board = TURN_BOARD
+    space = TurnEndgameSpace(board)
+    config = BootstrapConfig()
+    public = PublicState(betting=street_state(config, 100, 300), board=board)
+    rng = np.random.default_rng(0)
+    reach = np.stack([sample_range(rng, board, "dirichlet") for _ in range(2)])
+    iterations = 120
+
+    depth_limited = SubgameSolver(
+        build_endgame_tree(public, depth_limit=1),
+        leaf_value_fn=RiverLeafValues(space, iterations_per_call=3, warmup=120),
+        config=CFRConfig.dcfr(),
+        space=space,
+    )
+    depth_limited.solve(reach=reach, iterations=iterations)
+    bootstrapped = normalise_values(
+        depth_limited.root_values(), reach, space.pair_correction
+    )
+
+    exact_solver = SubgameSolver(
+        build_endgame_tree(public, depth_limit=None),
+        config=CFRConfig.dcfr(),
+        space=space,
+    )
+    exact_solver.solve(reach=reach, iterations=iterations)
+    exact = normalise_values(exact_solver.root_values(), reach, space.pair_correction)
+
+    live = np.flatnonzero(space.root_mask())
+    # Compare where it matters: weighted by how likely each hand actually is.
+    weighted = float(
+        (reach[:, live] * np.abs(bootstrapped - exact)[:, live]).sum()
+    )
+    assert weighted < 2.0, weighted
+
+
+def test_mixed_buffer_keeps_sources_apart_and_samples_in_proportion():
+    from holdem.curriculum import MixConfig, MixedBuffer
+    from holdem.generation import Examples
+
+    def block(n):
+        return Examples(
+            np.zeros((n, 2711), np.float32),
+            np.ones((n, NUM_COMBOS), np.float32),
+            np.zeros((n, 2, NUM_COMBOS), np.float32),
+        )
+
+    buffer = MixedBuffer(1000, MixConfig(river=0.5, turn=0.3, flop=0.0, self_play=0.2))
+    buffer.add("river", block(900))  # more than its share
+    buffer.add("turn", block(100))
+    assert buffer.counts()["river"] == 500, "a cheap source cannot crowd out the rest"
+    assert buffer.counts()["turn"] == 100
+
+    features, masks, targets = buffer.sample(100, np.random.default_rng(0))
+    assert len(features) == len(masks) == len(targets) > 0
+
+
+def test_curriculum_runs_every_stage():
+    from holdem.curriculum import CurriculumConfig, train_curriculum
+    from holdem.generation import GenerationConfig
+    from holdem.net import HoldemValueNetConfig
+
+    config = CurriculumConfig(
+        stages=(("river", 64, 10), ("turn", 8, 10), ("self_play", 4, 5)),
+        buffer_size=500,
+        batch_size=16,
+        workers=1,
+        value_net=HoldemValueNetConfig(
+            hidden_dim=32, embed_ranges=32, num_residual_blocks=1
+        ),
+        generation=GenerationConfig(situations_per_board=16, cfr_iterations=8),
+    )
+    _, history = train_curriculum(config)
+    assert [record["stage"] for record in history] == ["river", "turn", "self_play"]
+    assert all(np.isfinite(record["loss"]) for record in history)
+    # The river layer stays in the buffer while the streets above it train.
+    assert history[-1]["buffer_river"] > 0

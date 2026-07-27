@@ -157,3 +157,42 @@ def showdown_values_brute_force(
                 total -= reach[theirs]
         values[mine] = stake * total
     return values
+
+
+def showdown_values_batch(
+    board: Tuple[int, ...], reach: np.ndarray, stake: float
+) -> np.ndarray:
+    """:func:`showdown_values` for a batch of ranges sharing one board.
+
+    ``reach`` is ``(K, 1326)``.  The sorting and the per-card grouping depend
+    only on the board, so they are computed once and every situation in the
+    batch rides on the same index — the whole point of batching by board.
+    """
+    index = showdown_index(board)
+    weights = reach[:, index.order]
+    prefix = np.concatenate(
+        (np.zeros((len(reach), 1)), np.cumsum(weights, axis=1)), axis=1
+    )
+    total = prefix[:, -1:]
+
+    flat = np.concatenate(
+        (
+            np.zeros((len(reach), 1)),
+            np.cumsum(reach[:, index.flat_hands], axis=1),
+        ),
+        axis=1,
+    )
+    base = flat[:, index.card_offset[:-1]]
+    card_a, card_b = COMBO_CARDS[:, 0], COMBO_CARDS[:, 1]
+    base_a, base_b = base[:, card_a], base[:, card_b]
+    card_total = flat[:, index.card_offset[1:]] - base
+
+    first, last = index.group_start, index.group_end
+    weaker = (
+        prefix[:, first] - (flat[:, index.lo_a] - base_a) - (flat[:, index.lo_b] - base_b)
+    )
+    stronger = (total - prefix[:, last]) - (
+        (card_total[:, card_a] - (flat[:, index.hi_a] - base_a))
+        + (card_total[:, card_b] - (flat[:, index.hi_b] - base_b))
+    )
+    return stake * (weaker - stronger) * index.legal
