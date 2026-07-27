@@ -44,9 +44,7 @@ class ReBeLConfig:
     updates_per_iteration: int = 120
     batch_size: int = 512
     self_play: SelfPlayConfig = field(default_factory=SelfPlayConfig)
-    value_net: ValueNetConfig = field(
-        default_factory=lambda: ValueNetConfig(hidden_dim=256, num_residual_blocks=4)
-    )
+    value_net: ValueNetConfig = field(default_factory=ValueNetConfig)
     training: ValueTrainConfig = field(
         default_factory=lambda: ValueTrainConfig(learning_rate=1e-3, batch_size=512)
     )

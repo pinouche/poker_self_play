@@ -526,11 +526,12 @@ def test_bootstrapped_target_matches_an_exact_solve():
 
 def test_mixed_buffer_keeps_sources_apart_and_samples_in_proportion():
     from holdem.curriculum import MixConfig, MixedBuffer
+    from holdem.features import INPUT_DIM
     from holdem.generation import Examples
 
     def block(n):
         return Examples(
-            np.zeros((n, 2711), np.float32),
+            np.zeros((n, INPUT_DIM), np.float32),
             np.ones((n, NUM_COMBOS), np.float32),
             np.zeros((n, 2, NUM_COMBOS), np.float32),
         )

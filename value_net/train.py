@@ -1,6 +1,6 @@
 """Supervised training for the value network.
 
-Plain regression: features in, per-hand values out, MSE against the solver.
+Pointwise Huber regression: features in, per-hand values out, against the solver.
 Nothing exotic is needed — the interesting part is not the optimiser, it is
 whether a network that fits these values well is *good enough to search with*,
 which only the exploitability of the resulting agent can answer.
@@ -47,7 +47,7 @@ def train_value_net(
     optimiser = torch.optim.Adam(
         net.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.HuberLoss(reduction="mean")
     history: List[Dict[str, float]] = []
 
     for epoch in range(config.epochs):
@@ -62,7 +62,7 @@ def train_value_net(
             optimiser.step()
             total += float(loss.item())
             batches += 1
-        record = {"epoch": epoch + 1, "train_mse": total / max(batches, 1)}
+        record = {"epoch": epoch + 1, "train_huber": total / max(batches, 1)}
         if validation is not None:
             record.update(
                 {f"val_{k}": v for k, v in evaluate_net(net, validation, device).items()}

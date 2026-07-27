@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 
 from belief.ranges import NUM_HANDS, NUM_PLAYERS
-from model.residual_blocks import FeatureGroupEncoder, ResidualTrunk
+from model.rebel import CardEmbedding, ReBeLMLP
 from value_net.features import (
     BOARD_SLICE,
     MAX_POT,
@@ -44,11 +44,19 @@ from value_net.features import (
 
 @dataclass
 class ValueNetConfig:
-    embed_ranges: int = 128
-    embed_public: int = 64
-    hidden_dim: int = 128
-    num_residual_blocks: int = 3
+    hidden_dim: int = 1536
+    num_residual_blocks: int = 6
+    num_hidden_layers: int | None = None
+    card_embedding_dim: int = 64
+    agent_embedding_dim: int = 16
+    # Accepted for checkpoint/config compatibility with the old grouped encoder.
+    embed_ranges: int | None = None
+    embed_public: int | None = None
     dropout: float = 0.0
+
+    @property
+    def hidden_layers(self) -> int:
+        return self.num_residual_blocks if self.num_hidden_layers is None else self.num_hidden_layers
 
 
 class PBSValueNet(nn.Module):
@@ -57,17 +65,14 @@ class PBSValueNet(nn.Module):
     def __init__(self, config: ValueNetConfig | None = None) -> None:
         super().__init__()
         self.config = config or ValueNetConfig()
-        self.range_encoder = FeatureGroupEncoder(RANGE_DIM, self.config.embed_ranges)
-        self.public_encoder = FeatureGroupEncoder(PUBLIC_DIM, self.config.embed_public)
-        self.project = nn.Linear(
-            self.config.embed_ranges + self.config.embed_public, self.config.hidden_dim
+        self.board_embedding = CardEmbedding(
+            NUM_HANDS, self.config.card_embedding_dim, num_suits=2
         )
-        self.trunk = ResidualTrunk(
-            self.config.hidden_dim,
-            self.config.num_residual_blocks,
-            dropout=self.config.dropout,
-        )
-        self.head = nn.Linear(self.config.hidden_dim, NUM_PLAYERS * NUM_HANDS)
+        self.agent_embedding = nn.Embedding(NUM_PLAYERS, self.config.agent_embedding_dim)
+        input_dim = RANGE_DIM + (PUBLIC_DIM - NUM_HANDS) + self.config.card_embedding_dim
+        input_dim += self.config.agent_embedding_dim
+        self.trunk = ReBeLMLP(input_dim, self.config.hidden_dim, self.config.hidden_layers)
+        self.head = nn.Linear(self.config.hidden_dim, NUM_HANDS)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         ranges = features[..., RANGE_SLICE].reshape(-1, NUM_PLAYERS, NUM_HANDS)
@@ -78,16 +83,36 @@ class PBSValueNet(nn.Module):
         # and the large pots dominate the loss.  (DeepStack does the same.)
         pot = features[..., POT_INDEX].unsqueeze(-1).unsqueeze(-1) * MAX_POT
 
+        raw = torch.stack(
+            [self._indexed_raw(features, player) for player in range(NUM_PLAYERS)], dim=1
+        )
+        values = raw * possible.unsqueeze(1) * pot
+        return zero_sum_projection(values, ranges, possible)
+
+    def _indexed_raw(self, features: torch.Tensor, agent_index: int | torch.Tensor) -> torch.Tensor:
+        batch = features.shape[0]
+        if not torch.is_tensor(agent_index):
+            agent_index = torch.full((batch,), agent_index, device=features.device, dtype=torch.long)
+        else:
+            agent_index = agent_index.to(device=features.device, dtype=torch.long).reshape(-1)
+            if agent_index.numel() == 1:
+                agent_index = agent_index.expand(batch)
+        public = features[..., PUBLIC_SLICE]
+        board = features[..., BOARD_SLICE]
+        non_board = torch.cat((public[..., :0], public[..., NUM_HANDS:]), dim=-1)
         encoded = torch.cat(
-            [
-                self.range_encoder(features[..., RANGE_SLICE]),
-                self.public_encoder(features[..., PUBLIC_SLICE]),
-            ],
+            (features[..., RANGE_SLICE], self.board_embedding(board), non_board, self.agent_embedding(agent_index)),
             dim=-1,
         )
-        raw = self.head(self.trunk(self.project(encoded)))
-        values = raw.reshape(-1, NUM_PLAYERS, NUM_HANDS) * possible.unsqueeze(1) * pot
-        return zero_sum_projection(values, ranges, possible)
+        return self.head(self.trunk(encoded))
+
+    def forward_indexed(self, features: torch.Tensor, agent_index: torch.Tensor) -> torch.Tensor:
+        """Paper-style query for the indexed agent's infostate values."""
+        values = self(features)
+        indices = agent_index.to(device=features.device, dtype=torch.long).reshape(-1)
+        if indices.numel() == 1:
+            indices = indices.expand(features.shape[0])
+        return values[torch.arange(features.shape[0], device=features.device), indices]
 
 
 def zero_sum_projection(

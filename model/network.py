@@ -67,7 +67,7 @@ class PokerNet(nn.Module):
         self.projection = nn.Sequential(
             nn.Linear(embedding_dim, cfg.hidden_dim),
             nn.LayerNorm(cfg.hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
         )
         self.trunk = ResidualTrunk(cfg.hidden_dim, cfg.num_residual_blocks, cfg.dropout)
         self.policy_head = PolicyHead(cfg.hidden_dim, cfg.head_hidden, self.num_actions)

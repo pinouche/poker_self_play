@@ -14,7 +14,7 @@ import torch.nn as nn
 
 
 class ResidualMLPBlock(nn.Module):
-    """x -> Linear -> Norm -> ReLU -> Linear -> Norm -> (+x) -> ReLU"""
+    """x -> Linear -> Norm -> GeLU -> Linear -> Norm -> (+x) -> GeLU"""
 
     def __init__(self, dim: int, dropout: float = 0.0) -> None:
         super().__init__()
@@ -22,7 +22,7 @@ class ResidualMLPBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.fc2 = nn.Linear(dim, dim)
         self.norm2 = nn.LayerNorm(dim)
-        self.act = nn.ReLU(inplace=True)
+        self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -34,7 +34,7 @@ class ResidualMLPBlock(nn.Module):
 
 
 class FeatureGroupEncoder(nn.Module):
-    """Per-group input projection: Linear -> LayerNorm -> ReLU.
+    """Per-group input projection: Linear -> LayerNorm -> GeLU.
 
     The LayerNorm also absorbs the differing scales of the raw features (chip
     counts in big blinds versus one-hot indicators).
@@ -44,7 +44,7 @@ class FeatureGroupEncoder(nn.Module):
         super().__init__()
         self.fc = nn.Linear(in_dim, out_dim)
         self.norm = nn.LayerNorm(out_dim)
-        self.act = nn.ReLU(inplace=True)
+        self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.norm(self.fc(x)))

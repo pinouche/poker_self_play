@@ -27,6 +27,14 @@ from cfr.tabular_cfr import CFRConfig
 from holdem.combos import NUM_COMBOS, board_mask
 from holdem.features import INPUT_DIM, encode_pbs
 from holdem.net import HoldemValueNet, HoldemValueNetConfig
+from holdem.policy import (
+    MAX_ACTIONS,
+    HoldemPolicyNet,
+    HoldemPolicyNetConfig,
+    PolicyExample,
+    PolicyReplayBuffer,
+    train_policy_net,
+)
 from holdem.public_tree import PublicState, build_turn_tree
 from holdem.space import TurnEndgameSpace
 from holdem.values import NetLeafValues
@@ -57,6 +65,9 @@ class HoldemReBeLConfig:
     learning_rate: float = 1e-3
     self_play: HoldemSelfPlayConfig = field(default_factory=HoldemSelfPlayConfig)
     value_net: HoldemValueNetConfig = field(default_factory=HoldemValueNetConfig)
+    policy_net: HoldemPolicyNetConfig = field(default_factory=HoldemPolicyNetConfig)
+    policy_buffer_size: int = 2_000
+    policy_updates_per_iteration: int = 40
     seed: int = 0
     device: str = "cpu"
 
@@ -66,6 +77,7 @@ class Example:
     features: np.ndarray
     mask: np.ndarray
     values: np.ndarray
+    policy: PolicyExample | None = None
 
 
 class Buffer:
@@ -137,11 +149,22 @@ def collect_trajectory(
         values = normalise(solver.root_values(), reach, space.pair_correction)
         if values is not None:
             pbs = space.pbs(public, reach)
+            root = tree.root
+            target = np.zeros((space.num_hands, MAX_ACTIONS), dtype=np.float32)
+            target[:, root.actions] = solver.average_strategy(root)
+            legal = np.zeros(MAX_ACTIONS, dtype=np.float32)
+            legal[list(root.actions)] = 1.0
             examples.append(
                 Example(
                     features=encode_pbs(pbs),
                     mask=board_mask(tuple(public.board)),
                     values=values,
+                    policy=PolicyExample(
+                        features=encode_pbs(pbs),
+                        agent_index=root.player,
+                        legal_mask=legal,
+                        target=target,
+                    ),
                 )
             )
 
@@ -198,16 +221,19 @@ def train(
 
     net = HoldemValueNet(config.value_net).to(device)
     optimiser = torch.optim.Adam(net.parameters(), lr=config.learning_rate)
-    loss_fn = nn.MSELoss()
+    policy_net = HoldemPolicyNet(config.policy_net).to(device)
+    policy_optimiser = torch.optim.Adam(policy_net.parameters(), lr=config.learning_rate)
+    loss_fn = nn.HuberLoss(reduction="mean")
     buffer = Buffer(config.buffer_size)
+    policy_buffer = PolicyReplayBuffer(config.policy_buffer_size)
     history: List[Dict[str, float]] = []
 
     for iteration in range(1, config.iterations + 1):
         leaf_values = NetLeafValues(net, space, device=device)
         for _ in range(config.self_play.trajectories_per_iteration):
-            buffer.add(
-                collect_trajectory(leaf_values, space, root, config.self_play, rng)
-            )
+            examples = collect_trajectory(leaf_values, space, root, config.self_play, rng)
+            buffer.add(examples)
+            policy_buffer.add([example.policy for example in examples if example.policy is not None])
 
         net.train()
         total, updates = 0.0, 0
@@ -227,10 +253,21 @@ def train(
             "iteration": float(iteration),
             "buffer": float(len(buffer)),
             "loss": total / max(updates, 1),
+            "policy_loss": train_policy_net(
+                policy_net,
+                policy_buffer,
+                config.policy_updates_per_iteration,
+                config.batch_size,
+                config.learning_rate,
+                rng,
+                device,
+                policy_optimiser,
+            ),
         }
         if evaluate is not None:
             record.update(evaluate(net, iteration))
         history.append(record)
         if verbose:
             print("  ".join(f"{k}={v:.5g}" for k, v in record.items()), flush=True)
+    net.policy_net = policy_net
     return net, history

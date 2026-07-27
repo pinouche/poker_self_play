@@ -60,7 +60,7 @@ def train_rebel(
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.HuberLoss(reduction="mean")
     buffer = ValueReplayBuffer(config.buffer_size)
     world_tree = world_tree if world_tree is not None else build_tree(LeducHoldem())
     run = ReBeLRun(net=net, buffer=buffer)

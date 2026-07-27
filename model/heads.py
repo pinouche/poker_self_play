@@ -17,13 +17,13 @@ import torch.nn as nn
 
 
 class MLPHead(nn.Module):
-    """Linear -> ReLU -> Linear."""
+    """Linear -> GeLU -> Linear."""
 
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(hidden_dim, out_dim),
         )
 

@@ -159,7 +159,7 @@ def train_curriculum(
     net = net or HoldemValueNet(config.value_net)
     net.to(device)
     optimiser = torch.optim.Adam(net.parameters(), lr=config.learning_rate)
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.HuberLoss(reduction="mean")
     buffer = MixedBuffer(config.buffer_size, config.mix)
     history: List[Dict[str, float]] = []
 
