@@ -89,7 +89,9 @@ def _expand(public: PublicState, tree: PublicTree, last_round: Optional[int]) ->
         children = []
         for card in rivers:
             child_public = public.with_board(card)
-            if beyond_limit:
+            if child_public.is_terminal:
+                child = _expand(child_public, tree, last_round)
+            elif beyond_limit:
                 child = PublicNode(
                     index=len(tree.nodes), kind=LEAF, public=child_public
                 )

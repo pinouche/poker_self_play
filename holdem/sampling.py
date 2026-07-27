@@ -34,7 +34,7 @@ RANGE_STYLES = ("uniform", "dirichlet", "tilted", "capped", "sparse")
 class SituationConfig:
     """The distribution training situations are drawn from."""
 
-    board_cards: int = 4  # 4 = turn endgame
+    board_cards: int = 4  # 3 = flop, 4 = turn, 5 = river
     min_pot: int = 10
     max_pot: int = 120
     min_stack: int = 40
@@ -98,10 +98,17 @@ def sample_situation(
 ) -> Tuple[TurnEndgameSpace, PublicState, np.ndarray]:
     """A random (board, pot, stack, ranges) endgame to train or test on."""
     config = config or SituationConfig()
+    if config.board_cards not in (3, 4, 5):
+        raise ValueError("board_cards must identify a postflop street (3, 4, or 5)")
     board = sample_board(rng, config.board_cards, config.excluded_boards)
     pot = int(rng.integers(config.min_pot, config.max_pot + 1))
     stack = int(rng.integers(config.min_stack, config.max_stack + 1))
-    betting = Betting(starting_pot=pot, stack=stack, max_raises=config.max_raises)
+    betting = Betting(
+        starting_pot=pot,
+        stack=stack,
+        max_raises=config.max_raises,
+        num_rounds=6 - config.board_cards,
+    )
     space = TurnEndgameSpace(board)
     reach = np.stack([sample_range(rng, board) for _ in range(2)])
     return space, PublicState(betting=betting, board=board), reach

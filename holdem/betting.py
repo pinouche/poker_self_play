@@ -169,8 +169,16 @@ class Betting:
 
     def deal_board(self) -> "Betting":
         state = replace(self, awaiting_board=False)
-        # Nobody left to act: the river is dealt only to be shown down.
-        return replace(state, showdown=True) if self.all_in else state
+        if not self.all_in:
+            return state
+        # With nobody left to act, skip directly through any remaining board
+        # deals.  A flop all-in still needs both the turn and river before the
+        # hand can be evaluated.
+        if self.betting_round + 1 < self.num_rounds:
+            return replace(
+                state, betting_round=self.betting_round + 1, awaiting_board=True
+            )
+        return replace(state, showdown=True)
 
     # --- payoffs -----------------------------------------------------------
     def fold_returns(self) -> Tuple[float, float]:

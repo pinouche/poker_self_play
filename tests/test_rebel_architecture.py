@@ -22,7 +22,14 @@ from holdem.policy import (
     PolicyReplayBuffer,
     train_policy_net,
 )
-from holdem.rebel import HoldemReBeLConfig, HoldemSelfPlayConfig, collect_trajectory, train
+from holdem.rebel import (
+    HoldemReBeLConfig,
+    HoldemSelfPlayConfig,
+    _arrival_probability,
+    collect_trajectory,
+    train,
+)
+from holdem.sampling import SituationConfig, sample_situation
 from holdem.space import TurnEndgameSpace
 from holdem.values import ZeroLeafValues
 from holdem.public_tree import PublicState as HoldemPublicState
@@ -162,6 +169,79 @@ def test_holdem_self_play_records_a_quantizable_root_policy_target():
     assert policy.target.shape == (NUM_COMBOS, 9)
     np.testing.assert_allclose(policy.target.sum(axis=-1), 1.0)
     assert set(np.flatnonzero(policy.legal_mask)) == set(public.legal_actions())
+
+
+def test_holdem_self_play_follows_a_sampled_flop_through_every_street():
+    rng = np.random.default_rng(3)
+    space, public, reach = sample_situation(
+        rng, SituationConfig(board_cards=3, max_raises=0)
+    )
+
+    examples = collect_trajectory(
+        ZeroLeafValues(),
+        space,
+        public,
+        HoldemSelfPlayConfig(
+            search_iterations=1,
+            river_iterations=1,
+            warmup_fraction=0.0,
+            exploration=0.0,
+        ),
+        rng,
+        reach=reach,
+    )
+
+    assert [int(example.mask.sum()) for example in examples] == [1176, 1128, 1081]
+
+
+@pytest.mark.parametrize(
+    ("board_cards", "expected_rounds", "expected_examples"),
+    [(3, 3, 3), (4, 2, 2), (5, 1, 1)],
+)
+def test_sampled_trajectory_covers_every_remaining_postflop_street(
+    board_cards, expected_rounds, expected_examples
+):
+    rng = np.random.default_rng(board_cards)
+    space, public, reach = sample_situation(
+        rng, SituationConfig(board_cards=board_cards, max_raises=0)
+    )
+
+    examples = collect_trajectory(
+        ZeroLeafValues(),
+        space,
+        public,
+        HoldemSelfPlayConfig(search_iterations=1, river_iterations=1),
+        rng,
+        reach=reach,
+    )
+
+    assert public.betting.num_rounds == expected_rounds
+    assert len(examples) == expected_examples
+
+
+@pytest.mark.parametrize("board_cards", [0, 2, 6])
+def test_sampling_rejects_non_postflop_board_sizes(board_cards):
+    with pytest.raises(ValueError, match="board_cards"):
+        sample_situation(
+            np.random.default_rng(0), SituationConfig(board_cards=board_cards)
+        )
+
+
+def test_holdem_self_play_defaults_to_algorithm_one_sampling():
+    config = HoldemSelfPlayConfig()
+    assert config.warmup_fraction == 0.0
+    assert config.exploration == 0.0
+
+
+def test_leaf_arrival_probability_excludes_overlapping_private_hands():
+    overlapping = np.zeros((2, NUM_COMBOS))
+    overlapping[:, 0] = 1.0
+    disjoint = overlapping.copy()
+    disjoint[1] = 0.0
+    disjoint[1, -1] = 1.0
+
+    assert _arrival_probability(overlapping) == pytest.approx(0.0)
+    assert _arrival_probability(disjoint) > 0.0
 
 
 def test_quantized_policy_replay_trains_with_probability_mse():

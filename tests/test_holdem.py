@@ -290,6 +290,25 @@ def test_a_flop_rooted_tree_reaches_the_river_one_street_at_a_time():
     assert any(node.is_terminal for node in river.nodes)
 
 
+def test_a_flop_all_in_deals_both_remaining_board_cards_before_showdown():
+    all_in = Betting(
+        stack=100,
+        num_rounds=3,
+        betting_round=1,
+        contributions=(100, 100),
+        awaiting_board=True,
+    )
+
+    turn = all_in.deal_board()
+    river = turn.deal_board()
+
+    assert turn.betting_round == 2
+    assert turn.awaiting_board
+    assert not turn.showdown
+    assert river.showdown
+    assert not river.awaiting_board
+
+
 def test_chance_weights_match_the_cards_actually_left():
     from holdem.public_tree import build_endgame_tree
 

@@ -238,7 +238,7 @@ def _self_play(
     rng = np.random.default_rng(seed)
     leaf_values = NetLeafValues(net, device=config.device)
     situations = SituationConfig(
-        excluded_boards=config.generation.excluded_boards
+        board_cards=3, excluded_boards=config.generation.excluded_boards
     )
     play = HoldemSelfPlayConfig()
     features, masks, targets = [], [], []

@@ -1,17 +1,17 @@
-"""ReBeL self play on a hold'em turn endgame.
+"""ReBeL self play on a postflop hold'em endgame.
 
 The same loop as ``rebel/`` on Leduc — search at a belief state, train the
 network on what search concluded, descend into a leaf reached by a random CFR
 iterate — with the differences hold'em forces:
 
-* a trajectory is two belief states (turn, then river) rather than two Leduc
-  rounds, and the river solve runs to real showdowns, so its values are exact
-  and the network is only ever asked about river *starts*;
+* a trajectory starts on any postflop street and follows one sampled CFR
+  iterate's reach distribution through every later street; the river solve runs
+  to real showdowns, so its values are exact;
 * every example carries its own hand mask, because which of the 1,326 combos
   are possible depends on all five board cards;
-* ranges are sampled far more aggressively during exploration.  Equilibrium
-  turn play visits a narrow slice of a 1,326-dimensional simplex, and a network
-  that has only seen that slice is worthless the moment search steps off it.
+* optional off-policy exploration can broaden the range distribution beyond
+  the narrow slice equilibrium play visits, without changing the paper-aligned
+  default trajectory sampler.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 
 from cfr.tabular_cfr import CFRConfig
-from holdem.combos import NUM_COMBOS, board_mask
+from holdem.combos import NUM_COMBOS, board_mask, compatible_mass
 from holdem.features import INPUT_DIM, encode_pbs
 from holdem.net import HoldemValueNet, HoldemValueNetConfig
 from holdem.policy import (
@@ -51,8 +51,11 @@ class HoldemSelfPlayConfig:
     search_iterations: int = 40
     river_iterations: int = 60
     depth_limit: int = 1
-    warmup_fraction: float = 0.2
-    exploration: float = 0.3
+    # Algorithm 1 samples uniformly from every CFR iterate when there is no
+    # policy warm start.  These remain configurable for deliberate off-policy
+    # experiments, but the defaults follow the paper.
+    warmup_fraction: float = 0.0
+    exploration: float = 0.0
     cfr: CFRConfig = field(default_factory=CFRConfig.dcfr)
 
 
@@ -125,7 +128,7 @@ def collect_trajectory(
     rng: np.random.Generator,
     reach: Optional[np.ndarray] = None,
 ) -> List[Example]:
-    """One pass through belief space: turn, then a sampled river."""
+    """Sample one Algorithm 1 trajectory from ``root`` through the river."""
     public = root
     reach = space.initial_reach() if reach is None else np.asarray(reach, float)
     examples: List[Example] = []
@@ -150,21 +153,24 @@ def collect_trajectory(
         if values is not None:
             pbs = space.pbs(public, reach)
             root = tree.root
-            target = np.zeros((space.num_hands, MAX_ACTIONS), dtype=np.float32)
-            target[:, root.actions] = solver.average_strategy(root)
-            legal = np.zeros(MAX_ACTIONS, dtype=np.float32)
-            legal[list(root.actions)] = 1.0
+            policy = None
+            if root.is_decision:
+                target = np.zeros((space.num_hands, MAX_ACTIONS), dtype=np.float32)
+                target[:, root.actions] = solver.average_strategy(root)
+                legal = np.zeros(MAX_ACTIONS, dtype=np.float32)
+                legal[list(root.actions)] = 1.0
+                policy = PolicyExample(
+                    features=encode_pbs(pbs),
+                    agent_index=root.player,
+                    legal_mask=legal,
+                    target=target,
+                )
             examples.append(
                 Example(
                     features=encode_pbs(pbs),
                     mask=board_mask(tuple(public.board)),
                     values=values,
-                    policy=PolicyExample(
-                        features=encode_pbs(pbs),
-                        agent_index=root.player,
-                        legal_mask=legal,
-                        target=target,
-                    ),
+                    policy=policy,
                 )
             )
 
@@ -195,15 +201,20 @@ def _frontier(solver, tree, reach, space, config: HoldemSelfPlayConfig, rng):
 def _sample_leaf(frontier, space: TurnEndgameSpace, rng):
     candidates, weights = [], []
     for leaf, reach in frontier:
-        masses = reach.sum(axis=1)
-        if masses.min() <= 0.0:
+        weight = _arrival_probability(reach, space.pair_correction)
+        if weight <= 0.0:
             continue
         candidates.append((leaf, reach))
-        weights.append(float(masses[0] * masses[1]))
+        weights.append(weight)
     if not candidates:
         return None
     probabilities = np.asarray(weights) / float(np.sum(weights))
     return candidates[int(rng.choice(len(candidates), p=probabilities))]
+
+
+def _arrival_probability(reach: np.ndarray, correction: float = 1.0) -> float:
+    """Joint reach mass over legal, non-overlapping private-hand deals."""
+    return float(correction * np.dot(reach[0], compatible_mass(reach[1])))
 
 
 def train(
