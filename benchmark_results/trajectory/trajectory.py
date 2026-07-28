@@ -18,21 +18,21 @@ import time
 import numpy as np
 import torch
 
-from benchmark import build_config
-from config import Config
-from evaluation.evaluate import (
+from paradigm_a.cli.benchmark import build_config
+from paradigm_a.config import Config
+from paradigm_a.evaluation.evaluate import (
     bb_per_100_interval,
     duplicate_deal_scores,
     make_network_agent,
 )
-from evaluation.heuristic_agent import tight_aggressive
-from evaluation.random_agent import CallingStationAgent, RandomAgent
-from environment.state import action_space_for
-from model.network import build_network, save_checkpoint
-from representation.observation_encoder import ObservationEncoder
-from training.replay_buffer import ReplayBuffer
-from training.self_play import BatchedSelfPlayWorker, snapshot_agent
-from training.trainer import Trainer
+from paradigm_a.evaluation.heuristic_agent import tight_aggressive
+from paradigm_a.evaluation.random_agent import CallingStationAgent, RandomAgent
+from paradigm_a.environment.state import action_space_for
+from paradigm_a.model.network import build_network, save_checkpoint
+from paradigm_a.representation.observation_encoder import ObservationEncoder
+from paradigm_a.training.replay_buffer import ReplayBuffer
+from paradigm_a.training.self_play import BatchedSelfPlayWorker, snapshot_agent
+from paradigm_a.training.trainer import Trainer
 
 
 def train_with_checkpoints(config_name, seed, root, iterations, every):
@@ -68,8 +68,8 @@ def train_with_checkpoints(config_name, seed, root, iterations, every):
 
 
 def evaluate_trajectory(out, deals):
-    from config import EnvConfig
-    from model.network import load_checkpoint
+    from paradigm_a.config import EnvConfig
+    from paradigm_a.model.network import load_checkpoint
 
     seeds = list(range(1, deals + 1))
     curve = []

@@ -13,7 +13,46 @@ dev = [
     "pytest>=8.0",
 ]
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# The three top-level packages, one per functionality, plus what they share.
+# Listed explicitly rather than auto-discovered so that `runs/`, `checkpoints/`
+# and `benchmark_results/` are never mistaken for importable code.
+[tool.setuptools]
+packages = [
+    "common",
+    "paradigm_a",
+    "paradigm_a.cli",
+    "paradigm_a.environment",
+    "paradigm_a.evaluation",
+    "paradigm_a.inference",
+    "paradigm_a.model",
+    "paradigm_a.representation",
+    "paradigm_a.training",
+    "paradigm_b",
+    "paradigm_b.cli",
+    "paradigm_b.core",
+    "paradigm_b.core.belief",
+    "paradigm_b.core.cfr",
+    "paradigm_b.core.game",
+    "paradigm_b.core.search",
+    "paradigm_b.holdem",
+    "paradigm_b.holdem.arm1_fixed",
+    "paradigm_b.holdem.arm2_iterative",
+    "paradigm_b.holdem.arms_common",
+    "paradigm_b.holdem.compare",
+    "paradigm_b.holdem.data",
+    "paradigm_b.holdem.engine",
+    "paradigm_b.holdem.net",
+    "paradigm_b.leduc",
+    "paradigm_b.leduc.rebel",
+    "paradigm_b.leduc.value_net",
+]
+
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "slow: end-to-end training runs; minutes rather than seconds",
 ]
