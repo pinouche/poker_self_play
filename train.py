@@ -19,7 +19,14 @@ from typing import Dict
 import numpy as np
 import torch
 
-from config import Config, reward_bound, resolve_device, updates_for_transitions
+from config import (
+    MODEL_PRESETS,
+    Config,
+    model_config,
+    reward_bound,
+    resolve_device,
+    updates_for_transitions,
+)
 from evaluation.evaluate import evaluate_suite, format_results, summarize_headline
 from model.network import build_network, load_checkpoint, save_checkpoint
 from representation.observation_encoder import ObservationEncoder
@@ -63,6 +70,13 @@ def parse_args() -> argparse.Namespace:
         "--unbounded-q",
         action="store_true",
         help="use a linear Q head even when the reward mode would allow tanh",
+    )
+    parser.add_argument(
+        "--network-size",
+        choices=list(MODEL_PRESETS),
+        default=None,
+        help="trunk/embedding size preset for every network built this run "
+        "(league slots included).  Default is the `medium` baseline",
     )
     parser.add_argument("--starting-stack", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -129,6 +143,16 @@ def parse_args() -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> Config:
     cfg = Config.load(args.config) if args.config else Config()
+
+    # A size preset replaces the whole trunk/embedding block, so keep the head
+    # knobs that are unrelated to capacity (and may come from --config).
+    if args.network_size:
+        cfg.model = model_config(
+            args.network_size,
+            dropout=cfg.model.dropout,
+            bounded_q=cfg.model.bounded_q,
+            q_scale=cfg.model.q_scale,
+        )
 
     for name, target in [
         ("iterations", "train"),
@@ -696,6 +720,11 @@ def train_league(cfg: Config, args: argparse.Namespace, encoder, device: str) ->
 def main() -> None:
     args = parse_args()
     cfg = build_config(args)
+    if args.resume and args.network_size:
+        raise SystemExit(
+            "--network-size cannot be combined with --resume: the resumed "
+            "checkpoint carries its own model config"
+        )
     device = resolve_device(cfg.train.device)
     set_seeds(cfg.train.seed)
 
