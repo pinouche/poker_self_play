@@ -120,12 +120,29 @@ def policy_distributions(
     return masked_softmax_rows(np.concatenate(chunks, axis=0), masks)
 
 
-def pairwise_kl(policies: Sequence[np.ndarray], masks: np.ndarray) -> np.ndarray:
-    """``[n, n]`` matrix of mean ``KL(pi_i || pi_j)`` over the validation states.
+def mean_kl(policy: np.ndarray, other: np.ndarray, masks: np.ndarray) -> float:
+    """Mean ``KL(policy || other)`` over the validation states.
 
     Both distributions are masked to the same legal set, so the supports match
     and the divergence is finite; probabilities are floored before the log for
-    numerical safety.  The diagonal is zero.
+    numerical safety.
+    """
+    return _kl_from_logs(
+        policy, np.log(np.clip(policy, _EPS, None)),
+        np.log(np.clip(other, _EPS, None)), masks > 0,
+    )
+
+
+def _kl_from_logs(policy, log_policy, log_other, legal) -> float:
+    per_state = np.where(legal, policy * (log_policy - log_other), 0.0).sum(axis=1)
+    return float(per_state.mean())
+
+
+def pairwise_kl(policies: Sequence[np.ndarray], masks: np.ndarray) -> np.ndarray:
+    """``[n, n]`` matrix of mean ``KL(pi_i || pi_j)`` over the validation states.
+
+    The diagonal is zero.  Logs are taken once per policy rather than once per
+    pair -- at 32 members that is 32 log passes over the bank instead of 2,048.
     """
     n = len(policies)
     legal = masks > 0
@@ -133,10 +150,8 @@ def pairwise_kl(policies: Sequence[np.ndarray], masks: np.ndarray) -> np.ndarray
     logs = [np.log(np.clip(p, _EPS, None)) for p in policies]
     for i in range(n):
         for j in range(n):
-            if i == j:
-                continue
-            per_state = np.where(legal, policies[i] * (logs[i] - logs[j]), 0.0).sum(axis=1)
-            out[i, j] = float(per_state.mean())
+            if i != j:
+                out[i, j] = _kl_from_logs(policies[i], logs[i], logs[j], legal)
     return out
 
 

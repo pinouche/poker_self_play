@@ -206,6 +206,78 @@ def test_reference_policy_modes_both_run():
         Trainer(cfg, build_network(cfg), device="cpu").train_step(batch)
 
 
+def test_snapshot_reference_needs_a_reference_network():
+    cfg = small_config()
+    with pytest.raises(ValueError, match="snapshot"):
+        Trainer(cfg, build_network(cfg), device="cpu", reference_mode="snapshot")
+
+
+def test_snapshot_reference_bounds_drift_where_current_accumulates_it():
+    """The point of anchoring a league veteran to its own frozen snapshot.
+
+    With ``reference_policy="current"`` the trust region is re-centred on the
+    policy every update, so small steps compose without limit.  Anchored to a
+    fixed snapshot, ``beta`` bounds the distance from the snapshot itself, so the
+    same number of updates on the same data moves the policy far less.
+    """
+    import copy
+
+    import torch
+
+    from model.network import masked_log_softmax
+
+    cfg = small_config()
+    cfg.train.reference_policy = "current"
+    encoder = ObservationEncoder(cfg.obs)
+    start = build_network(cfg)
+    worker = SelfPlayWorker(cfg, build_network(cfg), encoder, seed=11)
+    buffer = ReplayBuffer(
+        capacity=2000, observation_dim=encoder.observation_dim, num_actions=NUM_ACTIONS
+    )
+    while len(buffer) < 256:
+        transitions, _ = worker.generate(40)
+        buffer.extend(transitions)
+    batch = buffer.sample(128, np.random.default_rng(0))
+
+    observations = torch.as_tensor(batch.observations, dtype=torch.float32)
+    legal = torch.as_tensor(batch.legal_action_masks, dtype=torch.float32)
+
+    def policy_of(network) -> torch.Tensor:
+        with torch.no_grad():
+            logits, _ = network(observations)
+            return masked_log_softmax(logits, legal).exp()
+
+    reference = policy_of(start)
+
+    def drift_after_training(**trainer_kwargs) -> float:
+        network = copy.deepcopy(start)
+        trainer = Trainer(cfg, network, device="cpu", **trainer_kwargs)
+        for _ in range(60):
+            trainer.train_step(batch)
+        moved = policy_of(network)
+        per_state = torch.where(
+            legal > 0, reference * (reference.clamp_min(1e-8).log()
+                                    - moved.clamp_min(1e-8).log()), 0.0
+        ).sum(dim=-1)
+        return float(per_state.mean())
+
+    unanchored = drift_after_training()
+    anchored = drift_after_training(
+        reference_mode="snapshot", reference_network=copy.deepcopy(start),
+    )
+    assert anchored < unanchored, (
+        f"anchored drift {anchored:.4f} should stay below unanchored {unanchored:.4f}"
+    )
+
+
+def test_lr_scale_slows_a_veterans_optimiser():
+    cfg = small_config()
+    trainer = Trainer(cfg, build_network(cfg), device="cpu", lr_scale=0.1)
+    assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(
+        cfg.train.learning_rate * 0.1
+    )
+
+
 def test_bb_normalized_training_stays_conditioned():
     """Large-magnitude rewards must not blow up the Q loss or kill exploration.
 

@@ -3,14 +3,26 @@
 The population is split into three roles:
 
 * **learners** -- updated continuously; the working edge of the league.
-* **champions** -- frozen historical snapshots, never updated.  They are the
-  cheap fix for four problems at once: catastrophic forgetting, meta-game
-  collapse, strategy cycling, and unstable evaluation.  With only live members
-  the whole population can walk away from a good strategy together and never
-  notice; a frozen ladder of past elites makes that impossible to hide.
+* **champions** -- historical snapshots.  They are the cheap fix for four
+  problems at once: catastrophic forgetting, meta-game collapse, strategy
+  cycling, and unstable evaluation.  With only live members the whole population
+  can walk away from a good strategy together and never notice; a ladder of past
+  elites makes that impossible to hide.
 * **explorers** -- learners periodically wiped and reinitialised *from scratch*.
   From scratch matters: a fresh random policy is genuinely off-distribution,
   whereas an offspring of an incumbent inherits its blind spots.
+
+Under ``champion_mode="frozen"`` every champion is a hard snapshot.  Under
+``"anchored"`` the pool splits into **anchors** (still hard-frozen, and the only
+slots the gauntlet reads -- a measuring stick that moves measures nothing) and
+**veterans**, which keep training.  A veteran exists because promotion can only
+freeze strategies the learner pool *currently holds*: a champion encoding a line
+the learners have abandoned is the one thing here that cannot be recreated, and
+frozen it merely rots until eviction.  Its improvement target is anchored to its
+own frozen snapshot (``reference_policy="snapshot"``), so ``beta`` bounds the
+distance from that snapshot rather than the size of one step from wherever it
+drifted to; the remaining drift is *measured* (:meth:`veteran_drift`) and reset
+when it exceeds the budget, rather than assumed small.
 
 Two rules keep the champion pool useful rather than random:
 
@@ -78,10 +90,31 @@ class LeagueMember:
     return_sum: float = 0.0       # sum of chip delta / own starting stack
     stale: bool = False           # champion flagged for eviction
 
+    # Veterans only: the frozen copy taken when this slot was filled.  It is both
+    # the reference policy their training target is anchored to and the baseline
+    # drift is measured against, so its presence is what marks a champion as a
+    # veteran rather than an anchor.
+    snapshot: Optional[PokerNet] = None
+
     @property
     def trainable(self) -> bool:
-        """Champions are opponents only; learners and explorers are optimised."""
-        return self.role is not Role.CHAMPION
+        """Anchored champions are opponents only; everything else is optimised."""
+        if self.role is not Role.CHAMPION:
+            return True
+        return self.snapshot is not None
+
+    @property
+    def is_anchor(self) -> bool:
+        """A hard-frozen champion -- part of the gauntlet's fixed measuring stick."""
+        return self.role is Role.CHAMPION and self.snapshot is None
+
+    @property
+    def label(self) -> str:
+        """Role for logs.  Frozen champions keep reading "champion" so that the
+        default mode's output is unchanged; only veterans need a new word."""
+        if self.role is Role.CHAMPION and not self.is_anchor:
+            return "veteran"
+        return self.role.value
 
     @property
     def strength(self) -> float:
@@ -112,7 +145,9 @@ class ManagementReport:
         parts = [f"promote learner {i} -> champion slot {s} ({why})"
                  for i, s, why in self.promoted]
         if self.retired:
-            parts.append(f"retire stale champions {self.retired}")
+            # Flagged only -- a stale champion leaves the pool when a promotion
+            # needs its slot, so this line must not read as an eviction.
+            parts.append(f"flag stale champions {self.retired} (evicted on next promotion)")
         if self.culled is not None:
             parts.append(f"cull learner {self.culled}")
         if self.reset_explorers:
@@ -132,10 +167,30 @@ class LeaguePopulation:
         self._generation = 0
         self._manage_pass = 0
 
+        self.champion_mode = str(cfg.train.champion_mode).lower()
+        if self.champion_mode not in ("frozen", "anchored"):
+            raise ValueError(
+                f"unknown champion_mode {cfg.train.champion_mode!r}; "
+                "choose from 'frozen', 'anchored'"
+            )
+
+        learners = max(0, int(cfg.train.league_learners))
+        champions = max(0, int(cfg.train.league_champions))
+        # The layout below lays champion slots out contiguously right after the
+        # learners, which is what makes these two ranges well defined.  Under
+        # "frozen" every champion is an anchor, so every anchor-aware code path
+        # below reduces exactly to the original behaviour.
+        anchors = (
+            champions if self.champion_mode == "frozen"
+            else min(champions, max(0, int(cfg.train.league_champion_anchors)))
+        )
+        self.anchor_slots = set(range(learners, learners + anchors))
+        self.veteran_slots = set(range(learners + anchors, learners + champions))
+
         self.members: List[LeagueMember] = []
         layout = (
-            (Role.LEARNER, int(cfg.train.league_learners)),
-            (Role.CHAMPION, int(cfg.train.league_champions)),
+            (Role.LEARNER, learners),
+            (Role.CHAMPION, champions),
             (Role.EXPLORER, int(cfg.train.league_explorers)),
         )
         for role, count in layout:
@@ -176,19 +231,43 @@ class LeaguePopulation:
         return network
 
     def _new_member(self, role: Role, index: Optional[int] = None) -> LeagueMember:
+        slot = len(self.members) if index is None else index
         network = self._new_network()
+        snapshot = None
         if role is Role.CHAMPION:
-            network = self._freeze(network)
+            network, snapshot = self._champion_networks(network, slot)
         self._generation += 1
         return LeagueMember(
-            index=len(self.members) if index is None else index,
+            index=slot,
             role=role,
             network=network,
             agent=self._build_agent(network),
             generation=self._generation,
             born_at_hands=self.total_hands,
             trained_at_hands=self.total_hands,
+            snapshot=snapshot,
         )
+
+    def _champion_networks(self, source: PokerNet, slot: int) -> tuple:
+        """``(live_network, snapshot)`` for a champion filling ``slot``.
+
+        Anchor slots get a single frozen network and no snapshot.  Veteran slots
+        get a *trainable* copy to play and train with, plus an independent frozen
+        copy kept as the anchor for their improvement target and the baseline for
+        drift.  Whether a slot is an anchor is a property of the slot, not of who
+        fills it, so the gauntlet spine survives every promotion and eviction.
+        """
+        if slot not in self.veteran_slots:
+            return self._freeze(source), None
+        return self._clone(source), self._freeze(source)
+
+    def _clone(self, network: PokerNet) -> PokerNet:
+        """An independent *trainable* copy of ``network``."""
+        clone = build_network(self.cfg)
+        clone.load_state_dict(copy.deepcopy(network.state_dict()))
+        if self.device:
+            clone.to(self.device)
+        return clone
 
     def _freeze(self, network: PokerNet) -> PokerNet:
         """An independent, non-trainable copy that cannot drift with the live net."""
@@ -219,8 +298,28 @@ class LeaguePopulation:
     def trainable_indices(self) -> List[int]:
         return [i for i, m in enumerate(self.members) if m.trainable]
 
+    def contender_indices(self) -> List[int]:
+        """Trainable non-champions -- the members promotion is judged over.
+
+        Veterans train but are already champions, so they belong in neither the
+        gauntlet's rows nor the promotion pool.
+        """
+        return [i for i, m in enumerate(self.members)
+                if m.trainable and m.role is not Role.CHAMPION]
+
+    def veteran_indices(self) -> List[int]:
+        """Champions that keep training (empty under ``champion_mode="frozen"``)."""
+        return [i for i, m in enumerate(self.members) if m.role is Role.CHAMPION and m.trainable]
+
+    def anchor_indices(self) -> List[int]:
+        """Hard-frozen champions -- the gauntlet's fixed measuring stick."""
+        return [i for i, m in enumerate(self.members) if m.is_anchor]
+
     def role_counts(self) -> dict:
-        return {role.value: len(self.indices(role)) for role in Role}
+        counts = {role.value: len(self.indices(role)) for role in Role}
+        counts["anchor"] = len(self.anchor_indices())
+        counts["veteran"] = len(self.veteran_indices())
+        return counts
 
     # --- matchmaking -------------------------------------------------------
     def sample_match(self) -> MatchType:
@@ -298,16 +397,27 @@ class LeaguePopulation:
         """Champion slots ordered oldest -> newest snapshot."""
         return sorted(self.indices(Role.CHAMPION), key=lambda i: self.members[i].trained_at_hands)
 
+    def gauntlet_generations(self) -> List[int]:
+        """Anchor slots, oldest -> newest: the generations the gauntlet judges on.
+
+        Veterans are deliberately excluded.  They drift toward beating the
+        current learner meta, so scoring learners against them would erode the
+        very generational spread the over-specialisation test reads.  Under
+        ``champion_mode="frozen"`` every champion is an anchor and this is
+        :meth:`champion_generations`.
+        """
+        return sorted(self.anchor_indices(), key=lambda i: self.members[i].trained_at_hands)
+
     def champion_gauntlet(self, min_hands: int = 1) -> dict:
-        """How every learner fares against each champion *generation*.
+        """How every learner fares against each anchor *generation*.
 
         A learner that beats the newest champion but loses badly to an older one
         is over-specialised: it has learned the current meta rather than the
         game.  ``beats`` counts generations with a positive result, and
         ``over_specialised`` flags exactly that pattern.
         """
-        generations = self.champion_generations()
-        learners = self.trainable_indices()
+        generations = self.gauntlet_generations()
+        learners = self.contender_indices()
         pair_mean = self.running_pair_mean()
         results = np.zeros((len(learners), len(generations)), dtype=np.float64)
         seen = np.zeros_like(results, dtype=bool)
@@ -453,20 +563,25 @@ class LeaguePopulation:
         diversity: Optional[Sequence[float]] = None,
         exclude: Sequence[int] = (),
     ) -> Optional[int]:
-        """Freeze a learner into a champion slot, forever."""
+        """Snapshot a learner into a champion slot.
+
+        Into an anchor slot that is forever; into a veteran slot the snapshot is
+        kept as the anchor for the copy that carries on training.
+        """
         slot = self._eviction_slot(exclude=exclude, diversity=diversity)
         if slot is None:
             return None
         self._generation += 1
-        frozen = self._freeze(self.members[index].network)
+        network, snapshot = self._champion_networks(self.members[index].network, slot)
         self.members[slot] = LeagueMember(
             index=slot,
             role=Role.CHAMPION,
-            network=frozen,
-            agent=self._build_agent(frozen),
+            network=network,
+            agent=self._build_agent(network),
             generation=self._generation,
             born_at_hands=self.total_hands,
             trained_at_hands=self.total_hands,
+            snapshot=snapshot,
         )
         self._clear_stats(slot)
         return slot
@@ -574,6 +689,53 @@ class LeaguePopulation:
             report.culled = self.cull(scores)
         return report
 
+    # --- veteran drift ------------------------------------------------------
+    def veteran_drift(self, observations: np.ndarray, masks: np.ndarray) -> np.ndarray:
+        """Mean ``KL(veteran || its own snapshot)``; NaN for non-veterans.
+
+        This is the number anchored mode lives or dies on.  Anchoring the
+        improvement target *bounds* drift rather than eliminating it, and a bound
+        nobody measures is a bound nobody has -- so it is reported every
+        management pass and enforced by :meth:`enforce_veteran_drift`.
+        """
+        from training.league_metrics import mean_kl, policy_distributions
+
+        drift = np.full(len(self.members), np.nan, dtype=np.float64)
+        for index in self.veteran_indices():
+            member = self.members[index]
+            live = policy_distributions(member.network, observations, masks, device=self.device)
+            anchor = policy_distributions(member.snapshot, observations, masks, device=self.device)
+            drift[index] = mean_kl(live, anchor, masks)
+        return drift
+
+    def enforce_veteran_drift(
+        self, drift: Sequence[float], skip: Sequence[int] = ()
+    ) -> List[int]:
+        """Reset veterans past ``league_veteran_max_kl`` back to their snapshot.
+
+        The returned slots need their optimiser and replay buffer rebuilt by the
+        caller: Adam's moment estimates survive a bare ``load_state_dict`` and
+        would shove the veteran straight back off the anchor it was just returned
+        to, and the buffer holds the drifted policy's experience.  ``skip`` is
+        for slots already replaced this pass, whose drift reading predates the
+        network now sitting in them.
+        """
+        budget = float(self.cfg.train.league_veteran_max_kl)
+        if budget <= 0:
+            return []
+        skipped = set(skip)
+        reset = []
+        for index in self.veteran_indices():
+            value = drift[index] if index < len(drift) else np.nan
+            if index in skipped or not np.isfinite(value) or value <= budget:
+                continue
+            member = self.members[index]
+            member.network.load_state_dict(copy.deepcopy(member.snapshot.state_dict()))
+            # The record was earned by the drifted policy, not by this one.
+            self._clear_stats(index)
+            reset.append(index)
+        return reset
+
     # --- metrics -----------------------------------------------------------
     def evaluate(self, encoder, seed: int = 0, offline_strength: bool = False) -> dict:
         """Strength, diversity, coverage and the management score.
@@ -625,6 +787,10 @@ class LeaguePopulation:
             "kl_matrix": kl,
             "hands_played": hands,
             "roles": [m.role.value for m in self.members],
+            # Free here: the validation bank is already sampled and the live
+            # policies already computed, so drift costs one forward pass per
+            # veteran snapshot.
+            "veteran_drift": self.veteran_drift(observations, masks),
         }
 
     def summary(self, metrics: dict, top: int = 5) -> str:
@@ -633,7 +799,7 @@ class LeaguePopulation:
         lines = [f"{'slot':>5}{'role':>10}{'score':>8}{'mbb/100':>12}{'diversity':>11}{'cover':>7}"]
         for index in order[:top]:
             lines.append(
-                f"{index:>5}{self.members[index].role.value:>10}"
+                f"{index:>5}{self.members[index].label:>10}"
                 f"{metrics['score'][index]:>8.3f}{metrics['strength_mbb_per_100'][index]:>12.0f}"
                 f"{metrics['diversity'][index]:>11.4f}{int(metrics['coverage'][index]):>7}"
             )

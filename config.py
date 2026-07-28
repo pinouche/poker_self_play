@@ -144,7 +144,10 @@ class TrainConfig:
     # Reference policy for the improvement operator.  "current" anchors to the
     # live network (detached) -- i.e. the policy immediately before the update.
     # "behavior" anchors to the policy stored with the transition, which grows
-    # stale as the buffer ages.
+    # stale as the buffer ages.  "snapshot" anchors to a *fixed* network handed
+    # to the trainer; only "current" and "behavior" are meaningful as a global
+    # default, since "snapshot" needs a per-slot reference network (it is what
+    # anchored veteran champions use -- see ``champion_mode``).
     reference_policy: str = "current"
 
     # --- returns ------------------------------------------------------------
@@ -262,7 +265,13 @@ class TrainConfig:
     league_learners: int = 16
     league_champions: int = 8
     league_explorers: int = 8
-    league_explorer_reset_hands: int = 5_000_000
+    # Explorers are wiped every this many *total league* hands (256/iteration at
+    # the defaults, so 512k in a 2000-iteration run).  Same failure mode as
+    # ``league_promotion_hands``: set above what a run generates and the explorer
+    # role is inert -- the slots are never reinitialised and behave as ordinary
+    # learners.  20k = every ~78 iterations, so it fires twice in a default
+    # 200-iteration run and ~25 times over 2000.
+    league_explorer_reset_hands: int = 20_000
     # Iterations between management passes (recompute metrics, promote, cull).
     league_manage_every: int = 50
     # Metric sample sizes.  100k-1M hands and ~100k states are the sizes that
@@ -296,7 +305,22 @@ class TrainConfig:
     # strengthen the absolute version becomes unmeetable and the ladder freezes
     # (observed -- promotions stopped for eight passes at the strong end).
     league_promotion_mbb_per_100: float = 35.0
-    league_promotion_hands: int = 2_000_000
+    # *Per member*, counted from this slot's own record (cleared when the slot is
+    # reset), NOT total league hands.  A member accrues roughly
+    #   hands_per_iteration * num_players / league_size
+    # hands per iteration -- ~32/iteration at the 256-hand, 32-net defaults, so
+    # ~2.4k by iteration 100 and ~48k over a 2000-iteration run.  Anything above
+    # that ceiling silently freezes the whole ladder: both promotion paths gate
+    # on it, so no learner is ever promoted, the champion pool stays at its
+    # random initialisation and every champion metric reads flat forever
+    # (`train_league` now warns when the gate is out of reach).  2k is reached at
+    # iteration ~83, so the ladder starts rolling on the second management pass
+    # of even a default 200-iteration run.  It is a *small* sample for a
+    # 35 mbb/100 estimate -- the median-generation, over-specialisation and
+    # external-panel gates are what actually filter promotions; this one only
+    # keeps a brand-new slot out.  Raise it for long runs, but never above
+    # `hands_per_iteration * num_players / league_size * iterations`.
+    league_promotion_hands: int = 2_000
     league_promotion_min_generations: float = 0.5
     # A generation counts as "faced" only past this many shared hands, so the
     # median gate is judged on real samples rather than one-hand noise.
@@ -356,6 +380,47 @@ class TrainConfig:
     league_champion_retire_mbb_per_100: float = -50_000.0
     league_champion_retire_vs_heuristic: float = -150.0  # bb/100; NaN eval = skip
     league_champion_min_hands: int = 5_000  # don't judge a champion on noise
+
+    # --- champion mode: frozen ladder, or anchored veterans -----------------
+    # "frozen" (the default, and the classic league) makes every champion a hard
+    # snapshot.  That is load-bearing for two things and only two: the gauntlet
+    # needs a measuring stick that does not move (if champions chase the current
+    # learner meta, the generational spread collapses and the
+    # over-specialisation test silently becomes a no-op), and "beat champion N"
+    # must mean the same thing at iteration 500 and at iteration 5000.
+    #
+    # "anchored" buys back what frozen costs.  Promotion can only ever freeze a
+    # strategy the learner pool *currently holds*; a champion encoding a line the
+    # learners have since abandoned is the one thing in the league that cannot be
+    # recreated, and today it just rots until it is evicted.  So the pool splits:
+    #   * the first ``league_champion_anchors`` champion slots stay hard-frozen
+    #     -- the gauntlet spine, and the only slots the gauntlet reads;
+    #   * the rest become *veterans*: they keep an optimiser and a replay buffer,
+    #     train on their own hands, and develop their abandoned branch.
+    # This is a diversity mechanism, not a strength one.  Veterans mostly face
+    # learners, so left alone they would chase the current meta and become
+    # learners with extra steps -- which is what the anchor below prevents.
+    champion_mode: str = "frozen"     # "frozen" | "anchored"
+    # Champion slots that stay hard-frozen under "anchored".  Needs >= 2 for the
+    # over-specialisation test (it compares the oldest and newest generation),
+    # and >= 4 keeps the median-generation promotion gate meaningful.  Ignored
+    # when champion_mode is "frozen" (there, every champion is an anchor).
+    league_champion_anchors: int = 4
+    # A veteran's improvement target is anchored to its *own* frozen snapshot
+    # rather than to its current policy (``reference_policy="snapshot"``), so
+    # ``beta`` bounds how far the target can sit from the snapshot instead of
+    # bounding one step from wherever it drifted to last update.  Drift is then
+    # an observable, not a hope: KL(veteran || snapshot) is measured over the
+    # validation bank every management pass, and a veteran past
+    # ``league_veteran_max_kl`` is reset to its snapshot (optimiser included).
+    # 0 or below disables the budget.  Note the anchor applies to the training
+    # *target* only -- the veteran acts with its own live network, as it must,
+    # since it is a real opponent.
+    league_veteran_max_kl: float = 0.05
+    # Veterans train slower than learners: they are developing an existing line,
+    # not searching for one, and a full-rate optimiser blows the drift budget in
+    # a handful of passes.
+    league_veteran_lr_scale: float = 0.1
     # A freshly reset/culled learner is protected from being culled again for
     # this many management passes, so it gets time to develop instead of being
     # re-culled every pass while it is still the youngest (observed churn: three

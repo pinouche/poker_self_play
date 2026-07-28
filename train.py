@@ -104,14 +104,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--league", dest="league_population", action="store_true", default=None,
-        help="role-structured league: learners + frozen champions + explorers, "
-        "with behaviour-aware promotion (score = 0.6 strength + 0.4 diversity)",
+        help="role-structured league: learners + champions + explorers, with "
+        "behaviour-aware promotion (score = 0.6 strength + 0.4 diversity).  "
+        "Champions are frozen unless --champion-mode anchored",
     )
     parser.add_argument("--league-learners", type=int, default=None)
     parser.add_argument("--league-champions", type=int, default=None)
     parser.add_argument("--league-explorers", type=int, default=None)
     parser.add_argument("--league-manage-every", type=int, default=None)
     parser.add_argument("--league-promotion-hands", type=int, default=None)
+    parser.add_argument(
+        "--champion-mode", choices=["frozen", "anchored"], default=None,
+        help="frozen (default): every champion is a hard snapshot.  anchored: "
+        "--league-champion-anchors slots stay frozen as the gauntlet spine and "
+        "the rest become veterans that keep training, anchored to their own "
+        "snapshot with a measured, enforced drift budget",
+    )
+    parser.add_argument("--league-champion-anchors", type=int, default=None)
+    parser.add_argument("--league-veteran-max-kl", type=float, default=None)
+    parser.add_argument("--league-veteran-lr-scale", type=float, default=None)
     parser.add_argument("--no-eval", action="store_true")
     return parser.parse_args()
 
@@ -151,6 +162,10 @@ def build_config(args: argparse.Namespace) -> Config:
         ("league_explorers", "train"),
         ("league_manage_every", "train"),
         ("league_promotion_hands", "train"),
+        ("champion_mode", "train"),
+        ("league_champion_anchors", "train"),
+        ("league_veteran_max_kl", "train"),
+        ("league_veteran_lr_scale", "train"),
         ("reward_mode", "env"),
         ("reward_clip", "env"),
         ("starting_stack", "env"),
@@ -335,12 +350,14 @@ def train_league(cfg: Config, args: argparse.Namespace, encoder, device: str) ->
     """Training loop for the role-structured league.
 
     Learners and explorers are optimised (one optimiser and replay buffer per
-    slot); champions only play.  A management pass every
-    ``league_manage_every`` iterations recomputes strength / diversity /
-    coverage, promotes earned learners into the frozen champion ladder, retires
-    stale champions and culls the weakest learner -- and any slot whose network
-    was replaced has its optimiser and buffer rebuilt here, since this loop owns
-    them.
+    slot); anchored champions only play.  Under ``champion_mode="anchored"``
+    veteran champions are optimised too, at a reduced learning rate and with
+    their improvement target anchored to their own frozen snapshot.  A management
+    pass every ``league_manage_every`` iterations recomputes strength /
+    diversity / coverage, promotes earned learners into the champion ladder,
+    retires stale champions, culls the weakest learner and resets any veteran
+    that has drifted past its budget -- and any slot whose network was replaced
+    has its optimiser and buffer rebuilt here, since this loop owns them.
     """
     from training.league import LeaguePopulation, Role
     from training.league_play import LeagueSelfPlayWorker
@@ -361,18 +378,50 @@ def train_league(cfg: Config, args: argparse.Namespace, encoder, device: str) ->
             store_next_obs=cfg.train.store_next_obs,
         )
 
+    def new_trainer(slot: int) -> Trainer:
+        """Optimiser for one slot; veterans get the anchored, slowed-down variant."""
+        member = population.members[slot]
+        if member.snapshot is None:
+            return Trainer(cfg, member.network, device=device)
+        return Trainer(
+            cfg, member.network, device=device,
+            reference_mode="snapshot", reference_network=member.snapshot,
+            lr_scale=float(cfg.train.league_veteran_lr_scale),
+        )
+
     buffers = {slot: new_buffer() for slot in trainable}
-    trainers = {
-        slot: Trainer(cfg, population.members[slot].network, device=device) for slot in trainable
-    }
+    trainers = {slot: new_trainer(slot) for slot in trainable}
 
     counts = population.role_counts()
+    champion_detail = (
+        f"{counts['champion']} champions"
+        if population.champion_mode == "frozen"
+        else f"{counts['anchor']} anchors + {counts['veteran']} veterans"
+    )
     print(
         f"device={device}  league={len(population)} networks "
-        f"({counts['learner']} learners, {counts['champion']} champions, "
+        f"({counts['learner']} learners, {champion_detail}, "
         f"{counts['explorer']} explorers)  parameters/net="
         f"{population.networks[0].num_parameters():,}"
     )
+    if population.champion_mode == "anchored":
+        print(
+            f"  champions: anchored mode -- {counts['veteran']} veterans train at "
+            f"{cfg.train.league_veteran_lr_scale:g}x lr against their own snapshot, "
+            f"reset past KL {cfg.train.league_veteran_max_kl:g}; the gauntlet reads "
+            f"the {counts['anchor']} frozen anchors only"
+        )
+        if counts["veteran"] == 0:
+            print(
+                "  WARNING: league_champion_anchors >= league_champions, so there are "
+                "no veterans and anchored mode is identical to frozen."
+            )
+        if counts["anchor"] < 2:
+            print(
+                f"  WARNING: only {counts['anchor']} frozen anchor(s); the "
+                "over-specialisation gate compares the oldest and newest generation "
+                "and is inert below 2.  Raise --league-champion-anchors."
+            )
     print(
         f"  matchmaking: {cfg.train.league_match_learner_vs_learner:.0%} L-v-L / "
         f"{cfg.train.league_match_learner_vs_champion:.0%} L-v-C / "
@@ -383,6 +432,37 @@ def train_league(cfg: Config, args: argparse.Namespace, encoder, device: str) ->
         f"{cfg.train.league_promotion_hands:,} hands, beating the median champion "
         f"(>= {cfg.train.league_promotion_min_generations:.0%} of generations faced)"
     )
+
+    # Both promotion paths gate on a *per-member* hand count.  Set above what the
+    # run can generate and the ladder freezes silently -- champions stay at their
+    # random initialisation and every champion metric reads flat for the whole
+    # run.  Say so up front rather than leaving it to be inferred from a dead plot.
+    per_member_per_iter = (
+        cfg.train.hands_per_iteration * cfg.env.num_players / max(1, len(population))
+    )
+    gate = int(cfg.train.league_promotion_hands)
+    iters_to_gate = gate / max(per_member_per_iter, 1e-9)
+    if iters_to_gate > cfg.train.iterations:
+        print(
+            f"  WARNING: no learner can reach the {gate:,}-hand promotion gate in "
+            f"{cfg.train.iterations:,} iterations (a member accrues "
+            f"~{per_member_per_iter:.0f} hands/iteration, so the gate needs "
+            f"~{iters_to_gate:,.0f}).  The champion pool will never change and "
+            f"every champion metric will read flat.  Lower "
+            f"--league-promotion-hands (<= {int(per_member_per_iter * cfg.train.iterations):,})."
+        )
+    else:
+        print(
+            f"  a member accrues ~{per_member_per_iter:.0f} hands/iteration "
+            f"-> promotion gate reachable from iteration ~{iters_to_gate:.0f}"
+        )
+    total_hands_planned = cfg.train.hands_per_iteration * cfg.train.iterations
+    if int(cfg.train.league_explorer_reset_hands) > total_hands_planned:
+        print(
+            f"  WARNING: explorers never reset -- "
+            f"league_explorer_reset_hands={cfg.train.league_explorer_reset_hands:,} "
+            f"exceeds the {total_hands_planned:,} league hands this run generates."
+        )
     print(
         f"  per-slot replay {per_slot_capacity:,}  ({len(trainable)} optimised slots)\n",
         flush=True,
@@ -430,7 +510,7 @@ def train_league(cfg: Config, args: argparse.Namespace, encoder, device: str) ->
             reset = population.maybe_reset_explorers()
             for slot in reset:
                 buffers[slot] = new_buffer()
-                trainers[slot] = Trainer(cfg, population.members[slot].network, device=device)
+                trainers[slot] = new_trainer(slot)
             if reset:
                 print(f"  reinitialised explorers {reset} from scratch", flush=True)
 
@@ -520,9 +600,34 @@ def train_league(cfg: Config, args: argparse.Namespace, encoder, device: str) ->
                 for slot in report.rebuilt_slots:
                     if population.members[slot].trainable:
                         buffers[slot] = new_buffer()
-                        trainers[slot] = Trainer(
-                            cfg, population.members[slot].network, device=device
-                        )
+                        trainers[slot] = new_trainer(slot)
+
+                # Veterans that blew the drift budget go back to their snapshot.
+                # Slots manage() just replaced are skipped: the drift reading
+                # above predates the network now sitting in them.
+                drift = league_metrics["veteran_drift"]
+                snapped = population.enforce_veteran_drift(
+                    drift, skip=report.rebuilt_slots
+                )
+                for slot in snapped:
+                    buffers[slot] = new_buffer()
+                    trainers[slot] = new_trainer(slot)
+                veterans = population.veteran_indices()
+                if veterans:
+                    values = [drift[i] for i in veterans if np.isfinite(drift[i])]
+                    print(
+                        "  veteran drift KL(live||snapshot): "
+                        + " ".join(f"{drift[i]:.4f}" for i in veterans)
+                        + (f"  |  max {max(values):.4f}" if values else "")
+                        + f" / budget {cfg.train.league_veteran_max_kl:g}"
+                        + (f"  -> reset {snapped} to snapshot" if snapped else ""),
+                        flush=True,
+                    )
+                    history.append({
+                        "iteration": iteration,
+                        "veteran_drift": [float(drift[i]) for i in veterans],
+                        "veterans_reset_to_snapshot": snapped,
+                    })
 
                 over = int(gauntlet["over_specialised"].sum())
                 print(population.summary(league_metrics, top=5), flush=True)

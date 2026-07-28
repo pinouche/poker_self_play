@@ -37,20 +37,32 @@ class Trainer:
         network: PokerNet,
         device: str = "cpu",
         optimizer: Optional[torch.optim.Optimizer] = None,
+        reference_mode: Optional[str] = None,
+        reference_network: Optional[PokerNet] = None,
+        lr_scale: float = 1.0,
     ) -> None:
         self.cfg = cfg
         self.network = network
         self.device = torch.device(device)
         self.network.to(self.device)
         self.q_scale = reward_scale(cfg.env)
-        self.optimizer = optimizer or self._build_optimizer(cfg, network)
+        # Per-slot overrides of the global improvement reference.  A league
+        # veteran anchors its target to its own frozen snapshot instead of to its
+        # current policy, and trains slower; nothing else needs either knob.
+        self.reference_mode = reference_mode or cfg.train.reference_policy
+        self.reference_network = reference_network
+        if self.reference_mode == "snapshot":
+            if reference_network is None:
+                raise ValueError("reference_policy='snapshot' requires a reference_network")
+            reference_network.to(self.device).eval()
+        self.optimizer = optimizer or self._build_optimizer(cfg, network, lr_scale)
         self.updates = 0
 
     @staticmethod
-    def _build_optimizer(cfg, network) -> torch.optim.Optimizer:
+    def _build_optimizer(cfg, network, lr_scale: float = 1.0) -> torch.optim.Optimizer:
         kind = cfg.train.optimizer.lower()
         params = dict(
-            lr=cfg.train.learning_rate, weight_decay=cfg.train.weight_decay
+            lr=cfg.train.learning_rate * lr_scale, weight_decay=cfg.train.weight_decay
         )
         if kind == "adamw":
             return torch.optim.AdamW(network.parameters(), **params)
@@ -63,16 +75,28 @@ class Trainer:
         return torch.as_tensor(array, dtype=dtype, device=self.device)
 
     def _reference_log_policy(
-        self, log_pi: torch.Tensor, old_policy: torch.Tensor, legal_mask: torch.Tensor
+        self,
+        log_pi: torch.Tensor,
+        old_policy: torch.Tensor,
+        legal_mask: torch.Tensor,
+        observations: torch.Tensor,
     ) -> torch.Tensor:
         """Log of the reference policy for the improvement operator."""
-        mode = self.cfg.train.reference_policy
+        mode = self.reference_mode
         if mode == "current":
             return log_pi.detach()
         if mode == "behavior":
             masked = old_policy * (legal_mask > 0)
             masked = masked / masked.sum(dim=-1, keepdim=True).clamp_min(_LOG_EPS)
             return torch.log(masked.clamp_min(_LOG_EPS))
+        if mode == "snapshot":
+            # A *fixed* reference: beta then bounds how far the target sits from
+            # the snapshot itself, rather than bounding one step from wherever
+            # the policy has already drifted to.  That difference is the whole
+            # trust region -- with "current" the anchor moves with the policy, so
+            # small steps still accumulate without limit.
+            logits, _ = self.reference_network(observations)
+            return masked_log_softmax(logits, legal_mask)
         raise ValueError(f"unknown reference_policy: {mode}")
 
     # --- single update -----------------------------------------------------
@@ -101,7 +125,9 @@ class Trainer:
 
         # --- improved policy target ---------------------------------------
         with torch.no_grad():
-            reference_log_policy = self._reference_log_policy(log_pi, old_policy, legal_mask)
+            reference_log_policy = self._reference_log_policy(
+                log_pi, old_policy, legal_mask, observations
+            )
             target_policy = improved_policy_torch(
                 q_values.detach(),
                 reference_log_policy,

@@ -45,6 +45,12 @@ python train.py --reward-mode normalized_chip_return --unbounded-q   # B, linear
 python train.py --reward-mode bb_normalized                          # C, BB units
 ```
 
+To keep training the champions with a lower LR, add --champion-mode <anchored, frozen> (frozen is default)
+
+```bash
+python train.py --iterations 2000 --league --league-manage-every 100 --eval-hands 1000 --seed 42
+```
+
 Requires PyTorch and NumPy. Nothing else.
 
 `train.py`, `evaluate.py` and `infer.py --show-spec` all print the exact

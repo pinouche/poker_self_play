@@ -4,6 +4,7 @@ import collections
 
 import numpy as np
 import pytest
+import torch
 
 from config import Config, ModelConfig
 from representation.observation_encoder import ObservationEncoder
@@ -106,7 +107,10 @@ def test_population_has_the_configured_roles():
     cfg = small_league_config(learners=3, champions=2, explorers=1)
     pop = LeaguePopulation(cfg, seed=0)
     assert len(pop) == 6
-    assert pop.role_counts() == {"learner": 3, "champion": 2, "explorer": 1}
+    counts = pop.role_counts()
+    assert (counts["learner"], counts["champion"], counts["explorer"]) == (3, 2, 1)
+    # Frozen is the default, so every champion is an anchor and none train.
+    assert (counts["anchor"], counts["veteran"]) == (2, 0)
     # Champions are opponents only; learners and explorers are optimised.
     assert sorted(pop.trainable_indices()) == sorted(
         pop.indices(Role.LEARNER) + pop.indices(Role.EXPLORER)
@@ -634,3 +638,210 @@ def test_evaluate_produces_strength_diversity_coverage_and_score():
     assert np.all((metrics["score"] >= 0.0) & (metrics["score"] <= 1.0))
     assert metrics["hands_played"].sum() > 0
     assert pop.summary(metrics)                          # renders for logs
+
+
+# --- default config sanity -------------------------------------------------
+# Every test above overrides `league_promotion_hands`, which is precisely how a
+# 2_000_000-hand default (31x more than a full run generates) shipped unnoticed
+# and froze the champion ladder for every real `--league` run.  These two guard
+# the *defaults* instead.
+def test_default_promotion_gate_is_reachable_in_a_default_run():
+    cfg = Config()
+    # Hands a single member accrues per iteration: every hand seats
+    # `num_players` members out of the whole league.
+    league_size = (
+        cfg.train.league_learners + cfg.train.league_champions + cfg.train.league_explorers
+    )
+    per_member_per_iter = cfg.train.hands_per_iteration * cfg.env.num_players / league_size
+    iterations_to_gate = cfg.train.league_promotion_hands / per_member_per_iter
+
+    # Reachable well inside a default-length run, or no learner is ever promoted
+    # and the champion pool stays at its random initialisation forever.
+    assert iterations_to_gate <= cfg.train.iterations / 2, (
+        f"promotion gate needs ~{iterations_to_gate:.0f} iterations but a run is "
+        f"{cfg.train.iterations}"
+    )
+    # And reachable within a few management passes, so the ladder actually rolls.
+    assert iterations_to_gate <= 5 * cfg.train.league_manage_every
+
+
+def test_default_explorer_reset_fires_during_a_default_run():
+    cfg = Config()
+    total_hands = cfg.train.hands_per_iteration * cfg.train.iterations
+    assert cfg.train.league_explorer_reset_hands <= total_hands / 2, (
+        "explorers would never be reinitialised; the explorer role would be inert"
+    )
+
+
+# --- anchored champions: veterans that keep training ------------------------
+def anchored_league_config(learners=2, champions=3, anchors=2, explorers=0) -> Config:
+    cfg = small_league_config(learners=learners, champions=champions, explorers=explorers)
+    cfg.train.champion_mode = "anchored"
+    cfg.train.league_champion_anchors = anchors
+    return cfg
+
+
+def test_frozen_is_the_default_so_no_champion_trains():
+    assert Config().train.champion_mode == "frozen"
+
+
+def test_anchored_mode_splits_champions_into_frozen_anchors_and_veterans():
+    cfg = anchored_league_config(learners=2, champions=3, anchors=2)
+    pop = LeaguePopulation(cfg, seed=0)
+
+    assert len(pop.anchor_indices()) == 2 and len(pop.veteran_indices()) == 1
+    # Anchors are opponents only, exactly as in frozen mode.
+    for index in pop.anchor_indices():
+        assert not pop.members[index].trainable
+        assert all(not p.requires_grad for p in pop.members[index].network.parameters())
+    # Veterans train, and carry a frozen snapshot to be anchored to.
+    for index in pop.veteran_indices():
+        member = pop.members[index]
+        assert member.trainable and member.role is Role.CHAMPION
+        assert all(p.requires_grad for p in member.network.parameters())
+        assert all(not p.requires_grad for p in member.snapshot.parameters())
+    assert sorted(pop.trainable_indices()) == sorted(
+        pop.indices(Role.LEARNER) + pop.veteran_indices()
+    )
+
+
+def test_a_veterans_snapshot_does_not_move_when_the_veteran_trains():
+    cfg = anchored_league_config()
+    pop = LeaguePopulation(cfg, seed=0)
+    veteran = pop.members[pop.veteran_indices()[0]]
+
+    observation = np.zeros(veteran.network.spec.total_dim, dtype=np.float32)
+    before = veteran.snapshot.infer(observation)[0].copy()
+    with torch.no_grad():
+        for parameter in veteran.network.parameters():
+            parameter.add_(0.5)
+
+    np.testing.assert_array_equal(before, veteran.snapshot.infer(observation)[0])
+    assert not np.allclose(before, veteran.network.infer(observation)[0])
+
+
+def test_the_gauntlet_reads_anchors_only():
+    """A moving measuring stick measures nothing, so veterans stay out of it."""
+    cfg = anchored_league_config(learners=2, champions=3, anchors=2)
+    pop = LeaguePopulation(cfg, seed=0)
+
+    assert pop.gauntlet_generations() == sorted(pop.anchor_indices())
+    gauntlet = pop.champion_gauntlet()
+    assert list(gauntlet["generations"]) == sorted(pop.anchor_indices())
+    # ...and a veteran is a champion, so it is never a *row* either: it cannot be
+    # promoted, and scoring it against the ladder would be meaningless.
+    assert not set(gauntlet["learners"]) & set(pop.veteran_indices())
+    assert pop.contender_indices() == pop.indices(Role.LEARNER) + pop.indices(Role.EXPLORER)
+
+
+def test_frozen_mode_leaves_the_gauntlet_exactly_as_it_was():
+    cfg = small_league_config(learners=2, champions=3, explorers=1)
+    pop = LeaguePopulation(cfg, seed=0)
+    assert pop.gauntlet_generations() == pop.champion_generations()
+    assert pop.contender_indices() == pop.trainable_indices()
+    assert pop.veteran_indices() == []
+
+
+def test_promoting_into_a_veteran_slot_yields_a_trainable_copy_and_a_snapshot():
+    cfg = anchored_league_config(learners=2, champions=1, anchors=0)
+    pop = LeaguePopulation(cfg, seed=0)
+    slot = pop.veteran_indices()[0]
+    learner = pop.indices(Role.LEARNER)[0]
+
+    assert pop.promote(learner) == slot
+    member = pop.members[slot]
+    assert member.role is Role.CHAMPION and member.trainable
+    # The copy is independent of the learner it came from: the learner keeps
+    # training, and must not drag the champion along with it.
+    observation = np.zeros(member.network.spec.total_dim, dtype=np.float32)
+    before = member.network.infer(observation)[0].copy()
+    with torch.no_grad():
+        for parameter in pop.members[learner].network.parameters():
+            parameter.add_(0.5)
+    np.testing.assert_array_equal(before, member.network.infer(observation)[0])
+    # ...and it starts life exactly at its own anchor.
+    np.testing.assert_array_equal(before, member.snapshot.infer(observation)[0])
+
+
+def test_promoting_into_an_anchor_slot_still_hard_freezes():
+    cfg = anchored_league_config(learners=2, champions=1, anchors=1)
+    pop = LeaguePopulation(cfg, seed=0)
+    slot = pop.promote(pop.indices(Role.LEARNER)[0])
+    assert pop.members[slot].is_anchor
+    assert not pop.members[slot].trainable
+    assert all(not p.requires_grad for p in pop.members[slot].network.parameters())
+
+
+def _validation_bank(pop, cfg, encoder_seed=0):
+    from training.league_metrics import sample_validation_states
+
+    encoder = ObservationEncoder.from_config(cfg)
+    return sample_validation_states(
+        pop.agents, cfg, cfg.train.league_diversity_states, encoder, seed=encoder_seed
+    )
+
+
+def test_veteran_drift_is_zero_at_the_snapshot_and_grows_with_training():
+    cfg = anchored_league_config()
+    pop = LeaguePopulation(cfg, seed=0)
+    observations, masks = _validation_bank(pop, cfg)
+    slot = pop.veteran_indices()[0]
+
+    drift = pop.veteran_drift(observations, masks)
+    assert np.isnan(drift[pop.anchor_indices()[0]])       # only veterans have one
+    assert drift[slot] == pytest.approx(0.0, abs=1e-6)    # starts at its anchor
+
+    # Random noise, not a constant: adding the same scalar to every parameter
+    # barely moves a softmax over logits, so it would not test anything.
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for parameter in pop.members[slot].network.parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.05)
+    assert pop.veteran_drift(observations, masks)[slot] > 0.0
+
+
+def test_a_veteran_past_the_budget_is_reset_to_its_snapshot():
+    cfg = anchored_league_config()
+    cfg.train.league_veteran_max_kl = 0.01
+    pop = LeaguePopulation(cfg, seed=0)
+    observations, masks = _validation_bank(pop, cfg)
+    slot = pop.veteran_indices()[0]
+
+    # Random noise, not a constant: adding the same scalar to every parameter
+    # barely moves a softmax over logits, so it would not test anything.
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for parameter in pop.members[slot].network.parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.05)
+    drift = pop.veteran_drift(observations, masks)
+    assert drift[slot] > cfg.train.league_veteran_max_kl
+
+    assert pop.enforce_veteran_drift(drift) == [slot]
+    assert pop.veteran_drift(observations, masks)[slot] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_drift_enforcement_skips_slots_replaced_this_pass():
+    """Their drift reading predates the network now sitting in the slot."""
+    cfg = anchored_league_config()
+    cfg.train.league_veteran_max_kl = 0.01
+    pop = LeaguePopulation(cfg, seed=0)
+    slot = pop.veteran_indices()[0]
+    drift = np.full(len(pop), np.nan)
+    drift[slot] = 10.0
+    assert pop.enforce_veteran_drift(drift, skip=[slot]) == []
+    assert pop.enforce_veteran_drift(drift) == [slot]
+
+
+def test_a_zero_drift_budget_disables_enforcement():
+    cfg = anchored_league_config()
+    cfg.train.league_veteran_max_kl = 0.0
+    pop = LeaguePopulation(cfg, seed=0)
+    drift = np.full(len(pop), 99.0)
+    assert pop.enforce_veteran_drift(drift) == []
+
+
+def test_an_unknown_champion_mode_is_rejected():
+    cfg = small_league_config()
+    cfg.train.champion_mode = "trainable"
+    with pytest.raises(ValueError, match="champion_mode"):
+        LeaguePopulation(cfg, seed=0)
