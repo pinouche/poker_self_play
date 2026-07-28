@@ -17,6 +17,13 @@ Design choices, and why:
   is only as good as the teacher that produced it), so keeping them apart
   mirrors :class:`holdem.curriculum.MixedBuffer` and lets a caller weight
   them explicitly rather than pooling silently.
+* **A fourth source, ``self_play``.**  River/turn/flop are sampled from a
+  distribution somebody designed; the online arm's data comes from belief
+  states its own search actually reached.  Without a frozen copy of the
+  latter, the two arms differ in *two* ways at once — stale labels and a
+  different input distribution — and a win for either one cannot be
+  attributed.  Filling this source lets a third arm hold the distribution
+  fixed and vary only label freshness, which is the question being asked.
 * **Read-only and memory-mapped on reopen.**  ``open()`` never loads a whole
   shard into RAM and never writes to it; sampling only ever pages in the
   rows it draws, which is what "sample without concatenating the full
@@ -45,8 +52,11 @@ from holdem.combos import NUM_COMBOS
 from holdem.features import INPUT_DIM
 from holdem.generation import Examples
 
-SCHEMA_VERSION = 1
-KNOWN_SOURCES: tuple[str, ...] = ("river", "turn", "flop")
+SCHEMA_VERSION = 2
+KNOWN_SOURCES: tuple[str, ...] = ("river", "turn", "flop", "self_play")
+# The streets, lowest first: the order they must be generated in, because each
+# is bootstrapped from the teacher fitted on the one below it.
+STREET_SOURCES: tuple[str, ...] = ("river", "turn", "flop")
 MANIFEST_FILENAME = "manifest.json"
 
 PathLike = Union[str, Path]
@@ -384,6 +394,43 @@ class DatasetStore:
         }
 
         parts = [self._sample_source(source, count, rng) for source, count in counts.items()]
+        return Examples.concatenate(parts)
+
+    def gather(self, source: str, rows: Sequence[int]) -> Examples:
+        """Specific rows of ``source``, by index across its shards in order.
+
+        Lets a caller pin an exact subset of the artifact and draw only from
+        it — which is what spending a *label budget* smaller than the whole
+        dataset has to mean, if the number is to be comparable with an arm that
+        generates exactly that many labels and no more.  Rows are gathered from
+        the memory maps, so the full dataset is still never materialised.
+        """
+        shards = self._shards.get(source, [])
+        if not shards:
+            raise ValueError(f"source {source!r} has no examples")
+        counts = np.array([s["count"] for s in shards], dtype=np.int64)
+        offsets = np.concatenate([[0], np.cumsum(counts)])
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size and (rows.min() < 0 or rows.max() >= offsets[-1]):
+            raise IndexError(
+                f"row index out of range for source {source!r}: "
+                f"have {offsets[-1]} example(s)"
+            )
+
+        parts = []
+        which = np.searchsorted(offsets, rows, side="right") - 1
+        for shard_index in np.unique(which):
+            local = rows[which == shard_index] - offsets[shard_index]
+            order = np.argsort(local)  # mmap fancy-indexing wants sorted rows
+            shard = shards[int(shard_index)]
+            picked = local[order]
+            parts.append(
+                Examples(
+                    features=np.asarray(shard["features"][picked], dtype=np.float32),
+                    masks=np.asarray(shard["masks"][picked], dtype=np.float32),
+                    targets=np.asarray(shard["targets"][picked], dtype=np.float32),
+                )
+            )
         return Examples.concatenate(parts)
 
     def _sample_source(self, source: str, count: int, rng: np.random.Generator) -> Examples:

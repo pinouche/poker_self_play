@@ -23,6 +23,16 @@
 > at 300 search iterations and 0.0164 at 10,000, so a quoted number without a
 > search budget attached means nothing.
 
+> **Stage 4 side-experiment: are labels a reusable asset?**  ReBeL regenerates
+> its training data every iteration because the labels come out of search that
+> uses the *current* network at the leaves — freeze them and you freeze that
+> network's mistakes.  But this repo's river labels are solved **exactly**, so
+> only the turn and flop are bootstrapped, and the argument for regenerating is
+> only as strong as the drift those two layers actually accumulate.
+> `holdem/compare/` runs both regimes head to head at equal label and update
+> budgets, and `holdem/compare/relabel.py` measures the drift directly.  Start
+> at `holdem/compare/README.md`.
+
 Paradigm A (self-play RL + league) is done. Its ceiling was measured: the
 strongest agent beats a fixed tight-aggressive heuristic by +57 bb/100 but a
 best-responder beats *it* by ~+160 bb/100 — a strong **exploitative** bot,

@@ -44,15 +44,38 @@ class SituationConfig:
     excluded_boards: Tuple[Tuple[int, ...], ...] = ()
 
 
+def conflicts_with_held_out(board: Sequence[int], excluded: Sequence) -> bool:
+    """Is ``board`` the same deal as a held-out one, seen at a different street?
+
+    Exact tuple equality is not enough.  A held-out flop ``(2, 7, 30)`` and the
+    turn board ``(2, 7, 30, 45)`` are the *same* three community cards with one
+    more revealed, so training on the latter leaks the former's texture into a
+    network that is then tested on it.  The relation that matters is therefore
+    subset containment in either direction, not equality — and it is checked on
+    card *sets*, because sorting does not make a flop a prefix of its own turn
+    (flop ``(7, 30, 45)`` plus turn card ``2`` sorts to ``(2, 7, 30, 45)``).
+    """
+    cards = frozenset(int(c) for c in board)
+    for other in excluded:
+        other_cards = frozenset(int(c) for c in other)
+        if cards <= other_cards or other_cards <= cards:
+            return True
+    return False
+
+
 def sample_board(
     rng: np.random.Generator, num_cards: int = 4, excluded: Sequence = ()
 ) -> Tuple[int, ...]:
-    """A random board, canonicalised by sorting so lookups share a cache."""
-    excluded = {tuple(sorted(b)) for b in excluded}
+    """A random board, canonicalised by sorting so lookups share a cache.
+
+    Boards that overlap the held-out set at *any* street are rejected; see
+    :func:`conflicts_with_held_out`.
+    """
+    excluded = tuple(tuple(int(c) for c in b) for b in excluded)
     while True:
-        board = tuple(sorted(rng.choice(NUM_CARDS, size=num_cards, replace=False)))
-        if board not in excluded:
-            return tuple(int(c) for c in board)
+        board = tuple(int(c) for c in sorted(rng.choice(NUM_CARDS, size=num_cards, replace=False)))
+        if not conflicts_with_held_out(board, excluded):
+            return board
 
 
 def sample_range(
@@ -115,14 +138,16 @@ def sample_situation(
 
 
 def held_out_boards(
-    rng: np.random.Generator, count: int, num_cards: int = 4
+    rng: np.random.Generator, count: int, num_cards: int = 4, excluded: Sequence = ()
 ) -> Tuple[Tuple[int, ...], ...]:
-    """Boards reserved for evaluation and never trained on."""
-    boards = []
-    seen = set()
+    """Boards reserved for evaluation and never trained on.
+
+    Drawn so that no two of them — and none of them and anything already in
+    ``excluded`` — are the same deal at different streets, which keeps a
+    multi-street held-out set from quietly testing the same board twice.
+    """
+    boards: list = []
     while len(boards) < count:
-        board = sample_board(rng, num_cards)
-        if board not in seen:
-            seen.add(board)
-            boards.append(board)
+        board = sample_board(rng, num_cards, tuple(excluded) + tuple(boards))
+        boards.append(board)
     return tuple(boards)

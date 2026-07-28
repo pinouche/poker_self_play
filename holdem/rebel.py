@@ -81,6 +81,10 @@ class Example:
     mask: np.ndarray
     values: np.ndarray
     policy: PolicyExample | None = None
+    # The board this example was solved on.  Carried so a caller can tell which
+    # street produced it — the encoded features contain the board, but recovering
+    # it from them is needless work when the sampler already knows.
+    board: Tuple[int, ...] = ()
 
 
 class Buffer:
@@ -171,6 +175,7 @@ def collect_trajectory(
                     mask=board_mask(tuple(public.board)),
                     values=values,
                     policy=policy,
+                    board=tuple(public.board),
                 )
             )
 

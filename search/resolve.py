@@ -47,6 +47,15 @@ class ResolveConfig:
     # Hold each re-solve to the counterfactual values the previous solve
     # promised (see :class:`Gadget`).  Off, re-solving is measurably exploitable.
     safe_resolving: bool = True
+    # How many betting rounds below the root to keep re-solving for.  ``None``
+    # resolves every reachable belief state to the end of the game, which is
+    # what you want on the turn (241 solves) and cannot afford on the flop,
+    # where the turn and river fan out to roughly 11,000.  Setting it to *n*
+    # stops the recursion at round ``root + n``, so those belief states become
+    # leaves priced by ``leaf_value_fn`` instead of solved.  Match it to the
+    # depth limit of the tree the strategy is scored on, or the agent will be
+    # measured on decision nodes it was never asked to produce behaviour for.
+    max_resolve_rounds: Optional[int] = None
 
 
 @dataclass
@@ -89,6 +98,7 @@ class ContinualResolver:
         )
         strategies: StrategyMap = {}
         traces: List[ResolveTrace] = []
+        root_round = root.betting_round
         # Each entry is a belief state to solve, plus the counterfactual values
         # the solve that produced it promised each player (None at the root).
         frontier: List[Tuple[PublicState, np.ndarray, Optional[np.ndarray]]] = [
@@ -116,11 +126,17 @@ class ContinualResolver:
             for point, point_reach in self._resolve_points(tree, local, node_reach):
                 if point_reach.sum(axis=1).min() <= 0.0:
                     continue  # a belief state neither player can reach
+                if self._beyond_resolve_limit(point.public, root_round):
+                    continue  # a leaf of the bounded tree: valued, not solved
                 promise = self._promise(
                     point, point_reach, local, public.betting_round
                 )
                 frontier.append((point.public, point_reach, promise))
         return strategies, traces
+
+    def _beyond_resolve_limit(self, public: PublicState, root_round: int) -> bool:
+        limit = self.config.max_resolve_rounds
+        return limit is not None and public.betting_round - root_round >= limit
 
     def _resolve_points(
         self, tree: PublicTree, strategies: StrategyMap, reach: np.ndarray

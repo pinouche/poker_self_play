@@ -17,6 +17,11 @@ Three subcommands, one per thing worth running on its own:
 ``decision-time``
               What playing actually costs: the wall clock for the two solves a
               single hand requires.
+``compare``   Frozen labels vs ReBeL-refreshed labels, at equal label and
+              update budgets, scored by held-out exploitability per street.
+``label-drift``
+              The follow-up: re-solve a frozen dataset's own inputs with a
+              stronger evaluator and measure how far its labels had drifted.
 
 Examples::
 
@@ -25,6 +30,8 @@ Examples::
     python solve.py benchmark --checkpoint checkpoints/rebel.pt
     python solve.py decision-time --checkpoint checkpoints/rebel.pt
     python solve.py holdem --iterations 400
+    python solve.py compare --run runs/labels-01 --label-budget 20000
+    python solve.py label-drift --run runs/labels-01
 """
 
 from __future__ import annotations
@@ -106,6 +113,80 @@ def parse_args() -> argparse.Namespace:
     timing.add_argument("--search-iterations", type=int, default=300)
     timing.add_argument("--leaf-iterations", type=int, default=100)
     timing.add_argument("--skip-exact", action="store_true")
+
+    compare = sub.add_parser(
+        "compare",
+        help="frozen labels vs ReBeL-refreshed labels, at equal budgets",
+    )
+    compare.add_argument("--run", type=str, required=True, help="run directory")
+    compare.add_argument("--label-budget", type=int, default=20_000)
+    compare.add_argument("--update-budget", type=int, default=4_000)
+    compare.add_argument("--river-examples", type=int, default=20_000)
+    compare.add_argument("--turn-examples", type=int, default=6_000)
+    compare.add_argument("--flop-examples", type=int, default=2_000)
+    compare.add_argument(
+        "--self-play-examples",
+        type=int,
+        default=0,
+        help="frozen on-policy control source; separates stale labels from "
+        "a different input distribution",
+    )
+    compare.add_argument("--teacher-updates", type=int, default=4_000)
+    compare.add_argument(
+        "--trajectories-per-iteration",
+        type=int,
+        default=16,
+        help="arm 2 only; with updates-per-iteration this sets the labels-per-"
+        "update ratio, which should roughly match label-budget/update-budget",
+    )
+    compare.add_argument("--updates-per-iteration", type=int, default=40)
+    compare.add_argument("--batch-size", type=int, default=128)
+    compare.add_argument("--learning-rate", type=float, default=1e-3)
+    compare.add_argument("--hidden-dim", type=int, default=1536)
+    compare.add_argument("--residual-blocks", type=int, default=6)
+    compare.add_argument("--card-embedding-dim", type=int, default=128)
+    compare.add_argument("--eval-boards", type=int, default=2)
+    compare.add_argument("--eval-iterations", type=int, default=40)
+    compare.add_argument(
+        "--eval-every",
+        type=int,
+        default=None,
+        help="score mid-run every N iterations (arm 2) / N updates (arm 1); "
+        "off by default because a flop+turn score is not cheap",
+    )
+    compare.add_argument("--checkpoint-every", type=int, default=10)
+    compare.add_argument(
+        "--flop-depth-limit",
+        type=int,
+        default=1,
+        help="betting rounds of flop lookahead when scoring; 2 is ~170x the work",
+    )
+    compare.add_argument("--rebuild-dataset", action="store_true")
+    compare.add_argument("--workers", type=int, default=8)
+    compare.add_argument("--seed", type=int, default=0)
+    compare.add_argument("--device", type=str, default="cpu")
+
+    drift = sub.add_parser(
+        "label-drift",
+        help="how far a frozen dataset's labels sit from freshly-solved ones",
+    )
+    drift.add_argument("--run", type=str, required=True, help="an existing run directory")
+    drift.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="evaluator to re-solve with; defaults to the iterative student",
+    )
+    drift.add_argument("--sample-size", type=int, default=64)
+    drift.add_argument(
+        "--cfr-iterations",
+        type=int,
+        default=None,
+        help="override; by default each source is re-solved at the count it "
+        "was generated with, which is what makes the river a control",
+    )
+    drift.add_argument("--seed", type=int, default=0)
+    drift.add_argument("--device", type=str, default="cpu")
     return parser.parse_args()
 
 
@@ -347,6 +428,120 @@ def _time_one_hand(leaf_value_fn, iterations: int):
     return first, time.time() - started
 
 
+def run_compare(args: argparse.Namespace) -> None:
+    """Both arms, equal budgets, one report.  See ``holdem/compare/README.md``."""
+    from dataclasses import replace as _replace
+
+    from holdem.compare.common.evaluation import EvaluationConfig
+    from holdem.compare.experiment import ComparisonConfig, run_comparison
+    from holdem.compare.fixed.build import DatasetBuildConfig
+    from holdem.compare.fixed.student import FixedStudentConfig
+    from holdem.compare.iterative.student import OnlineStudentConfig
+    from holdem.net import HoldemValueNetConfig
+    from holdem.sampling import SituationConfig
+
+    value_net = HoldemValueNetConfig(
+        hidden_dim=args.hidden_dim,
+        num_residual_blocks=args.residual_blocks,
+        card_embedding_dim=args.card_embedding_dim,
+    )
+    config = ComparisonConfig(
+        run_path=args.run,
+        label_budget=args.label_budget,
+        update_budget=args.update_budget,
+        dataset=DatasetBuildConfig(
+            river_examples=args.river_examples,
+            turn_examples=args.turn_examples,
+            flop_examples=args.flop_examples,
+            self_play_examples=args.self_play_examples,
+            teacher_updates=args.teacher_updates,
+            teacher_batch_size=args.batch_size,
+            teacher_learning_rate=args.learning_rate,
+            value_net=value_net,
+            workers=args.workers,
+        ),
+        rebuild_dataset=args.rebuild_dataset,
+        fixed=FixedStudentConfig(
+            label_budget=0,
+            update_budget=0,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            eval_every=args.eval_every,
+        ),
+        iterative=OnlineStudentConfig(
+            trajectories_per_iteration=args.trajectories_per_iteration,
+            updates_per_iteration=args.updates_per_iteration,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            eval_every=args.eval_every,
+            checkpoint_every=args.checkpoint_every,
+        ),
+        evaluation=EvaluationConfig(
+            situations=SituationConfig(board_cards=4),
+            boards_per_street=args.eval_boards,
+            search_iterations=args.eval_iterations,
+            flop_tree_depth_limit=args.flop_depth_limit,
+            device=args.device,
+        ),
+        value_net=value_net,
+        seed=args.seed,
+        device=args.device,
+    )
+    run_comparison(config, verbose=True)
+
+
+def _net_config_from_state(state) -> "HoldemValueNetConfig":
+    """Recover a value net's shape from its own weights.
+
+    Saves the caller from having to repeat ``--hidden-dim`` and friends when
+    probing a run that was trained with non-default sizes — and from the silent
+    ``load_state_dict`` failure that follows when they forget.
+    """
+    from holdem.net import HoldemValueNetConfig
+
+    linear = [
+        k
+        for k, v in state.items()
+        if k.startswith("trunk.layers") and k.endswith(".weight") and v.dim() == 2
+    ]
+    return HoldemValueNetConfig(
+        hidden_dim=int(state["trunk.layers.0.weight"].shape[0]),
+        num_residual_blocks=len(linear),
+        card_embedding_dim=int(state["board_embedding.card_embedding.weight"].shape[1]),
+    )
+
+
+def run_label_drift(args: argparse.Namespace) -> None:
+    """Re-solve a frozen dataset's own inputs with a stronger evaluator."""
+    import json
+
+    from holdem.compare.common.storage import RunLayout
+    from holdem.compare.fixed.store import DatasetStore
+    from holdem.compare.relabel import measure_label_drift
+    from holdem.net import HoldemValueNet, HoldemValueNetConfig
+
+    layout = RunLayout.at(args.run)
+    store = DatasetStore.open(layout.dataset)
+    checkpoint = args.checkpoint or layout.iterative_student
+    state = torch.load(checkpoint, map_location=args.device)
+    # Size the network from the checkpoint rather than the defaults, so a run
+    # made with --hidden-dim can be probed without repeating the flag.
+    net = HoldemValueNet(_net_config_from_state(state))
+    net.load_state_dict(state)
+
+    results = measure_label_drift(
+        store,
+        net,
+        sample_size=args.sample_size,
+        seed=args.seed,
+        cfr_iterations=args.cfr_iterations,
+        device=args.device,
+        results_path=layout.relabel,
+    )
+    print(json.dumps(results, indent=2))
+    print(f"\n{results['verdict']}")
+
+
 def main() -> None:
     args = parse_args()
     commands = {
@@ -355,6 +550,8 @@ def main() -> None:
         "benchmark": run_benchmark,
         "holdem": run_holdem,
         "decision-time": run_decision_time,
+        "compare": run_compare,
+        "label-drift": run_label_drift,
     }
     commands[args.command](args)
 

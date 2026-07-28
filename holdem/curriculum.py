@@ -1,5 +1,17 @@
 """Training one value network across streets, from four sources of data.
 
+.. note::
+
+   This is the in-memory staged trainer: generate a stage, train on it, move
+   up a street, all in one process with nothing written down.  It is kept
+   because it is the simplest way to train a value net end to end.
+
+   The **fixed-vs-iterative experiment** does not use it — it needs the frozen
+   labels and the teachers that made them to survive on disk, so it has its own
+   builder in ``holdem/compare/fixed/build.py``.  If you are asking "is a
+   labelled dataset a reusable asset?", start at ``holdem/compare/README.md``.
+
+
 The four sources answer different needs and none of them suffices alone:
 
 ``river``      Sampled situations solved exactly.  Ground truth, and cheap
