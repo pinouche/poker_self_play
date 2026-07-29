@@ -23,6 +23,7 @@ were made.
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -55,6 +56,21 @@ class OnlineStudentConfig:
     self_play: HoldemSelfPlayConfig = field(default_factory=HoldemSelfPlayConfig)
     situations: SituationConfig = field(default_factory=SituationConfig)
     street_mix: StreetMix = field(default_factory=StreetMix)
+    # ReBeL appendix E removes half the replay buffer after 20 of its 1,750
+    # epochs, because the earliest labels were written by a random network.
+    # ``None`` disables it; the labels still count against the label budget,
+    # because generating them is a cost that was really paid.
+    # Actor processes generating trajectories in parallel.  0 keeps the
+    # synchronous generate-then-train loop, which is exactly reproducible and
+    # is what the fixed-vs-iterative comparison uses.  Anything higher runs the
+    # Ape-X shape from ``actors.py``: much faster, not bit-reproducible.
+    actors: int = 0
+    # How many gradient steps between publishing weights to the actors.  Lower
+    # means fresher labels and more copying; ReBeL's actors run a network some
+    # way behind the learner's and it costs little.
+    weight_sync_every: int = 50
+    purge_after_iterations: Optional[int] = None
+    purge_fraction: float = 0.5
     # Score the agent every N iterations; ``None`` scores only at the end.
     eval_every: Optional[int] = None
     # Keep a copy of the student every N iterations, so the run can be replayed.
@@ -75,9 +91,30 @@ def fit_online_student(
     journal_path: Optional[PathLike] = None,
     checkpoint_path: Optional[PathLike] = None,
 ) -> StudentResult:
-    """Run Algorithm 1 until both budgets are exactly spent."""
+    """Run Algorithm 1 until both budgets are exactly spent.
+
+    Dispatches to the parallel actor/learner loop when ``config.actors > 0``;
+    see :mod:`paradigm_b.holdem.arm2_iterative.async_student`.
+    """
     if label_budget <= 0 or update_budget <= 0:
         raise ValueError("label_budget and update_budget must be positive")
+
+    if config.actors > 0:
+        from paradigm_b.holdem.arm2_iterative.async_student import (
+            fit_online_student_async,
+        )
+
+        return fit_online_student_async(
+            config,
+            label_budget,
+            update_budget,
+            net=net,
+            rng=rng,
+            tests=tests,
+            evaluation=evaluation,
+            journal_path=journal_path,
+            checkpoint_path=checkpoint_path,
+        )
 
     rng = rng if rng is not None else np.random.default_rng(config.seed)
     device = torch.device(config.device)
@@ -95,6 +132,7 @@ def fit_online_student(
     situations = config.situations
     trajectory_id = 0
     iteration = 0
+    _warn_if_budgets_are_mismatched(config, label_budget, update_budget)
 
     while spend.labels < label_budget or spend.updates < update_budget:
         iteration += 1
@@ -141,6 +179,14 @@ def fit_online_student(
         if journal is not None:
             journal.flush(iteration)
 
+        # Flush the random-network era out of the buffer, once.
+        purged = 0
+        if (
+            config.purge_after_iterations is not None
+            and iteration == config.purge_after_iterations
+        ):
+            purged = buffer.purge_oldest(config.purge_fraction)
+
         # -- train ---------------------------------------------------------
         training_started = time.perf_counter()
         steps = min(config.updates_per_iteration, update_budget - spend.updates)
@@ -156,6 +202,7 @@ def fit_online_student(
             "updates": float(spend.updates),
             "generated": float(produced),
             "buffer": float(len(buffer)),
+            "purged": float(purged),
             "loss": total / max(done, 1),
         }
         finished = spend.labels >= label_budget and spend.updates >= update_budget
@@ -187,6 +234,63 @@ def fit_online_student(
         journal.flush(iteration)
     return StudentResult(
         net=net, history=history, initial_state=initial_state, spend=spend
+    )
+
+
+def _warn_if_budgets_are_mismatched(
+    config: OnlineStudentConfig, label_budget: int, update_budget: int
+) -> None:
+    """Shout when the per-iteration rates cannot spend both budgets together.
+
+    The loop runs until *both* budgets are exhausted, so a mismatched ratio
+    does not fail — it silently wastes.  Exhaust updates first and the tail of
+    the run generates labels it never trains on; exhaust labels first and the
+    tail trains on a frozen buffer.  A run that burns 46% of its label budget
+    after training has stopped looks like a fair comparison in the results file
+    and is not one, so this is worth a loud warning rather than a docstring.
+    """
+    per_iteration = (
+        config.trajectories_per_iteration * config.street_mix.labels_per_trajectory
+    )
+    if per_iteration <= 0 or config.updates_per_iteration <= 0:
+        return
+
+    label_iterations = label_budget / per_iteration
+    update_iterations = update_budget / config.updates_per_iteration
+    # Judge the waste itself rather than the ratio.  A ratio that looks only
+    # mildly off — 0.27 labels per update against a requested 0.5 — still burns
+    # 46% of the run, which is what happened the first time this was run for
+    # real, so the threshold has to be on the consequence.
+    longer, shorter = max(label_iterations, update_iterations), min(
+        label_iterations, update_iterations
+    )
+    waste = 1.0 - shorter / longer
+    if waste <= 0.15:
+        return
+
+    updates_first = update_iterations < label_iterations
+    tail = (
+        "generating labels it never trains on"
+        if updates_first
+        else "training on a frozen buffer"
+    )
+    suggestion = max(
+        round(
+            (label_budget / update_budget)
+            * config.updates_per_iteration
+            / config.street_mix.labels_per_trajectory
+        ),
+        1,
+    )
+    warnings.warn(
+        f"budget ratio mismatch: the run produces "
+        f"{per_iteration / config.updates_per_iteration:.2f} labels per update "
+        f"but the budgets ask for {label_budget / update_budget:.2f}.  "
+        f"{'Updates' if updates_first else 'Labels'} will run out first, leaving "
+        f"roughly {waste:.0%} of the run {tail}.  Set "
+        f"trajectories_per_iteration to about {suggestion}.",
+        RuntimeWarning,
+        stacklevel=3,
     )
 
 

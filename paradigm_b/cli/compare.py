@@ -36,6 +36,7 @@ from paradigm_b.holdem.compare.experiment import ComparisonConfig, run_compariso
 from paradigm_b.holdem.compare.relabel import measure_label_drift
 from paradigm_b.holdem.data.sampling import SituationConfig
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
+from paradigm_b.holdem.selfplay import HoldemSelfPlayConfig
 
 
 # --- argument wiring -------------------------------------------------------
@@ -62,6 +63,37 @@ def _add_compare_args(parser: argparse.ArgumentParser) -> None:
         "update ratio, which should roughly match label-budget/update-budget",
     )
     parser.add_argument("--updates-per-iteration", type=int, default=40)
+    parser.add_argument(
+        "--exploration",
+        type=float,
+        default=0.25,
+        help="arm 2: probability of descending through a uniform-random "
+        "strategy instead of a CFR iterate (ReBeL appendix E's eps = 25%%).  "
+        "Measured worse at a 2,000-label budget; set 0.0 for small runs",
+    )
+    parser.add_argument(
+        "--purge-after-iterations",
+        type=int,
+        default=None,
+        help="arm 2: drop the oldest half of the replay buffer once, at this "
+        "iteration, flushing labels written by the near-random initial network "
+        "(ReBeL appendix E does this after 20 of its 1,750 epochs)",
+    )
+    parser.add_argument("--purge-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--actors",
+        type=int,
+        default=0,
+        help="arm 2: actor processes generating trajectories in parallel.  0 "
+        "keeps the reproducible synchronous loop, which is what a controlled "
+        "comparison wants; higher is much faster but not bit-reproducible",
+    )
+    parser.add_argument(
+        "--weight-sync-every",
+        type=int,
+        default=50,
+        help="gradient steps between publishing weights to the actors",
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=1536)
@@ -157,6 +189,11 @@ def run_compare(args: argparse.Namespace) -> None:
             eval_every=args.eval_every,
         ),
         iterative=OnlineStudentConfig(
+            self_play=HoldemSelfPlayConfig(exploration=args.exploration),
+            actors=args.actors,
+            weight_sync_every=args.weight_sync_every,
+            purge_after_iterations=args.purge_after_iterations,
+            purge_fraction=args.purge_fraction,
             trajectories_per_iteration=args.trajectories_per_iteration,
             updates_per_iteration=args.updates_per_iteration,
             batch_size=args.batch_size,

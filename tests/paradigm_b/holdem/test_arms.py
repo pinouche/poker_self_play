@@ -10,6 +10,7 @@ properties a real run's conclusions rest on, and they are cheap to assert.
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -69,7 +70,7 @@ def tiny_comparison(run_path, **overrides) -> ComparisonConfig:
         dataset=tiny_dataset_config(),
         fixed=FixedStudentConfig(label_budget=0, update_budget=0, batch_size=8),
         iterative=OnlineStudentConfig(
-            trajectories_per_iteration=2,
+            trajectories_per_iteration=11,  # ~4 labels per update, matching the budgets
             updates_per_iteration=4,
             batch_size=8,
             self_play=HoldemSelfPlayConfig(search_iterations=3, river_iterations=3),
@@ -300,7 +301,7 @@ def test_the_online_student_spends_its_budgets_exactly(tmp_path):
     net = HoldemValueNet(TINY_NET)
     result = fit_online_student(
         OnlineStudentConfig(
-            trajectories_per_iteration=2,
+            trajectories_per_iteration=4,
             updates_per_iteration=3,
             batch_size=8,
             self_play=HoldemSelfPlayConfig(search_iterations=3, river_iterations=3),
@@ -323,7 +324,7 @@ def test_the_journal_records_every_label_with_its_iteration(tmp_path):
     net = HoldemValueNet(TINY_NET)
     result = fit_online_student(
         OnlineStudentConfig(
-            trajectories_per_iteration=2,
+            trajectories_per_iteration=4,
             updates_per_iteration=3,
             batch_size=8,
             self_play=HoldemSelfPlayConfig(search_iterations=3, river_iterations=3),
@@ -379,16 +380,84 @@ def test_the_journal_can_be_read_one_iteration_at_a_time(tmp_path):
 
 
 # --- the street mixture -----------------------------------------------------
-def test_the_street_mix_follows_the_artifacts_composition():
-    mix = StreetMix.from_counts({"river": 100, "turn": 50, "flop": 50})
-    weights = mix.normalised()
-    assert weights["river"] == pytest.approx(0.5)
-    assert weights["turn"] == pytest.approx(0.25)
+def test_the_street_mix_matches_labels_not_starting_streets():
+    """The mapping is an inversion, not a copy.
+
+    A trajectory yields one label per street it passes through on the way down,
+    so copying an artifact's label proportions onto the *starting* street
+    over-produces river labels.  Starting probabilities are the differences of
+    the cumulative label shares.
+    """
+    mix = StreetMix.from_label_counts({"river": 100, "turn": 50, "flop": 50})
+    starts = mix.normalised()
+    # flop 50, turn 50-50=0, river 100-50=50  ->  half flop starts, half river.
+    assert starts["flop"] == pytest.approx(0.5)
+    assert starts["river"] == pytest.approx(0.5)
+    assert starts.get("turn", 0.0) == pytest.approx(0.0)
+    # And those starts really do reproduce the requested label mixture.
+    shares = mix.label_shares()
+    assert shares["river"] == pytest.approx(0.5)
+    assert shares["turn"] == pytest.approx(0.25)
+    assert shares["flop"] == pytest.approx(0.25)
+
     rng = np.random.default_rng(0)
     drawn = [
         sample_mixed_situation(rng, SituationConfig(), mix)[3] for _ in range(60)
     ]
-    assert set(drawn) == {3, 4, 5}
+    assert set(drawn) <= {3, 4, 5}
+
+
+def test_naively_copying_label_shares_would_over_produce_river_labels():
+    """Guards the bug directly: the old behaviour is measurably wrong."""
+    counts = {"river": 71.0, "turn": 21.0, "flop": 7.0}
+    naive = StreetMix(river=counts["river"], turn=counts["turn"], flop=counts["flop"])
+    fixed = StreetMix.from_label_counts(counts)
+    total = sum(counts.values())
+    wanted = {k: v / total for k, v in counts.items()}
+
+    assert fixed.label_shares()["river"] == pytest.approx(wanted["river"], abs=1e-9)
+    # The naive mapping drifts the river share upward and starves the flop.
+    assert naive.label_shares()["river"] > wanted["river"] + 0.02
+    assert naive.label_shares()["flop"] < wanted["flop"]
+
+
+def test_labels_per_trajectory_is_what_budget_sizing_needs():
+    assert StreetMix(river=1, turn=0, flop=0).labels_per_trajectory == pytest.approx(1.0)
+    assert StreetMix(river=0, turn=0, flop=1).labels_per_trajectory == pytest.approx(3.0)
+    # The mix from the first real run: 71/21/7 copied naively onto starts.
+    naive = StreetMix(river=71, turn=21, flop=7)
+    assert naive.labels_per_trajectory == pytest.approx(1.36, abs=0.02)
+
+
+def test_a_label_target_deeper_streets_cannot_reach_is_clamped():
+    """Descending trajectories force river >= turn >= flop in label counts."""
+    mix = StreetMix.from_label_counts({"river": 10, "turn": 50, "flop": 90})
+    assert mix.turn == 0.0 and mix.river == 0.0
+    assert mix.normalised()["flop"] == pytest.approx(1.0)
+
+
+def test_a_mismatched_budget_ratio_warns_rather_than_silently_wasting():
+    from paradigm_b.holdem.arm2_iterative.student import _warn_if_budgets_are_mismatched
+
+    # The first real run's settings: 8 trajectories of ~1.36 labels against 40
+    # updates, for budgets asking 0.5 labels per update.
+    config = OnlineStudentConfig(
+        trajectories_per_iteration=8,
+        updates_per_iteration=40,
+        street_mix=StreetMix(river=71, turn=21, flop=7),
+    )
+    with pytest.warns(RuntimeWarning, match="budget ratio mismatch"):
+        _warn_if_budgets_are_mismatched(config, label_budget=1500, update_budget=3000)
+
+    # Sized correctly, it stays quiet.
+    good = OnlineStudentConfig(
+        trajectories_per_iteration=8,
+        updates_per_iteration=40,
+        street_mix=StreetMix.from_label_counts({"river": 40, "turn": 35, "flop": 25}),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _warn_if_budgets_are_mismatched(good, label_budget=2000, update_budget=4000)
 
 
 def test_a_street_mix_needs_at_least_one_positive_weight():
@@ -522,3 +591,231 @@ def test_writes_are_atomic_and_leave_no_temporary_files(tmp_path):
     write_json({"a": 2}, path)
     assert read_json(path) == {"a": 2}
     assert [p.name for p in tmp_path.iterdir()] == ["thing.json"]
+
+
+# --- value-prediction accuracy: the river metric exploitability cannot give ---
+def test_accuracy_ignores_hands_the_board_makes_impossible(tmp_path):
+    """Roughly half of the 1,326 combos are blocked on any board.
+
+    Letting those masked zeros into the average would flatter every network
+    equally and wash out the differences the metric exists to show.
+    """
+    from paradigm_b.holdem.arms_common.accuracy import accuracy_on
+
+    net = HoldemValueNet(TINY_NET)
+    rng = np.random.default_rng(0)
+    features = rng.standard_normal((4, 2852)).astype(np.float32)
+    masks = np.zeros((4, 1326), dtype=np.float32)
+    masks[:, :100] = 1.0  # only 100 legal hands
+    targets = rng.standard_normal((4, 2, 1326)).astype(np.float32)
+
+    scored = accuracy_on(net, features, masks, targets)
+    # Blow up the targets only where they are masked out; nothing may change.
+    poisoned = targets.copy()
+    poisoned[:, :, 100:] += 1e6
+    again = accuracy_on(net, features, masks, poisoned)
+    assert scored.mae == pytest.approx(again.mae)
+    assert scored.examples == 4
+
+
+def test_a_perfect_predictor_scores_zero_error():
+    from paradigm_b.holdem.arms_common.accuracy import accuracy_on, predict
+
+    net = HoldemValueNet(TINY_NET)
+    rng = np.random.default_rng(1)
+    features = rng.standard_normal((6, 2852)).astype(np.float32)
+    masks = np.ones((6, 1326), dtype=np.float32)
+    # Use the network's own output as the target: error must vanish and R2 hit 1.
+    targets = predict(net, features, masks)
+    scored = accuracy_on(net, features, masks, targets)
+    assert scored.mae == pytest.approx(0.0, abs=1e-5)
+    assert scored.bias == pytest.approx(0.0, abs=1e-5)
+    assert scored.r2 == pytest.approx(1.0, abs=1e-4)
+
+
+def test_accuracy_reports_every_street_of_an_artifact(tmp_path):
+    from paradigm_b.holdem.arms_common.accuracy import evaluate_accuracy
+
+    store, _ = build_layered_dataset(
+        tmp_path / "dataset", tiny_dataset_config(), teachers_path=tmp_path / "teachers"
+    )
+    net = HoldemValueNet(TINY_NET)
+    results = evaluate_accuracy(net, store, sample_size=4)
+    assert set(results["sources"]) == {"river", "turn", "flop"}
+    for entry in results["sources"].values():
+        assert entry["examples"] > 0
+        assert entry["mae"] >= 0.0
+        assert np.isfinite(entry["rmse"])
+
+
+# --- ReBeL appendix E: buffer purge and exploration -------------------------
+def test_purging_drops_the_oldest_half_and_keeps_the_newest(tmp_path):
+    """The buffer must know which labels are old, wrapped or not."""
+    from paradigm_b.holdem.selfplay import Buffer, Example
+
+    buffer = Buffer(capacity=10)
+
+    def label(i):
+        return Example(
+            features=np.full(2852, i, dtype=np.float32),
+            mask=np.ones(1326, dtype=np.float32),
+            values=np.zeros((2, 1326), dtype=np.float32),
+        )
+
+    buffer.add([label(i) for i in range(8)])  # not yet wrapped
+    assert buffer.purge_oldest(0.5) == 4
+    assert len(buffer) == 4
+    kept = sorted({int(buffer.features[i][0]) for i in range(len(buffer))})
+    assert kept == [4, 5, 6, 7]  # the newest four survive
+
+    # And again once the ring has wrapped past the end.
+    buffer = Buffer(capacity=6)
+    buffer.add([label(i) for i in range(10)])  # wraps: holds 4..9
+    assert len(buffer) == 6
+    buffer.purge_oldest(0.5)
+    kept = sorted({int(buffer.features[i][0]) for i in range(len(buffer))})
+    assert kept == [7, 8, 9]
+
+
+def test_purging_is_a_no_op_at_the_edges():
+    from paradigm_b.holdem.selfplay import Buffer
+
+    buffer = Buffer(capacity=4)
+    assert buffer.purge_oldest(0.5) == 0  # empty
+    assert buffer.purge_oldest(0.0) == 0
+    assert buffer.purge_oldest(1.0) == 0
+
+
+def test_the_online_student_purges_once_at_the_configured_iteration(tmp_path):
+    net = HoldemValueNet(TINY_NET)
+    result = fit_online_student(
+        OnlineStudentConfig(
+            trajectories_per_iteration=2,
+            updates_per_iteration=3,
+            batch_size=8,
+            self_play=HoldemSelfPlayConfig(search_iterations=3, river_iterations=3),
+            situations=SituationConfig(board_cards=4),
+            value_net=TINY_NET,
+            purge_after_iterations=2,
+            purge_fraction=0.5,
+        ),
+        label_budget=30,
+        update_budget=30,
+        net=net,
+        rng=np.random.default_rng(0),
+    )
+    purges = [r for r in result.history if r.get("purged", 0) > 0]
+    assert len(purges) == 1, "the purge must happen exactly once"
+    assert purges[0]["iteration"] == 2
+    # Labels still count against the budget: generating them was a real cost.
+    assert result.spend.labels == 30
+
+
+def test_exploration_defaults_to_the_papers_epsilon():
+    """Appendix E: "we set the probability to explore a random action to 25%".
+
+    Kept as the default even though it measured *worse* at this repo's 2,000
+    label budget (aggregate 35.7 -> 38.5): exploration widens the belief-state
+    distribution, which pays once there is data to cover it, and the small-budget
+    result is a statement about the budget rather than about the setting.
+    """
+    assert HoldemSelfPlayConfig().exploration == pytest.approx(0.25)
+    assert HoldemSelfPlayConfig(exploration=0.0).exploration == pytest.approx(0.0)
+
+
+# --- the actor/learner loop -------------------------------------------------
+def test_shared_weights_publish_and_reload_across_a_version_bump():
+    """Actors reload only when the learner says the weights moved."""
+    from paradigm_b.holdem.arm2_iterative.actors import SharedWeights
+
+    learner = HoldemValueNet(TINY_NET)
+    shared = SharedWeights(learner)
+    actor = HoldemValueNet(TINY_NET)
+    assert shared.load_into(actor) == 0
+
+    # Change the learner, publish, and the actor must pick the change up.
+    with torch.no_grad():
+        for parameter in learner.parameters():
+            parameter.add_(1.0)
+    assert shared.publish(learner) == 1
+    assert shared.load_into(actor) == 1
+    for left, right in zip(learner.state_dict().values(), actor.state_dict().values()):
+        assert torch.equal(left.cpu(), right.cpu())
+
+
+def test_clipping_an_actor_batch_lands_on_the_budget():
+    from paradigm_b.holdem.arm2_iterative.actors import ActorBatch
+    from paradigm_b.holdem.arm2_iterative.async_student import _clip
+
+    batch = ActorBatch(
+        features=np.zeros((3, 2852), np.float32),
+        masks=np.ones((3, 1326), np.float32),
+        targets=np.zeros((3, 2, 1326), np.float32),
+        boards=[3, 4, 5],
+        leaf_evaluations=10,
+        solver_calls=2,
+        weight_version=1,
+    )
+    assert len(_clip(batch, 5)) == 3  # room to spare: untouched
+    clipped = _clip(batch, 2)
+    assert len(clipped) == 2
+    assert clipped.boards == [3, 4]
+
+
+def test_the_async_loop_spends_both_budgets_exactly(tmp_path):
+    """Scheduling is nondeterministic; the accounting must not be."""
+    config = OnlineStudentConfig(
+        trajectories_per_iteration=2,
+        updates_per_iteration=5,
+        batch_size=8,
+        self_play=HoldemSelfPlayConfig(search_iterations=3, river_iterations=3),
+        situations=SituationConfig(board_cards=4),
+        value_net=TINY_NET,
+        actors=2,
+        weight_sync_every=5,
+    )
+    result = fit_online_student(
+        config,
+        label_budget=23,  # deliberately not a multiple of a trajectory
+        update_budget=15,
+        net=HoldemValueNet(TINY_NET),
+        rng=np.random.default_rng(0),
+        journal_path=tmp_path / "journal",
+    )
+    assert result.spend.labels == 23
+    assert result.spend.updates == 15
+    assert result.spend.leaf_evaluations > 0
+    # Everything accepted was journalled, so the record matches the accounting.
+    journal = TrajectoryJournal.open(tmp_path / "journal")
+    assert len(journal) == 23
+
+
+def test_actors_zero_keeps_the_reproducible_synchronous_path():
+    """The comparison depends on determinism, so 0 must stay the default."""
+    assert OnlineStudentConfig().actors == 0
+
+    def run():
+        # Seed the construction too: two fresh nets would otherwise start from
+        # different random weights and the comparison would be meaningless.
+        torch.manual_seed(0)
+        return fit_online_student(
+            OnlineStudentConfig(
+                trajectories_per_iteration=2,
+                updates_per_iteration=4,
+                batch_size=8,
+                self_play=HoldemSelfPlayConfig(search_iterations=3, river_iterations=3),
+                situations=SituationConfig(board_cards=4),
+                value_net=TINY_NET,
+                actors=0,
+            ),
+            label_budget=12,
+            update_budget=8,
+            net=HoldemValueNet(TINY_NET),
+            rng=np.random.default_rng(7),
+        )
+
+    first, second = run(), run()
+    for left, right in zip(
+        first.net.state_dict().values(), second.net.state_dict().values()
+    ):
+        assert torch.equal(left, right), "the synchronous path must be reproducible"

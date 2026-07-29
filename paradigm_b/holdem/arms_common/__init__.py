@@ -15,6 +15,11 @@ from paradigm_b.holdem.arms_common.evaluation import (
     make_held_out_situations,
 )
 from paradigm_b.holdem.arms_common.fitting import StudentResult, fit_value_net
+from paradigm_b.holdem.arms_common.accuracy import (
+    AccuracyResult,
+    accuracy_on,
+    evaluate_accuracy,
+)
 from paradigm_b.holdem.arms_common.situations import (
     STREET_CARDS,
     STREET_NAMES,
@@ -30,6 +35,9 @@ from paradigm_b.holdem.arms_common.storage import (
 )
 
 __all__ = [
+    "AccuracyResult",
+    "accuracy_on",
+    "evaluate_accuracy",
     "CountingLeafValues",
     "SpendRecord",
     "EvaluationConfig",

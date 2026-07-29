@@ -97,7 +97,8 @@ class ObsConfig:
 class ModelConfig:
     # Defaults are the "medium" baseline from the research plan (~1.6M params):
     # 256-wide trunk, 8 residual blocks.  Named presets live in
-    # ``MODEL_PRESETS`` (tiny / medium / large) for controlled size comparisons.
+    # ``MODEL_PRESETS`` (tiny / medium / large / xlarge) for controlled size
+    # comparisons; ``xlarge`` matches the paradigm-B value network's capacity.
     hidden_dim: int = 256
     num_residual_blocks: int = 8
     embed_cards: int = 128
@@ -548,11 +549,27 @@ MODEL_PRESETS = {
         embed_cards=256, embed_board=256, embed_players=256,
         embed_pot_history=512, embed_position=128,
     ),
+    # ~18.8M parameters, chosen to sit alongside the paradigm-B value network
+    # (18.6M at its default 1536-wide, 6-block trunk) and the ReBeL paper's own
+    # value net, which works out to ~17.9M from the architecture given in its
+    # appendix E.  The point of matching them is that a capacity comparison
+    # between the two paradigms is otherwise confounded by size: "B beats A" is
+    # not interesting if B's network is three times larger.
+    #
+    # Reached by depth rather than width (768 wide x 12 blocks, not 1536 x 6),
+    # because paradigm A's trunk feeds several heads and widening it inflates
+    # every head at once.
+    "xlarge": dict(
+        hidden_dim=768, num_residual_blocks=12, head_hidden=768,
+        card_embedding_dim=256,
+        embed_cards=384, embed_board=384, embed_players=384,
+        embed_pot_history=768, embed_position=192,
+    ),
 }
 
 
 def model_config(preset: str, **overrides) -> ModelConfig:
-    """A :class:`ModelConfig` for a named size preset (tiny/medium/large)."""
+    """A :class:`ModelConfig` for a named size preset (tiny/medium/large/xlarge)."""
     if preset not in MODEL_PRESETS:
         raise ValueError(f"unknown model preset {preset!r}; choose from {list(MODEL_PRESETS)}")
     return ModelConfig(**{**MODEL_PRESETS[preset], **overrides})

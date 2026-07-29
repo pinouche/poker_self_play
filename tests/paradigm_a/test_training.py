@@ -342,15 +342,31 @@ def test_model_presets_have_increasing_size_and_valid_ranges():
     from paradigm_a.model.network import build_network
 
     counts = {}
-    for preset in ("tiny", "medium", "large"):
+    for preset in ("tiny", "medium", "large", "xlarge"):
         cfg = small_config()
         cfg.model = model_config(preset)
         counts[preset] = build_network(cfg).num_parameters()
-    assert counts["tiny"] < counts["medium"] < counts["large"]
+    assert counts["tiny"] < counts["medium"] < counts["large"] < counts["xlarge"]
     # Spec ranges (10-action space): tiny 0.3-0.8M, medium 1-3M, large 5-15M.
     assert 0.3e6 <= counts["tiny"] <= 0.9e6
     assert 1e6 <= counts["medium"] <= 3e6
     assert 5e6 <= counts["large"] <= 15e6
+    # ``xlarge`` exists to be capacity-matched against paradigm B's value net
+    # (18.6M at its defaults), so that "B beats A" cannot be explained by size.
+    assert 16e6 <= counts["xlarge"] <= 21e6
+
+
+def test_xlarge_matches_the_paradigm_b_value_network_within_a_few_percent():
+    """The whole point of the preset is that the two paradigms are size-matched."""
+    from paradigm_a.config import model_config
+    from paradigm_a.model.network import build_network
+    from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
+
+    cfg = small_config()
+    cfg.model = model_config("xlarge")
+    a = build_network(cfg).num_parameters()
+    b = sum(p.numel() for p in HoldemValueNet(HoldemValueNetConfig()).parameters())
+    assert abs(a - b) / b < 0.10, f"paradigm A xlarge {a:,} vs paradigm B {b:,}"
 
 
 def test_unknown_model_preset_is_rejected():

@@ -51,11 +51,22 @@ class HoldemSelfPlayConfig:
     search_iterations: int = 40
     river_iterations: int = 60
     depth_limit: int = 1
-    # Algorithm 1 samples uniformly from every CFR iterate when there is no
-    # policy warm start.  These remain configurable for deliberate off-policy
-    # experiments, but the defaults follow the paper.
+    # Algorithm 1 samples the descent leaf uniformly from every CFR iterate when
+    # there is no policy warm start, which is what ``warmup_fraction = 0`` gives.
     warmup_fraction: float = 0.0
-    exploration: float = 0.0
+    # Probability of descending through a uniform-random strategy instead of a
+    # CFR iterate.  Appendix E of the ReBeL paper: *"for all experiments we set
+    # the probability to explore a random action to eps = 25%"*, so this is the
+    # paper-faithful value and the default here.
+    #
+    # One measured caveat, so it is not rediscovered the hard way: at a 2,000
+    # label budget this made the online arm *worse*, not better — held-out
+    # aggregate exploitability 35.7 -> 38.5 (``runs/labels-02`` vs
+    # ``runs/fixes-u4000``).  Exploration widens the belief-state distribution,
+    # which pays only once there is enough data to cover the wider space, and
+    # ReBeL's 12M-example buffer has ~6,000x more of it than those runs did.
+    # Set it to 0.0 for deliberately small-budget experiments.
+    exploration: float = 0.25
     cfr: CFRConfig = field(default_factory=CFRConfig.dcfr)
 
 
@@ -112,6 +123,41 @@ class Buffer:
     def sample(self, batch_size: int, rng: np.random.Generator):
         index = rng.integers(0, self.size, size=min(batch_size, self.size))
         return self.features[index], self.masks[index], self.targets[index]
+
+    def purge_oldest(self, fraction: float = 0.5) -> int:
+        """Drop the oldest ``fraction`` of the buffer; return how many went.
+
+        ReBeL's appendix E: *"As initial data is produced with a random value
+        network, we remove half of the data from the replay buffer after 20
+        epochs."*  Without this, labels written by an essentially random
+        network keep being sampled at full weight for the rest of the run —
+        and in a buffer that never fills (2,000 labels into 60,000 slots)
+        nothing is ever evicted by the ordinary circular churn either, so
+        *every* early mistake survives to the last gradient step.
+
+        Order is reconstructed from the write pointer, so this is correct
+        whether or not the buffer has wrapped.
+        """
+        if not 0.0 < fraction < 1.0 or self.size == 0:
+            return 0
+        keep = max(self.size - int(self.size * fraction), 1)
+        if keep >= self.size:
+            return 0
+        if self.size < self.capacity:
+            order = np.arange(self.size)
+        else:  # wrapped: oldest sits at the write pointer
+            order = np.concatenate(
+                [np.arange(self._next, self.capacity), np.arange(0, self._next)]
+            )
+        newest = order[-keep:]
+        # Fancy indexing copies, so this cannot alias the destination.
+        self.features[:keep] = self.features[newest]
+        self.masks[:keep] = self.masks[newest]
+        self.targets[:keep] = self.targets[newest]
+        dropped = self.size - keep
+        self.size = keep
+        self._next = keep % self.capacity
+        return dropped
 
 
 def normalise(values: np.ndarray, reach: np.ndarray, correction: float):

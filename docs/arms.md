@@ -89,15 +89,43 @@ regenerate.
 | `--flop-depth-limit` | 1 | flop lookahead when scoring; 2 is ~170x the work |
 | `--eval-every` | off | mid-run scoring cadence, for a learning curve |
 | `--checkpoint-every` | 10 | arm 2 student snapshots |
+| `--exploration` | 0.25 | arm 2: chance of descending a uniform-random strategy (appendix E's ε) |
+| `--purge-after-iterations` | off | arm 2: drop the oldest half of the buffer once, at this iteration |
+| `--actors` | 0 | arm 2: parallel generator processes; 0 = reproducible synchronous loop |
+| `--weight-sync-every` | 50 | gradient steps between publishing weights to actors |
 | `--rebuild-dataset` | off | regenerate the artifact instead of reusing it |
 | `--workers` | 8 | parallelism for river generation only |
 | `--seed` / `--device` | 0 / cpu | |
 
-**Sizing note.** `label-budget / update-budget` should roughly match
+**Sizing note.** `label-budget / update-budget` must match
 `trajectories-per-iteration × labels-per-trajectory / updates-per-iteration`, or
 arm 2 exhausts one budget long before the other and spends the tail either
-generating labels it never trains on, or training on a frozen buffer. A
-trajectory yields one label per street it passes through (~2–3 from the turn).
+generating labels it never trains on, or training on a frozen buffer. This is
+not a rounding concern: the first real run looked only mildly off (0.27 labels
+per update against a requested 0.5) and burned **46% of its label budget after
+training had already stopped**. The results file gave no hint. Arm 2 now emits
+a `RuntimeWarning` when the projected waste exceeds 15%, and names the
+`trajectories-per-iteration` that would fix it.
+
+**A trajectory yields one label per street it passes through**, descending to
+the river — 3 from a flop start, 2 from a turn start, 1 from a river start.
+Two consequences that are easy to get wrong:
+
+* `labels-per-trajectory` is a property of the *street mixture*, not a
+  constant. Use `StreetMix.labels_per_trajectory` rather than guessing.
+* **Start-street shares are not label shares.** Matching arm 2's *labels* to
+  the artifact's composition means inverting the relationship — start
+  probabilities are the differences of the cumulative label shares, deepest
+  street first — because turn and flop starts pass through the river too.
+  Copying the proportions directly (as the first run did) over-produces river
+  labels: a requested 71/21/7 came out as 74/21/5, and since river labels are
+  exact and network-independent in *both* arms, that quietly switched off the
+  mechanism the experiment exists to test on three-quarters of arm 2's data.
+  `StreetMix.from_label_counts` does the inversion; `label_shares()` reports
+  what a mixture actually produces.
+
+Descending trajectories also force `river >= turn >= flop` in label counts, so
+a target with more flop labels than river ones is unreachable and is clamped.
 
 ### `label-drift` flags
 
@@ -154,12 +182,37 @@ Per-street shape is the finding, not the aggregate:
 
 | street | if labels go stale | if staleness doesn't matter |
 |---|---|---|
-| river | tie — both solve it exactly | tie |
+| river | tie — and always a tie, see below | tie |
 | turn | small gap to iterative | tie |
 | flop | largest gap (two teacher layers) | tie |
 
 A flat difference across all three streets means something *other* than label
 staleness is driving it — most likely the confound below.
+
+**The river tie is guaranteed, not evidence.** Scoring a river-rooted
+situation builds a depth-limited tree with no leaves — the hand runs straight
+to showdown — so the value network is never consulted and the score reflects
+only the CFR search. Two different networks produce byte-identical river
+numbers. It is a free check that the solver is behaving (if it ever *differs*
+between two agents, something is broken) but it says nothing about either
+network, so `aggregate` is the mean over the flop and turn only.
+`aggregate_all_streets` keeps the diluted version for continuity.
+
+This is not the agent skipping the river. It plays the river, and plays it
+*better* than any other street (~0.9 exploitability against 8–28), precisely
+because the river needs no approximation: it can be solved exactly at decision
+time. The network's river knowledge is consumed **one street up** — when a turn
+solve reaches a river node it cannot afford to expand, it asks the network what
+that river belief state is worth. That is why both arms still train on
+thousands of river labels even though river *play* never consults the net.
+
+To measure that knowledge you need a different instrument —
+`arms_common/accuracy.py`, which compares predicted counterfactual values
+against known-good ones (MAE / RMSE / R² / signed bias, over legal hands only).
+River labels are exact rather than bootstrapped, so the river is the one place
+in the harness with unambiguous ground truth. Score it against a *held-out*
+artifact, though: run it on the dataset a student trained from and it reports
+memorisation, which the offline arm would win by construction.
 
 ### Neither arm is a floor for the other
 
@@ -260,3 +313,27 @@ reports the resulting disaster as the network's exploitability.
 |---|---|---|
 | 1 (default) | 364 nodes | 343 |
 | 2 | 92,288 nodes | 58,800 |
+
+
+## Running arm 2 in parallel
+
+Generating a label runs a full depth-limited CFR solve; training on it is one
+forward and one backward pass. Measured here, arm 2 spends **1629s generating
+against 25s training** — one core solving while everything else waits. Since
+trajectories are independent, `--actors N` runs the Ape-X shape ReBeL used
+across 90 DGX-1 machines: N processes generating from the latest weights, one
+learner consuming a shared replay buffer, weights republished every
+`--weight-sync-every` gradient steps. Actors deliberately run a slightly stale
+network; the staleness costs less than synchronising would.
+
+Measured on a toy run: **4.05x with 6 actors**, budgets still exact.
+
+**But `--actors` is not bit-reproducible.** How many trajectories land between
+two gradient steps depends on process scheduling. The fixed-vs-iterative
+comparison rests on both arms being deterministic given a seed, so it keeps
+`--actors 0`; use parallelism for large runs where wall clock binds.
+
+Labels count when the learner *accepts* them, not when an actor produces them —
+actors are stopped on the label that hits the cap and anything in flight is
+dropped. The arm is charged exactly `label-budget`, though slightly more
+generation work than that really happened, and the wall clock shows it.

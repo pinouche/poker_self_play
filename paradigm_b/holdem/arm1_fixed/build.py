@@ -320,7 +320,7 @@ def build_layered_dataset(
 
     if counts.get("self_play"):
         seed = int(rng.integers(1 << 31))
-        mix = StreetMix.from_counts({k: v for k, v in counts.items() if k in STREET_SOURCES})
+        mix = StreetMix.from_label_counts({k: v for k, v in counts.items() if k in STREET_SOURCES})
         examples = _self_play_source(
             counts["self_play"], teacher, config, excluded_boards, mix, spend, seed, config.device
         )

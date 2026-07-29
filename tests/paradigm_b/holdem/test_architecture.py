@@ -181,8 +181,12 @@ def test_sampling_rejects_non_postflop_board_sizes(board_cards):
 
 def test_holdem_self_play_defaults_to_algorithm_one_sampling():
     config = HoldemSelfPlayConfig()
+    # No policy warm start, so Algorithm 1 samples the descent leaf uniformly
+    # over every CFR iterate.
     assert config.warmup_fraction == 0.0
-    assert config.exploration == 0.0
+    # Appendix E: "for all experiments we set the probability to explore a
+    # random action to eps = 25%".
+    assert config.exploration == 0.25
 
 
 def test_leaf_arrival_probability_excludes_overlapping_private_hands():

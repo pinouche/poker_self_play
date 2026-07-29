@@ -1,0 +1,277 @@
+"""Many actors -> replay buffer -> one learner, the way ReBeL is actually run.
+
+The synchronous loop in ``student.py`` generates every trajectory, *then*
+trains, then repeats.  That is easy to reason about and exactly reproducible,
+and it wastes almost all the wall clock: generating one label runs a full
+depth-limited CFR solve — hundreds of tree traversals, each evaluating every
+leaf through the network — while training on it is one forward and one backward
+pass.  Measured on this repo, arm 2 spends **1629s generating against 25s
+training**.  One core solves; nothing else happens.
+
+Generation is embarrassingly parallel, though: trajectories are independent and
+never talk to each other.  So the shape that fits is the standard Ape-X /
+AlphaZero one, which is what ReBeL used across 90 DGX-1 machines:
+
+    actors (N processes)          learner (this process)
+    ------------------            ----------------------
+    pull latest weights   <-----  publish weights every K updates
+    sample a situation            drain the queue into the replay buffer
+    run Algorithm 1               take gradient steps
+    push examples         ----->  repeat
+
+The buffer decouples them.  Actors never wait for the learner and the learner
+never waits for data — it trains on whatever has accumulated. Actors therefore
+run a network that is a little behind the learner's, by design: the staleness
+costs less than the synchronisation would.
+
+**This is not bit-reproducible, and that is a real trade-off.**  How many
+trajectories land between two gradient steps depends on process scheduling, so
+two runs with the same seed will not match. The fixed-vs-iterative comparison
+rests on determinism (identical weights, identical budgets), so it should keep
+using the synchronous path; use this one for large runs where wall clock is the
+binding constraint. Budgets are still honoured exactly — the learner counts what
+it accepts and stops the actors on the label that hits the cap.
+
+Weights move through shared memory rather than pickled queues: the learner
+copies parameters into a shared mirror and bumps a version counter, and actors
+reload when the version they hold is stale. For an 18M-parameter network that is
+~75MB copied per sync instead of per message.
+
+.. warning::
+
+   Actors are started with the ``spawn`` start method, so every child
+   re-imports the ``__main__`` module.  A script that calls this from module
+   level therefore re-runs itself in each child and spawns recursively until
+   the machine dies.  **Guard the call site**::
+
+       if __name__ == "__main__":
+           fit_online_student(config, ...)
+
+   ``solve.py`` and ``paradigm_b/cli/compare.py`` already do; anything under
+   ``scratchpad/`` or a notebook must too.  :class:`ActorPool` raises rather
+   than spawning if it detects it is already running inside an actor.
+"""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import queue
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+
+from paradigm_b.holdem.arms_common.situations import StreetMix, sample_mixed_situation
+from paradigm_b.holdem.data.sampling import SituationConfig
+from paradigm_b.holdem.net.leaf_values import NetLeafValues
+from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
+from paradigm_b.holdem.selfplay import Example, HoldemSelfPlayConfig, collect_trajectory
+
+
+@dataclass
+class ActorBatch:
+    """One trajectory's worth of labels, plus what producing it cost."""
+
+    features: np.ndarray
+    masks: np.ndarray
+    targets: np.ndarray
+    boards: List[int]
+    leaf_evaluations: int
+    solver_calls: int
+    weight_version: int
+
+    def __len__(self) -> int:
+        return len(self.features)
+
+
+class _CountingLeaves:
+    """Per-actor tally; the learner sums them as batches arrive."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.leaf_evaluations = 0
+        self.solver_calls = 0
+
+    def __call__(self, states):
+        self.solver_calls += 1
+        self.leaf_evaluations += len(states)
+        return self.inner(states)
+
+    def reset(self) -> Tuple[int, int]:
+        counts = (self.leaf_evaluations, self.solver_calls)
+        self.leaf_evaluations = self.solver_calls = 0
+        return counts
+
+
+class SharedWeights:
+    """A shared-memory mirror of the learner's parameters, plus a version.
+
+    Actors poll ``version``; when it moves they copy the tensors into their own
+    network.  A lock is held on both sides only for the copy itself, so an actor
+    can never observe a half-written parameter set — cheap, because syncing is
+    rare relative to solving.
+    """
+
+    def __init__(self, net: HoldemValueNet) -> None:
+        self.tensors: Dict[str, torch.Tensor] = {
+            name: value.detach().cpu().clone().share_memory_()
+            for name, value in net.state_dict().items()
+        }
+        self.version = mp.Value("i", 0)
+        self.lock = mp.Lock()
+
+    def publish(self, net: HoldemValueNet) -> int:
+        state = net.state_dict()
+        with self.lock:
+            for name, tensor in self.tensors.items():
+                tensor.copy_(state[name].detach().cpu())
+            self.version.value += 1
+            return self.version.value
+
+    def load_into(self, net: HoldemValueNet) -> int:
+        with self.lock:
+            version = self.version.value
+            net.load_state_dict({k: v.clone() for k, v in self.tensors.items()})
+        return version
+
+
+def actor_loop(
+    worker_index: int,
+    shared: SharedWeights,
+    outbox: mp.Queue,
+    stop: mp.Event,
+    net_config: HoldemValueNetConfig,
+    self_play: HoldemSelfPlayConfig,
+    situations: SituationConfig,
+    street_mix: StreetMix,
+    seed: int,
+    device: str,
+) -> None:
+    """One actor: pull weights, run Algorithm 1, push labels, repeat."""
+    torch.set_num_threads(1)  # actors are parallel; don't fight over cores
+    rng = np.random.default_rng(seed + worker_index)
+    net = HoldemValueNet(net_config)
+    version = shared.load_into(net)
+    net.eval()
+    leaves = _CountingLeaves(NetLeafValues(net, device=device))
+
+    while not stop.is_set():
+        if shared.version.value != version:
+            version = shared.load_into(net)
+            net.eval()
+
+        space, root, reach, _ = sample_mixed_situation(rng, situations, street_mix)
+        examples: Sequence[Example] = collect_trajectory(
+            leaves, space, root, self_play, rng, reach=reach
+        )
+        if not examples:
+            continue
+        leaf_evaluations, solver_calls = leaves.reset()
+        batch = ActorBatch(
+            features=np.stack([e.features for e in examples]).astype(np.float32),
+            masks=np.stack([e.mask for e in examples]).astype(np.float32),
+            targets=np.stack([e.values for e in examples]).astype(np.float32),
+            boards=[len(e.board) for e in examples],
+            leaf_evaluations=leaf_evaluations,
+            solver_calls=solver_calls,
+            weight_version=version,
+        )
+        while not stop.is_set():
+            try:
+                outbox.put(batch, timeout=0.5)
+                break
+            except queue.Full:  # learner is behind; check the stop flag and retry
+                continue
+
+
+class ActorPool:
+    """Owns the actor processes and the queue they publish into."""
+
+    def __init__(
+        self,
+        workers: int,
+        net: HoldemValueNet,
+        net_config: HoldemValueNetConfig,
+        self_play: HoldemSelfPlayConfig,
+        situations: SituationConfig,
+        street_mix: StreetMix,
+        seed: int,
+        device: str = "cpu",
+        queue_size: int = 64,
+    ) -> None:
+        if mp.parent_process() is not None:
+            raise RuntimeError(
+                "ActorPool was constructed inside a child process.  With the "
+                "'spawn' start method each actor re-imports __main__, so a "
+                "call at module level spawns recursively until the machine "
+                "dies.  Wrap the call site in `if __name__ == \"__main__\":`."
+            )
+        context = mp.get_context("spawn")
+        self.workers = workers
+        self.shared = SharedWeights(net)
+        self.queue: mp.Queue = context.Queue(maxsize=queue_size)
+        self.stop = context.Event()
+        self.processes = [
+            context.Process(
+                target=actor_loop,
+                args=(
+                    index,
+                    self.shared,
+                    self.queue,
+                    self.stop,
+                    net_config,
+                    self_play,
+                    situations,
+                    street_mix,
+                    seed,
+                    device,
+                ),
+                daemon=True,
+            )
+            for index in range(workers)
+        ]
+
+    def start(self) -> "ActorPool":
+        for process in self.processes:
+            process.start()
+        return self
+
+    def publish(self, net: HoldemValueNet) -> int:
+        return self.shared.publish(net)
+
+    def drain(self, timeout: float = 0.1, limit: int = 256) -> List[ActorBatch]:
+        """Whatever the actors have produced; blocks briefly if nothing is ready."""
+        batches: List[ActorBatch] = []
+        try:
+            batches.append(self.queue.get(timeout=timeout))
+        except queue.Empty:
+            return batches
+        while len(batches) < limit:
+            try:
+                batches.append(self.queue.get_nowait())
+            except queue.Empty:
+                break
+        return batches
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Stop the actors and drain the queue so no process blocks on a put."""
+        self.stop.set()
+        deadline_drains = 64
+        for _ in range(deadline_drains):
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        for process in self.processes:
+            process.join(timeout=timeout)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=timeout)
+        self.queue.close()
+
+    def __enter__(self) -> "ActorPool":
+        return self.start()
+
+    def __exit__(self, *exc) -> None:
+        self.shutdown()

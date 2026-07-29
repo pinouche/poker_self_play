@@ -197,6 +197,16 @@ def evaluate_agent(
 
     The aggregate is the mean over *streets*, not over situations, so a street
     that happens to carry more held-out boards does not dominate the headline.
+
+    **The river is excluded from the headline aggregate, on purpose.**  Scoring
+    a river-rooted situation builds a depth-limited tree that has no leaves —
+    the hand runs straight to showdown — so the value network is never
+    consulted and the score measures only the CFR search.  Two different
+    networks produce *byte-identical* river numbers, and averaging that
+    constant into the headline just dilutes the comparison.  It is still
+    reported per-street, and still worth reading: it is a free check that the
+    solver is behaving, and if it ever differs between two agents something is
+    wrong.  ``aggregate_all_streets`` keeps the undiluted mean for continuity.
     """
     scores: Dict[str, float] = {}
     for board_cards, street_situations in sorted(situations.items()):
@@ -215,5 +225,17 @@ def evaluate_agent(
         scores[name] = float(np.mean(per_board))
         scores[f"{name}_worst"] = float(np.max(per_board))
     street_means = [v for k, v in scores.items() if not k.endswith("_worst")]
-    scores["aggregate"] = float(np.mean(street_means)) if street_means else float("nan")
+    scores["aggregate_all_streets"] = (
+        float(np.mean(street_means)) if street_means else float("nan")
+    )
+    # Streets where the agent's own re-solve is depth-limited, and therefore
+    # where the network actually decides anything.  The river is not one.
+    sensitive = [
+        scores[STREET_NAMES[cards]]
+        for cards in sorted(situations)
+        if cards < 5 and STREET_NAMES[cards] in scores
+    ]
+    scores["aggregate"] = float(np.mean(sensitive)) if sensitive else scores[
+        "aggregate_all_streets"
+    ]
     return scores

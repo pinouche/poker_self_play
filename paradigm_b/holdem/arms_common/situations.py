@@ -44,17 +44,53 @@ class StreetMix:
         return {k: v / total for k, v in positive.items()}
 
     @classmethod
-    def from_counts(cls, counts: Dict[str, float]) -> "StreetMix":
-        """The mix implied by an artifact's per-source example counts.
+    def from_label_counts(cls, counts: Dict[str, float]) -> "StreetMix":
+        """Start-street weights that make the *labels* match ``counts``.
 
-        This is how the online arm is made to match the offline one: whatever
-        proportion of the frozen dataset is turn data, the same proportion of
-        online trajectories starts on the turn.
+        These are two different things, and conflating them silently skews the
+        online arm's data toward the river.  A trajectory produces one label at
+        every street it passes through on the way down: a flop start yields
+        flop, turn *and* river labels; a turn start yields turn and river; a
+        river start yields one.  So copying an artifact's label proportions
+        straight onto the starting street over-produces river labels, because
+        turn and flop starts pass through the river as well.
+
+        Inverting it: the share of labels at a street is the total start
+        probability at or above it, so the start probabilities are the
+        *differences* of the cumulative label shares, deepest street first.
+
+        Note the constraint this exposes — descending trajectories force
+        ``river >= turn >= flop`` in label counts, so a target with more flop
+        labels than river ones is unreachable.  Such a target is clamped rather
+        than silently approximated by something else.
         """
+        shares = {
+            street: max(float(counts.get(street, 0.0)), 0.0)
+            for street in ("flop", "turn", "river")
+        }
         return cls(
-            river=float(counts.get("river", 0.0)),
-            turn=float(counts.get("turn", 0.0)),
-            flop=float(counts.get("flop", 0.0)),
+            flop=shares["flop"],
+            turn=max(shares["turn"] - shares["flop"], 0.0),
+            river=max(shares["river"] - shares["turn"], 0.0),
+        )
+
+    def label_shares(self) -> Dict[str, float]:
+        """The label mixture this start-street mixture actually produces."""
+        starts = self.normalised()
+        cumulative, running = {}, 0.0
+        for street in ("flop", "turn", "river"):
+            running += starts.get(street, 0.0)
+            cumulative[street] = running
+        total = sum(cumulative.values())
+        return {k: v / total for k, v in cumulative.items()}
+
+    @property
+    def labels_per_trajectory(self) -> float:
+        """Expected labels one trajectory yields — what budget sizing needs."""
+        starts = self.normalised()
+        return sum(
+            probability * (5 - STREET_CARDS[street] + 1)
+            for street, probability in starts.items()
         )
 
     def to_dict(self) -> Dict[str, float]:

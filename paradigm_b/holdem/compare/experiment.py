@@ -242,7 +242,7 @@ def run_comparison(
         counts = {k: v for k, v in store.counts().items() if k in STREET_SOURCES}
         if counts:
             iterative_config = replace(
-                iterative_config, street_mix=StreetMix.from_counts(counts)
+                iterative_config, street_mix=StreetMix.from_label_counts(counts)
             )
     iterative_student = fit_online_student(
         iterative_config,
