@@ -47,6 +47,13 @@ class CFRConfig:
     plus: bool = False  # floor cumulative regret at zero (regret matching+)
     alternating: bool = True  # update one player per iteration
     linear_averaging: bool = False  # weight iteration t by t in the average
+    # Added to that weight, so iteration *t* counts ``t + average_offset``.
+    # CFR+ conventionally uses weight *t*; ReBeL's Algorithm 2 writes its
+    # averages as the recursion ``x_bar <- (t/(t+2))*x_bar + (2/(t+2))*x_t``,
+    # which is the same thing with weight *t+1*.  Solving the recursion:
+    # matching ``w_t / W_t = 2/(t+2)`` and ``W_{t-1}/W_t = t/(t+2)`` needs
+    # ``W_t = (t+1)(t+2)/2``, hence ``w_t = W_t - W_{t-1} = t + 1``.
+    average_offset: int = 0
     regret_alpha: Optional[float] = None  # discount exponent, positive regret
     regret_beta: Optional[float] = None  # discount exponent, negative regret
     strategy_gamma: Optional[float] = None  # discount exponent, average strategy
@@ -66,10 +73,71 @@ class CFRConfig:
         )
 
     @staticmethod
+    def linear_cfr_d() -> "CFRConfig":
+        """The weighting ReBeL's Algorithm 2 (Linear CFR-D) specifies.
+
+        Regret is weighted by *t* — Linear CFR, which is Discounted CFR with
+        alpha = beta = 1 and is implemented here as the equivalent per-iteration
+        discount ``t/(t+1)``, so regret accrued at iteration *s* retains
+        ``prod_{u=s..T} u/(u+1) = s/(T+1)``.
+
+        Both averages — the average strategy and the average root value the
+        value network trains on — are weighted explicitly by ``t + 1`` rather
+        than by discounting, which is the pseudocode's ``(t/(t+2))`` recursion
+        exactly.  ``strategy_gamma`` is therefore ``None``: discounting *and*
+        weighting would count the schedule twice.
+
+        This is not the same as :meth:`dcfr`, which is faster on Leduc but
+        weights iteration *s* by ``s^2``.  Use dcfr when you want the strongest
+        solver; use this when you want the paper's algorithm.
+        """
+        return CFRConfig(
+            plus=False,
+            alternating=True,
+            linear_averaging=True,
+            average_offset=1,
+            regret_alpha=1.0,
+            regret_beta=1.0,
+            strategy_gamma=None,
+        )
+
+    @staticmethod
     def dcfr() -> "CFRConfig":
         return CFRConfig(
             alternating=True, regret_alpha=1.5, regret_beta=0.0, strategy_gamma=2.0
         )
+
+    def average_weight(self, iteration: float) -> float:
+        """Weight iteration ``t`` carries in the strategy and value averages."""
+        if not self.linear_averaging:
+            return 1.0
+        return float(iteration) + float(self.average_offset)
+
+    def cumulative_average_weight(self, iteration: float) -> float:
+        """Total average weight ``sum_{t=1..iteration} average_weight(t)``.
+
+        What a warm start has to seed so that resuming at ``t_warm`` continues
+        the same running average rather than restarting it.
+        """
+        if not self.linear_averaging:
+            return float(iteration)
+        offset = float(self.average_offset)
+        total = float(iteration)
+        return total * (total + 1.0) / 2.0 + offset * total
+
+    def initial_average_weight(self, warm_iterations: float = 0.0) -> float:
+        """Weight carried by the value/strategy average *before* the loop runs.
+
+        Algorithm 2 seeds ``v(beta_r) = COMPUTE_EV(G, pi_{t_warm})`` and
+        ``pi_bar = pi_{t_warm}`` before iterating, and the ``(t/(t+2))``
+        recursion then decays that seed.  For the recursion to hold, the seed
+        must enter with weight ``W_{t_warm} = (t_warm+1)(t_warm+2)/2``, which is
+        one more than the weight ``t_warm`` real iterations would have
+        accumulated — with no warm start that is a weight of exactly 1.
+        """
+        if not self.linear_averaging:
+            return 1.0
+        return 1.0 + self.cumulative_average_weight(warm_iterations)
 
 
 class CFRSolver:
@@ -98,7 +166,7 @@ class CFRSolver:
         for _ in range(iterations):
             self.iteration += 1
             self._refresh_strategy()
-            weight = float(self.iteration) if self.config.linear_averaging else 1.0
+            weight = self.config.average_weight(self.iteration)
             players = (
                 [(self.iteration - 1) % self.tree.game.num_players]
                 if self.config.alternating

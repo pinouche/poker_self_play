@@ -1,9 +1,11 @@
-"""Arm 2: ReBeL Algorithm 1 — generate labels with the current net, forever.
+"""Arm 2: ReBeL Algorithm 2 — generate labels with the current net, forever.
 
-The loop is the paper's: sample a situation, run depth-limited search using the
-**current** network at the leaves, record what search concluded, take gradient
-steps, repeat.  Labels improve as the network improves, and stale ones age out
-of the replay buffer.  Nothing is ever frozen.
+The loop is the paper's: sample a situation, run Linear CFR-D depth-limited
+search using the **current** network at the leaves (see
+:func:`~paradigm_b.holdem.selfplay.collect_trajectory`, which is the pseudocode
+line by line), record what search concluded, take gradient steps, repeat.
+Labels improve as the network improves, and stale ones age out of the replay
+buffer.  Nothing is ever frozen.
 
 Two things this has to get right for the comparison to mean anything:
 
@@ -24,7 +26,7 @@ from __future__ import annotations
 
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -38,6 +40,12 @@ from paradigm_b.holdem.arms_common.fitting import StudentResult, fit_value_net
 from paradigm_b.holdem.arms_common.situations import StreetMix, sample_mixed_situation
 from paradigm_b.holdem.arms_common.storage import PathLike, save_checkpoint
 from paradigm_b.holdem.arm2_iterative.journal import JournalEntry, TrajectoryJournal
+from paradigm_b.holdem.net.policy import (
+    HoldemPolicyNet,
+    HoldemPolicyNetConfig,
+    PolicyReplayBuffer,
+    train_policy_net,
+)
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
 from paradigm_b.holdem.selfplay import Buffer, HoldemSelfPlayConfig, collect_trajectory
 from paradigm_b.holdem.data.sampling import SituationConfig
@@ -83,8 +91,36 @@ class OnlineStudentConfig:
     # Keep a copy of the student every N iterations, so the run can be replayed.
     checkpoint_every: Optional[int] = None
     value_net: HoldemValueNetConfig = field(default_factory=HoldemValueNetConfig)
+    # theta_pi and D_pi.  Algorithm 2 carries a policy network alongside the
+    # value network; it exists to warm-start search
+    # (``self_play.warm_start_iterations``) and it is the one line of the
+    # pseudocode marked "optional".
+    #
+    # Both are off by default, for a reason the comparison depends on: gradient
+    # steps spent on theta_pi are compute arm 1 does not spend, and
+    # ``update_budget`` counts only value-net steps, so a run with the policy
+    # net on is no longer the equal-budget comparison
+    # :mod:`~paradigm_b.holdem.compare.experiment` is measuring.  Turn them on
+    # to run the full algorithm; leave them off to run the comparison.
+    policy_net: HoldemPolicyNetConfig = field(default_factory=HoldemPolicyNetConfig)
+    policy_buffer_size: int = 20_000
+    policy_updates_per_iteration: int = 0
     seed: int = 0
     device: str = "cpu"
+
+    @property
+    def uses_policy_net(self) -> bool:
+        """Whether theta_pi is trained, warm-starts search, or both."""
+        return (
+            self.policy_updates_per_iteration > 0
+            or self.self_play.warm_start_iterations > 0
+        )
+
+    def generation_config(self) -> HoldemSelfPlayConfig:
+        """The self-play config to generate with, with D_pi off when unused."""
+        if self.uses_policy_net:
+            return self.self_play
+        return replace(self.self_play, policy_targets=False)
 
 
 def fit_online_student(
@@ -136,6 +172,17 @@ def fit_online_student(
     spend = SpendRecord()
     history: List[Dict[str, float]] = []
 
+    policy_net: Optional[HoldemPolicyNet] = None
+    policy_optimiser = None
+    policy_buffer = None
+    if config.uses_policy_net:
+        policy_net = HoldemPolicyNet(config.policy_net).to(device)
+        policy_optimiser = torch.optim.Adam(
+            policy_net.parameters(), lr=config.learning_rate
+        )
+        policy_buffer = PolicyReplayBuffer(config.policy_buffer_size)
+
+    self_play = config.generation_config()
     situations = config.situations
     trajectory_id = 0
     iteration = 0
@@ -157,13 +204,24 @@ def fit_online_student(
                 rng, situations, config.street_mix
             )
             examples = collect_trajectory(
-                leaf_values, space, root, config.self_play, rng, reach=reach
+                leaf_values,
+                space,
+                root,
+                self_play,
+                rng,
+                reach=reach,
+                policy_net=policy_net,
+                device=config.device,
             )
             # Truncate so the arm lands exactly on its budget.
             examples = examples[: label_budget - spend.labels]
             if not examples:
                 continue
             buffer.add(examples)
+            if policy_buffer is not None:
+                policy_buffer.add(
+                    [policy for example in examples for policy in example.policies]
+                )
             spend.labels += len(examples)
             produced += len(examples)
             if journal is not None:
@@ -212,6 +270,19 @@ def fit_online_student(
             "purged": float(purged),
             "loss": total / max(done, 1),
         }
+        # theta_pi's steps are deliberately outside ``update_budget``; see
+        # :class:`OnlineStudentConfig`.
+        if policy_net is not None and config.policy_updates_per_iteration > 0:
+            record["policy_loss"] = train_policy_net(
+                policy_net,
+                policy_buffer,
+                config.policy_updates_per_iteration,
+                config.batch_size,
+                config.learning_rate,
+                rng,
+                device,
+                policy_optimiser,
+            )
         finished = spend.labels >= label_budget and spend.updates >= update_budget
         # Cadence only — never forced at the finish.  The final score belongs to
         # :func:`~holdem.compare.experiment.run_comparison`, and doing it here
@@ -240,7 +311,11 @@ def fit_online_student(
     if journal is not None:
         journal.flush(iteration)
     return StudentResult(
-        net=net, history=history, initial_state=initial_state, spend=spend
+        net=net,
+        history=history,
+        initial_state=initial_state,
+        spend=spend,
+        policy_net=policy_net,
     )
 
 

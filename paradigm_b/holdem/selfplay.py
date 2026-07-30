@@ -1,17 +1,31 @@
 """ReBeL self play on a postflop hold'em endgame.
 
-The same loop as ``rebel/`` on Leduc — search at a belief state, train the
-network on what search concluded, descend into a leaf reached by a random CFR
-iterate — with the differences hold'em forces:
+Algorithm 2 of Brown et al. 2020 — ReBeL with Linear CFR-D data generation —
+line by line, with the differences hold'em forces:
 
-* a trajectory starts on any postflop street and follows one sampled CFR
+* a trajectory starts on any postflop street and follows the sampled CFR
   iterate's reach distribution through every later street; the river solve runs
   to real showdowns, so its values are exact;
 * every example carries its own hand mask, because which of the 1,326 combos
-  are possible depends on all five board cards;
-* optional off-policy exploration can broaden the range distribution beyond
-  the narrow slice equilibrium play visits, without changing the paper-aligned
-  default trajectory sampler.
+  are possible depends on all five board cards.
+
+The correspondence to the pseudocode, since the whole point of this module is
+that it *is* the pseudocode:
+
+===============================  =======================================
+``REBEL-LINEAR-CFR-D``           :func:`collect_trajectory`
+``CONSTRUCT_SUBGAME(beta_r)``    ``build_turn_tree(public, depth_limit)``
+``INITIALIZE_POLICY(G, th_pi)``  :func:`initialize_policy`
+``SET_LEAF_VALUES``              ``SubgameSolver._evaluate_leaves``, run
+                                 once per CFR iteration against pi_t
+``COMPUTE_EV`` / ``v(beta_r)``   ``SubgameSolver.root_values``
+``t_sample ~ linear{..}``        :func:`sample_iteration`
+``UPDATE_POLICY`` / ``pi_bar``   regret matching + the linear weighting in
+                                 :meth:`CFRConfig.linear_cfr_d`
+``SAMPLE_LEAF(G, pi_{t-1})``     :func:`sample_leaf`
+``Add {beta_r, v} to D_v``       the returned :class:`Example` values
+``Add {beta, pi_bar} to D_pi``   the returned :class:`Example` policies
+===============================  =======================================
 """
 
 from __future__ import annotations
@@ -33,14 +47,15 @@ from paradigm_b.holdem.net.policy import (
     HoldemPolicyNetConfig,
     PolicyExample,
     PolicyReplayBuffer,
+    query_policy,
     train_policy_net,
 )
 from paradigm_b.holdem.engine.public_tree import PublicState, build_turn_tree
 from paradigm_b.holdem.engine.space import TurnEndgameSpace
 from paradigm_b.holdem.net.leaf_values import NetLeafValues
-from paradigm_b.core.search.evaluate import leaf_reaches
+from paradigm_b.core.search.evaluate import decision_reaches, leaf_reaches
 from paradigm_b.core.search.policy import StrategyMap
-from paradigm_b.core.search.subgame import SubgameSolver
+from paradigm_b.core.search.subgame import SubgameSolver, WarmStart
 
 NUM_PLAYERS = 2
 
@@ -48,26 +63,40 @@ NUM_PLAYERS = 2
 @dataclass
 class HoldemSelfPlayConfig:
     trajectories_per_iteration: int = 8
+    # ``T``: the iteration the CFR loop finishes at, counting from t_warm.
     search_iterations: int = 40
     river_iterations: int = 60
     depth_limit: int = 1
-    # Algorithm 1 samples the descent leaf uniformly from every CFR iterate when
-    # there is no policy warm start, which is what ``warmup_fraction = 0`` gives.
-    warmup_fraction: float = 0.0
-    # Probability of descending through a uniform-random strategy instead of a
-    # CFR iterate.  Appendix E of the ReBeL paper: *"for all experiments we set
+    # ``t_warm``.  Zero means the algorithm's own no-warm-start branch: pi_0 is
+    # uniform and the loop starts at t = 1.  Anything higher only takes effect
+    # when a policy network is passed to :func:`collect_trajectory` — there is
+    # nothing to warm start *from* otherwise — and then INITIALIZE_POLICY seeds
+    # every decision node in the subgame from theta_pi.
+    warm_start_iterations: int = 0
+    # ``epsilon``.  Appendix E of the ReBeL paper: *"for all experiments we set
     # the probability to explore a random action to eps = 25%"*, so this is the
-    # paper-faithful value and the default here.
+    # paper-faithful value and the default here.  It is applied the way
+    # SAMPLE_LEAF applies it: to one uniformly chosen player, at every node of
+    # the descent, mixing eps of uniform into that player's action
+    # probabilities.  The other player follows the CFR iterate untouched.
     #
     # One measured caveat, so it is not rediscovered the hard way: at a 2,000
-    # label budget this made the online arm *worse*, not better — held-out
-    # aggregate exploitability 35.7 -> 38.5 (``runs/labels-02`` vs
-    # ``runs/fixes-u4000``).  Exploration widens the belief-state distribution,
-    # which pays only once there is enough data to cover the wider space, and
-    # ReBeL's 12M-example buffer has ~6,000x more of it than those runs did.
-    # Set it to 0.0 for deliberately small-budget experiments.
+    # label budget a coarser form of this (both players uniform for the whole
+    # descent) made the online arm *worse*, not better — held-out aggregate
+    # exploitability 35.7 -> 38.5 (``runs/labels-02`` vs ``runs/fixes-u4000``).
+    # Exploration widens the belief-state distribution, which pays only once
+    # there is enough data to cover the wider space, and ReBeL's 12M-example
+    # buffer has ~6,000x more of it than those runs did.  Set it to 0.0 for
+    # deliberately small-budget experiments; it is also 0.0 at test time, which
+    # is what evaluation through ``ContinualResolver`` already gives.
     exploration: float = 0.25
-    cfr: CFRConfig = field(default_factory=CFRConfig.dcfr)
+    # The "(optional)" line of Algorithm 2: record pi_bar at every public state
+    # in G for D_pi.  Costs one extra tree descent plus a PBS encode per
+    # decision node, so callers that train no policy network turn it off rather
+    # than build examples nothing will consume.
+    policy_targets: bool = True
+    # Algorithm 2 is *Linear* CFR-D; see :meth:`CFRConfig.linear_cfr_d`.
+    cfr: CFRConfig = field(default_factory=CFRConfig.linear_cfr_d)
 
 
 @dataclass
@@ -88,10 +117,14 @@ class HoldemReBeLConfig:
 
 @dataclass
 class Example:
+    """One solved belief state: its D_v label, and its D_pi labels beside it."""
+
     features: np.ndarray
     mask: np.ndarray
     values: np.ndarray
-    policy: PolicyExample | None = None
+    # ``for beta in G: add {beta, pi_bar(beta)} to D_pi`` — one entry per
+    # decision node of the subgame that was solved here, not just its root.
+    policies: Tuple[PolicyExample, ...] = ()
     # The board this example was solved on.  Carried so a caller can tell which
     # street produced it — the encoded features contain the board, but recovering
     # it from them is needless work when the sampler already knows.
@@ -177,8 +210,19 @@ def collect_trajectory(
     config: HoldemSelfPlayConfig,
     rng: np.random.Generator,
     reach: Optional[np.ndarray] = None,
+    policy_net: Optional[HoldemPolicyNet] = None,
+    device: str | torch.device = "cpu",
 ) -> List[Example]:
-    """Sample one Algorithm 1 trajectory from ``root`` through the river."""
+    """``REBEL-LINEAR-CFR-D``: one trajectory from ``root`` through the river.
+
+    Each pass of the loop is one ``beta_r``: build its subgame, initialise the
+    policy, run Linear CFR-D to ``T`` with the value network at the depth
+    limit, emit ``{beta_r, v(beta_r)}`` for D_v and ``{beta, pi_bar(beta)}`` for
+    D_pi, then step to the leaf ``SAMPLE_LEAF`` picked out of iteration
+    ``t_sample``.  It ends when the subgame runs to real terminals — on the
+    river there is no depth limit, so ``IS_TERMINAL(beta_r)`` is reached with
+    exact values rather than predicted ones.
+    """
     public = root
     reach = space.initial_reach() if reach is None else np.asarray(reach, float)
     examples: List[Example] = []
@@ -192,35 +236,37 @@ def collect_trajectory(
             config=config.cfr,
             space=space,
         )
-        iterations = (
-            config.search_iterations if has_leaves else config.river_iterations
-        )
+
+        # pi, pi_bar, t_warm = INITIALIZE_POLICY(G, theta_pi)
+        warm_start = initialize_policy(tree, space, reach, config, policy_net, device)
+        warm_iterations = 0 if warm_start is None else warm_start.iterations
+        total = config.search_iterations if has_leaves else config.river_iterations
+        total = max(total, warm_iterations + 1)
+
+        # t_sample ~ linear{t_warm + 1, ..., T}, drawn before the loop so that
+        # SAMPLE_LEAF is called once, at that iteration, against pi_{t-1}.
+        sampled = sample_iteration(warm_iterations, total, rng) if has_leaves else None
+
         solver.solve(
-            reach=reach, iterations=iterations, store_iteration_leaves=has_leaves
+            reach=reach,
+            iterations=total,
+            warm_start=warm_start,
+            capture_strategy_at=sampled,
+            seed_root_value=True,
         )
 
         values = normalise(solver.root_values(), reach, space.pair_correction)
         if values is not None:
-            pbs = space.pbs(public, reach)
-            root = tree.root
-            policy = None
-            if root.is_decision:
-                target = np.zeros((space.num_hands, MAX_ACTIONS), dtype=np.float32)
-                target[:, root.actions] = solver.average_strategy(root)
-                legal = np.zeros(MAX_ACTIONS, dtype=np.float32)
-                legal[list(root.actions)] = 1.0
-                policy = PolicyExample(
-                    features=encode_pbs(pbs),
-                    agent_index=root.player,
-                    legal_mask=legal,
-                    target=target,
-                )
             examples.append(
                 Example(
-                    features=encode_pbs(pbs),
+                    features=encode_pbs(space.pbs(public, reach)),
                     mask=board_mask(tuple(public.board)),
                     values=values,
-                    policy=policy,
+                    policies=(
+                        policy_targets(solver, tree, space, reach)
+                        if config.policy_targets
+                        else ()
+                    ),
                     board=tuple(public.board),
                 )
             )
@@ -228,28 +274,197 @@ def collect_trajectory(
         if not has_leaves:
             return examples
 
-        frontier = _frontier(solver, tree, reach, space, config, rng)
-        chosen = _sample_leaf(frontier, space, rng)
+        chosen = sample_leaf(tree, space, solver.captured_strategy, reach, config, rng)
         if chosen is None:
             return examples
         leaf, reach = chosen
         public = leaf.public
 
 
-def _frontier(solver, tree, reach, space, config: HoldemSelfPlayConfig, rng):
-    if rng.random() < config.exploration:
-        uniform: StrategyMap = {
-            node.public: np.full((space.num_hands, node.num_actions), 1.0 / node.num_actions)
-            for node in tree.decision_nodes()
-        }
-        return leaf_reaches(tree, uniform, reach, space=space)
-    stored = solver.iteration_leaves
-    first = int(len(stored) * config.warmup_fraction)
-    index = int(rng.integers(first, len(stored))) if len(stored) > first else -1
-    return stored[index]
+def sample_iteration(warm_iterations: int, total: int, rng: np.random.Generator) -> int:
+    """``t_sample ~ linear{t_warm + 1, ..., T}``: probability proportional to t.
+
+    The linear weighting is not decoration.  Linear CFR-D weights iteration
+    ``t`` by ``t`` in everything it averages, so late iterates describe the
+    strategy far better than early ones do; sampling the descent uniformly (as
+    Algorithm 1 does, and as this used to) would send a quarter of the
+    trajectory through belief states produced by the first few, near-uniform
+    iterates, and spend the value network's capacity on them.
+    """
+    candidates = np.arange(warm_iterations + 1, total + 1)
+    return int(rng.choice(candidates, p=candidates / candidates.sum()))
 
 
-def _sample_leaf(frontier, space: TurnEndgameSpace, rng):
+def sample_leaf(
+    tree,
+    space: TurnEndgameSpace,
+    strategies: Optional[List[Optional[np.ndarray]]],
+    reach: np.ndarray,
+    config: HoldemSelfPlayConfig,
+    rng: np.random.Generator,
+):
+    """``SAMPLE_LEAF(G, pi_{t-1})``: the leaf the next belief state is rooted at.
+
+    The pseudocode draws one player ``i* ~ unif{1, N}`` and one history
+    ``h ~ beta_r``, then walks down: at each step ``i*`` takes a uniform-random
+    action with probability ``eps`` and both players otherwise follow ``pi``.
+    Because only one player acts at a node, that walk is playing the profile
+
+        i*      :  (1 - eps) * pi + eps * uniform
+        1 - i*  :  pi
+
+    and the leaf it stops at is distributed exactly as that profile's arrival
+    mass.  So the frontier is enumerated under that profile and one leaf drawn
+    in proportion to arrival probability: the same distribution as the walk,
+    with none of its sampling noise.  The ranges are already being propagated
+    for the solve, so there is nothing to gain from following a single history
+    and a lot of variance to lose.
+
+    The returned reach vectors are the ones this profile produces, which is
+    what makes ``beta_h`` the belief state of the play that actually reached
+    it.  ``eps = 0`` recovers pure on-policy descent, which is what evaluation
+    uses.
+    """
+    explorer = int(rng.integers(NUM_PLAYERS))  # i* ~ unif{1, N}
+    profile = exploration_profile(
+        tree, space, strategies, explorer, config.exploration
+    )
+    return _draw_leaf(leaf_reaches(tree, profile, reach, space=space), space, rng)
+
+
+def exploration_profile(
+    tree,
+    space: TurnEndgameSpace,
+    strategies: Optional[List[Optional[np.ndarray]]],
+    explorer: int,
+    epsilon: float,
+) -> StrategyMap:
+    """The profile ``SAMPLE_LEAF`` walks: ``eps`` of uniform, for ``i*`` only."""
+    if strategies is None:  # solve stopped before t_sample; fall back to pi_0
+        strategies = [None] * tree.num_nodes
+    profile: StrategyMap = {}
+    for node in tree.decision_nodes():
+        strategy = strategies[node.index]
+        if strategy is None:
+            strategy = np.full(
+                (space.num_hands, node.num_actions), 1.0 / node.num_actions
+            )
+        if node.player == explorer and epsilon > 0.0:
+            strategy = (1.0 - epsilon) * strategy + epsilon / node.num_actions
+        profile[node.public] = strategy
+    return profile
+
+
+def policy_targets(
+    solver: SubgameSolver, tree, space: TurnEndgameSpace, reach: np.ndarray
+) -> Tuple[PolicyExample, ...]:
+    """``for beta in G: add {beta, pi_bar(beta)} to D_pi``.
+
+    Every decision node of the solved subgame, each paired with the belief
+    state the average strategy itself induces there — not only the root, which
+    would train theta_pi on one public state per solve and leave it unable to
+    warm start anything below the first action.
+    """
+    averages = {
+        node.public: solver.average_strategy(node) for node in tree.decision_nodes()
+    }
+    out: List[PolicyExample] = []
+    for node, node_reach in decision_reaches(tree, averages, reach, space=space):
+        if node_reach.sum(axis=1).min() <= 0.0:
+            continue  # a belief state neither player can reach
+        target = np.zeros((space.num_hands, MAX_ACTIONS), dtype=np.float32)
+        target[:, node.actions] = averages[node.public]
+        legal = np.zeros(MAX_ACTIONS, dtype=np.float32)
+        legal[list(node.actions)] = 1.0
+        out.append(
+            PolicyExample(
+                features=encode_pbs(space.pbs(node.public, node_reach)),
+                agent_index=node.player,
+                legal_mask=legal,
+                target=target,
+            )
+        )
+    return tuple(out)
+
+
+def initialize_policy(
+    tree,
+    space: TurnEndgameSpace,
+    reach: np.ndarray,
+    config: HoldemSelfPlayConfig,
+    policy_net: Optional[HoldemPolicyNet],
+    device: str | torch.device = "cpu",
+) -> Optional[WarmStart]:
+    """``INITIALIZE_POLICY(G, theta_pi)``.
+
+    With no policy network — or with ``t_warm = 0`` — this is the branch the
+    pseudocode spells out in its own comment: pi_0 is uniform, t_warm is 0, and
+    there is nothing to hand the solver, so it returns ``None``.
+
+    With one, every decision node in ``G`` is initialised to theta_pi's
+    prediction for its *own* belief state.  That has to be a top-down pass: the
+    ranges arriving at a node depend on the policy above it, so the network
+    cannot be asked about a node until its ancestors have been set.  Levels are
+    batched, which costs one forward pass per depth of the public tree rather
+    than one per node.
+    """
+    if policy_net is None or config.warm_start_iterations <= 0:
+        return None
+
+    strategies: List[Optional[np.ndarray]] = [None] * tree.num_nodes
+    reaches: List[Optional[np.ndarray]] = [None] * tree.num_nodes
+    level = [(tree.root, np.asarray(reach, dtype=np.float64).copy())]
+
+    while level:
+        decisions = [(node, r) for node, r in level if node.is_decision]
+        if decisions:
+            legal = np.zeros((len(decisions), MAX_ACTIONS), dtype=np.float32)
+            for row, (node, _) in enumerate(decisions):
+                legal[row, list(node.actions)] = 1.0
+            predicted = query_policy(
+                policy_net,
+                np.stack(
+                    [encode_pbs(space.pbs(node.public, r)) for node, r in decisions]
+                ),
+                np.array([node.player for node, _ in decisions], dtype=np.int64),
+                legal,
+                device,
+            )
+            for (node, node_reach), probabilities in zip(decisions, predicted):
+                strategy = probabilities[:, list(node.actions)]
+                totals = strategy.sum(axis=1, keepdims=True)
+                strategies[node.index] = np.where(
+                    totals > 0.0,
+                    strategy / np.where(totals > 0.0, totals, 1.0),
+                    1.0 / node.num_actions,
+                )
+                reaches[node.index] = node_reach
+
+        following = []
+        for node, node_reach in level:
+            if node.is_terminal or node.is_leaf:
+                continue
+            if node.is_chance:
+                for board, child in zip(node.boards, node.children):
+                    child_reach = node_reach * space.deal_mask(board)
+                    if child_reach.sum() > 0.0:
+                        following.append((child, child_reach))
+                continue
+            strategy = strategies[node.index]
+            for j, child in enumerate(node.children):
+                child_reach = node_reach.copy()
+                child_reach[node.player] = node_reach[node.player] * strategy[:, j]
+                following.append((child, child_reach))
+        level = following
+
+    return WarmStart(
+        strategies=strategies,
+        reaches=reaches,
+        iterations=config.warm_start_iterations,
+    )
+
+
+def _draw_leaf(frontier, space: TurnEndgameSpace, rng):
     candidates, weights = [], []
     for leaf, reach in frontier:
         weight = _arrival_probability(reach, space.pair_correction)
@@ -293,9 +508,21 @@ def train(
     for iteration in range(1, config.iterations + 1):
         leaf_values = NetLeafValues(net, space, device=device)
         for _ in range(config.self_play.trajectories_per_iteration):
-            examples = collect_trajectory(leaf_values, space, root, config.self_play, rng)
+            # theta_pi is fed back in, so a run with ``warm_start_iterations``
+            # set warm-starts each solve from the policy it has learned so far.
+            examples = collect_trajectory(
+                leaf_values,
+                space,
+                root,
+                config.self_play,
+                rng,
+                policy_net=policy_net,
+                device=device,
+            )
             buffer.add(examples)
-            policy_buffer.add([example.policy for example in examples if example.policy is not None])
+            policy_buffer.add(
+                [policy for example in examples for policy in example.policies]
+            )
 
         net.train()
         total, updates = 0.0, 0

@@ -49,6 +49,11 @@ from paradigm_b.holdem.arms_common.budget import SpendRecord
 from paradigm_b.holdem.arms_common.evaluation import EvaluationConfig, TestSituation, evaluate_agent
 from paradigm_b.holdem.arms_common.fitting import StudentResult, fit_value_net
 from paradigm_b.holdem.arms_common.storage import PathLike, save_checkpoint
+from paradigm_b.holdem.net.policy import (
+    HoldemPolicyNet,
+    PolicyReplayBuffer,
+    train_policy_net,
+)
 from paradigm_b.holdem.net.value_net import HoldemValueNet
 from paradigm_b.holdem.selfplay import Buffer, Example
 
@@ -105,7 +110,7 @@ def _learner_threads(count: int) -> Iterator[int]:
 
 
 def _clip(batch: ActorBatch, room: int) -> ActorBatch:
-    """The first ``room`` labels of ``batch``."""
+    """The first ``room`` labels of ``batch``, and their policy targets."""
     if room >= len(batch):
         return batch
     return ActorBatch(
@@ -116,6 +121,7 @@ def _clip(batch: ActorBatch, room: int) -> ActorBatch:
         leaf_evaluations=batch.leaf_evaluations,
         solver_calls=batch.solver_calls,
         weight_version=batch.weight_version,
+        policies=batch.policies[:room],
     )
 
 
@@ -144,15 +150,27 @@ def fit_online_student_async(
     spend = SpendRecord()
     history: List[Dict[str, float]] = []
 
+    policy_net: Optional[HoldemPolicyNet] = None
+    policy_optimiser = None
+    policy_buffer = None
+    if config.uses_policy_net:
+        policy_net = HoldemPolicyNet(config.policy_net).to(device)
+        policy_optimiser = torch.optim.Adam(
+            policy_net.parameters(), lr=config.learning_rate
+        )
+        policy_buffer = PolicyReplayBuffer(config.policy_buffer_size)
+
     pool = ActorPool(
         workers=config.actors,
         net=net,
         net_config=config.value_net,
-        self_play=config.self_play,
+        self_play=config.generation_config(),
         situations=config.situations,
         street_mix=config.street_mix,
         seed=config.seed,
         device=config.device,
+        policy_net=policy_net,
+        policy_config=config.policy_net if policy_net is not None else None,
     )
     trajectory_id = 0
     iteration = 0
@@ -186,6 +204,14 @@ def fit_online_student_async(
                                 for i in range(len(batch))
                             ]
                         )
+                        if policy_buffer is not None:
+                            policy_buffer.add(
+                                [
+                                    policy
+                                    for group in batch.policies
+                                    for policy in group
+                                ]
+                            )
                         spend.labels += len(batch)
                         spend.leaf_evaluations += batch.leaf_evaluations
                         spend.solver_calls += batch.solver_calls
@@ -236,9 +262,24 @@ def fit_online_student_async(
                     spend.updates += done
                 spend.training_seconds += time.perf_counter() - training
 
+                # 2b. theta_pi, outside ``update_budget`` — see
+                #     :class:`OnlineStudentConfig`.
+                policy_loss = None
+                if policy_net is not None and config.policy_updates_per_iteration > 0:
+                    policy_loss = train_policy_net(
+                        policy_net,
+                        policy_buffer,
+                        config.policy_updates_per_iteration,
+                        config.batch_size,
+                        config.learning_rate,
+                        rng,
+                        device,
+                        policy_optimiser,
+                    )
+
                 # 3. Let the actors catch up to the learner.
                 if done and spend.updates % config.weight_sync_every < done:
-                    pool.publish(net)
+                    pool.publish(net, policy_net)
 
                 finished = spend.labels >= label_budget and spend.updates >= update_budget
                 record: Dict[str, float] = {
@@ -250,6 +291,8 @@ def fit_online_student_async(
                     "purged": float(purged),
                     "loss": total / max(done, 1),
                 }
+                if policy_loss is not None:
+                    record["policy_loss"] = policy_loss
                 if (
                     tests is not None
                     and evaluation is not None
@@ -276,5 +319,9 @@ def fit_online_student_async(
 
     spend.training_seconds = min(spend.training_seconds, time.perf_counter() - started)
     return StudentResult(
-        net=net, history=history, initial_state=initial_state, spend=spend
+        net=net,
+        history=history,
+        initial_state=initial_state,
+        spend=spend,
+        policy_net=policy_net,
     )

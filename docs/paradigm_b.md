@@ -108,7 +108,7 @@ paradigm_b/
     data/                  situation sampling, exact river labels, bootstrapping
     selfplay.py            ReBeL trajectory collection — used by both arms
     arm1_fixed/            frozen-label regime          -> arms.md
-    arm2_iterative/        ReBeL Algorithm 1            -> arms.md
+    arm2_iterative/        ReBeL Algorithm 2            -> arms.md
     arms_common/           what the two share
     compare/               the head-to-head and the drift probe
   cli/                   leduc.py, holdem.py, compare.py

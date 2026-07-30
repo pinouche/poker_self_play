@@ -68,6 +68,54 @@ def leaf_reaches(
     return out
 
 
+def decision_reaches(
+    tree: PublicTree,
+    strategies: StrategyMap,
+    reach: np.ndarray,
+    space: Optional[HandSpace] = None,
+) -> List[Tuple[PublicNode, np.ndarray]]:
+    """Reach vectors at *every* decision node, descending through them.
+
+    :func:`reaches_at` stops at the states it is asked for, which is what
+    continual re-solving wants; this one keeps going, which is what ReBeL's
+    ``for beta in G: add {beta, pi_bar(beta)} to D_pi`` wants — every public
+    belief state the subgame contains, each with the ranges that arrive there
+    under ``strategies``.
+    """
+    out: List[Tuple[PublicNode, np.ndarray]] = []
+    _descend_decisions(
+        tree.root,
+        np.asarray(reach, dtype=np.float64).copy(),
+        strategies,
+        out,
+        space or LEDUC_SPACE,
+    )
+    return out
+
+
+def _descend_decisions(
+    node: PublicNode,
+    reach: np.ndarray,
+    strategies: StrategyMap,
+    out: List[Tuple[PublicNode, np.ndarray]],
+    space: HandSpace,
+) -> None:
+    if node.is_terminal or node.is_leaf:
+        return
+    if node.is_chance:
+        for board, child in zip(node.boards, node.children):
+            child_reach = reach * space.deal_mask(board)
+            if child_reach.sum() > 0.0:
+                _descend_decisions(child, child_reach, strategies, out, space)
+        return
+    out.append((node, reach))
+    strategy = strategies[node.public]
+    for j, child in enumerate(node.children):
+        child_reach = reach.copy()
+        child_reach[node.player] = reach[node.player] * strategy[:, j]
+        _descend_decisions(child, child_reach, strategies, out, space)
+
+
 def reaches_at(
     tree: PublicTree,
     strategies: StrategyMap,

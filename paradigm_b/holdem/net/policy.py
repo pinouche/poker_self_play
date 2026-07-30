@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -79,6 +80,30 @@ def policy_mse_loss(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tens
     return torch.nn.functional.mse_loss(predicted, target)
 
 
+@torch.no_grad()
+def query_policy(
+    net: HoldemPolicyNet,
+    features: np.ndarray,
+    agent_indices: np.ndarray,
+    legal_masks: np.ndarray,
+    device: str | torch.device = "cpu",
+) -> np.ndarray:
+    """``(N, NUM_COMBOS, MAX_ACTIONS)`` probabilities for a batch of belief states.
+
+    The read side of the network, used by ``INITIALIZE_POLICY`` to warm-start a
+    subgame.  Batched because the initialiser queries a whole level of the
+    public tree at once.
+    """
+    device = torch.device(device)
+    net.to(device).eval()
+    probabilities = net(
+        torch.as_tensor(features, dtype=torch.float32, device=device),
+        torch.as_tensor(agent_indices, dtype=torch.long, device=device),
+        torch.as_tensor(legal_masks, dtype=torch.float32, device=device),
+    )
+    return probabilities.cpu().numpy().astype(np.float64)
+
+
 @dataclass
 class PolicyExample:
     """One searched PBS policy target, stored with linear 8-bit quantisation."""
@@ -87,6 +112,24 @@ class PolicyExample:
     agent_index: int
     legal_mask: np.ndarray
     target: np.ndarray
+
+    def quantised(self) -> "PolicyExample":
+        """The same example with its target already in the buffer's 8-bit form.
+
+        Actors send policy targets to the learner through a queue, and a
+        ``(1326, 9)`` float32 target is 47KB against 12KB quantised — worth the
+        round trip through uint8 when a trajectory carries one of these per
+        decision node.  :meth:`PolicyReplayBuffer.add` accepts either form.
+        """
+        if self.target.dtype == np.uint8:
+            return self
+        quantised = np.rint(np.clip(self.target, 0.0, 1.0) * 255.0).astype(np.uint8)
+        return PolicyExample(
+            features=self.features,
+            agent_index=self.agent_index,
+            legal_mask=self.legal_mask,
+            target=quantised,
+        )
 
 
 class PolicyReplayBuffer:
@@ -104,12 +147,16 @@ class PolicyReplayBuffer:
     def __len__(self) -> int:
         return self.size
 
-    def add(self, examples: list[PolicyExample]) -> None:
+    def add(self, examples: Sequence[PolicyExample]) -> None:
         for example in examples:
             self.features[self._next] = example.features
             self.agent_indices[self._next] = example.agent_index
             self.legal_masks[self._next] = example.legal_mask
-            self.targets[self._next] = np.rint(np.clip(example.target, 0.0, 1.0) * 255.0)
+            self.targets[self._next] = (
+                example.target
+                if example.target.dtype == np.uint8
+                else np.rint(np.clip(example.target, 0.0, 1.0) * 255.0)
+            )
             self._next = (self._next + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
 

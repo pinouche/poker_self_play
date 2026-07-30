@@ -81,6 +81,28 @@ class SubgameSolution:
     iterations: int
 
 
+@dataclass
+class WarmStart:
+    """What ``INITIALIZE_POLICY(G, theta_pi)`` produced, ready to hand to a solve.
+
+    ReBeL's Algorithm 2 does not always start CFR from the uniform policy: when
+    a policy network is available it initialises the subgame's profile to that
+    network's prediction and starts the iteration counter at ``t_warm``, so the
+    warm profile carries the weight ``t_warm`` iterations of search would have
+    earned rather than being immediately averaged away.
+
+    ``strategies`` and ``reaches`` are indexed by ``PublicNode.index`` and hold
+    ``None`` for every node that is not a decision node.  ``reaches`` is needed
+    because CFR's average strategy is reach-weighted: seeding it correctly
+    requires knowing how much of each player's range arrives at each node under
+    pi_0, which the initialiser computed on its way down the tree.
+    """
+
+    strategies: List[Optional[np.ndarray]]
+    reaches: List[Optional[np.ndarray]]
+    iterations: int  # t_warm
+
+
 class SubgameSolver:
     """CFR over ranges on a public tree.
 
@@ -123,6 +145,13 @@ class SubgameSolver:
         # Per-iteration leaf frontiers, when asked for: ReBeL descends into a
         # leaf sampled from a *random* iteration's policy, not the average one.
         self.iteration_leaves: List[List[Tuple[PublicNode, np.ndarray]]] = []
+        # The profile as it stood at the top of ``capture_strategy_at``, i.e.
+        # pi_{t-1} for the sampled iteration t.  Algorithm 2 draws t_sample
+        # *before* the loop and calls SAMPLE_LEAF once, at that iteration, so a
+        # single snapshot is all a descent needs — keeping every iteration's
+        # frontier instead costs a leaf-reach descent and an array per leaf per
+        # iteration, for T-1 frontiers that are thrown away.
+        self.captured_strategy: Optional[List[Optional[np.ndarray]]] = None
         self.gadget_regrets = np.zeros((self.space.num_hands, 2))
         # Values at the root, averaged over iterations: the ReBeL training target.
         self._value_sum = np.zeros((NUM_PLAYERS, self.space.num_hands))
@@ -137,16 +166,49 @@ class SubgameSolver:
         store_iteration_values: bool = False,
         store_iteration_leaves: bool = False,
         gadget: Optional[Gadget] = None,
+        warm_start: Optional[WarmStart] = None,
+        capture_strategy_at: Optional[int] = None,
+        seed_root_value: bool = False,
     ) -> SubgameSolution:
+        """Run CFR in this subgame.
+
+        ``iterations`` is how many iterations to *run*, except when
+        ``warm_start`` is given: then it is read as Algorithm 2's ``T``, the
+        iteration to finish at, and the loop runs ``T - t_warm`` times so that
+        ``t`` covers ``t_warm+1 ... T`` exactly as the pseudocode writes it.
+
+        ``capture_strategy_at`` is Algorithm 2's ``t_sample``: at the top of
+        that iteration the current profile — pi_{t-1}, since regret matching
+        for iteration ``t`` has not run yet — is snapshotted into
+        :attr:`captured_strategy` for the caller's ``SAMPLE_LEAF``.
+
+        ``seed_root_value`` adds the pre-loop ``v(beta_r) = COMPUTE_EV(G,
+        pi_{t_warm})`` term to the value average.  It costs one extra traversal
+        and one extra leaf-evaluator call per solve, and with no warm start it
+        enters the average with weight 1 against a total of ``(T+1)(T+2)/2`` —
+        0.1% at T=40.  It is off by default so that solvers which are not
+        running Algorithm 2 (exact labelling, continual re-solving, the leaf
+        oracles) do not pay for it.
+        """
         reach = self.space.initial_reach() if reach is None else np.asarray(reach, dtype=np.float64)
-        self._store_leaves = store_iteration_leaves
         root_public = self.tree.root.public
+        self.captured_strategy = None
         if gadget is not None:
             self.gadget_regrets = np.zeros((self.space.num_hands, 2))
+        if warm_start is not None:
+            self._apply_warm_start(warm_start)
+            iterations = max(iterations - warm_start.iterations, 0)
+        if seed_root_value:
+            self._seed_root_value(reach)
+        self._store_leaves = store_iteration_leaves
         for _ in range(iterations):
             self.iteration += 1
+            if capture_strategy_at is not None and self.iteration == capture_strategy_at:
+                self.captured_strategy = [
+                    None if s is None else s.copy() for s in self.strategy
+                ]
             self._refresh_strategies()
-            weight = float(self.iteration) if self.config.linear_averaging else 1.0
+            weight = self.config.average_weight(self.iteration)
             self._weight = weight
             self._update_player = (
                 (self.iteration - 1) % NUM_PLAYERS if self.config.alternating else None
@@ -171,6 +233,52 @@ class SubgameSolver:
             root_pbs=self.space.pbs(root_public, reach),
             iterations=self.iteration,
         )
+
+    # --- Algorithm 2's initialisation --------------------------------------
+    def _apply_warm_start(self, warm: WarmStart) -> None:
+        """Adopt pi_0 from a policy network and start counting at ``t_warm``.
+
+        Three things have to line up for the warm profile to *stay* warm.
+
+        The current profile is pi_0 outright.  The accumulated regret is set to
+        ``t_warm * pi_0``: regret matching normalises, so any positive multiple
+        of pi_0 reproduces pi_0 exactly, and the multiple is what decides how
+        many real iterations of contrary evidence it takes to move away from it
+        — scaling by ``t_warm`` makes that cost the same as if the warm profile
+        had genuinely won ``t_warm`` iterations of regret.
+
+        The average strategy is seeded with pi_0 at the weight ``t_warm``
+        iterations would have earned, reach-weighted like every other
+        contribution to it, so ``pi_bar`` starts at pi_0 rather than at zero.
+        """
+        warm_iterations = max(int(warm.iterations), 0)
+        weight = self.config.initial_average_weight(warm_iterations)
+        for node in self.tree.decision_nodes():
+            strategy = warm.strategies[node.index]
+            if strategy is None:
+                continue
+            strategy = np.asarray(strategy, dtype=np.float64)
+            self.strategy[node.index] = strategy.copy()
+            self.regrets[node.index] = strategy * float(warm_iterations)
+            node_reach = warm.reaches[node.index]
+            own = (
+                np.ones((self.space.num_hands, 1))
+                if node_reach is None
+                else np.asarray(node_reach, dtype=np.float64)[node.player][:, None]
+            )
+            self.strategy_sum[node.index] = weight * own * strategy
+        self.iteration = warm_iterations
+
+    def _seed_root_value(self, reach: np.ndarray) -> None:
+        """Algorithm 2's pre-loop ``v(beta_r) = COMPUTE_EV(G, pi_{t_warm})``.
+
+        The value average starts from the expected value of the initial policy
+        — uniform with no warm start, the policy network's profile with one —
+        carrying the weight the ``(t/(t+2))`` recursion assigns it.
+        """
+        weight = self.config.initial_average_weight(self.iteration)
+        self._value_sum += weight * self.evaluate(reach, average=False)
+        self._value_weight += weight
 
     def evaluate(
         self, reach: np.ndarray | None = None, average: bool = True

@@ -222,11 +222,14 @@ def _self_play_source(
     rng = np.random.default_rng(seed)
     leaf_values = CountingLeafValues(NetLeafValues(teacher, device=device), spend)
     situations = replace(config.situations, excluded_boards=excluded_boards)
+    # The artifact stores value labels only, so Algorithm 2's optional D_pi
+    # line is skipped rather than building policy targets nothing will read.
+    self_play = replace(config.self_play, policy_targets=False)
     features, masks, targets = [], [], []
     while len(features) < count:
         space, root, reach, _ = sample_mixed_situation(rng, situations, mix)
         for example in collect_trajectory(
-            leaf_values, space, root, config.self_play, rng, reach=reach
+            leaf_values, space, root, self_play, rng, reach=reach
         ):
             features.append(example.features)
             masks.append(example.mask)

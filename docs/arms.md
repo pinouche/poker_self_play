@@ -18,10 +18,12 @@ written to disk and frozen. A **fresh** student is then trained on the file
 alone — no solver, no teacher. Arm 1's turn and flop labels are permanently the
 opinion of one early network.
 
-**Arm 2 (`arm2_iterative/`)** is ReBeL Algorithm 1. Sample a situation, search with
-the **current** network at the leaves, record what search concluded, take
-gradient steps, repeat. Labels improve as the network does; stale ones age out
-of the replay buffer. Nothing is ever frozen.
+**Arm 2 (`arm2_iterative/`)** is ReBeL Algorithm 2 (Linear CFR-D data
+generation). Sample a situation, search with the **current** network at the
+leaves, record what search concluded, take gradient steps, repeat. Labels
+improve as the network does; stale ones age out of the replay buffer. Nothing
+is ever frozen. `selfplay.py` maps the pseudocode line by line — see the table
+in its module docstring.
 
 ## Files
 
@@ -41,7 +43,7 @@ arm1_fixed/       arm 1
   student.py        training a fresh student from it, solver never invoked
 arm2_iterative/   arm 2
   journal.py        append-only record of every label the loop produced
-  student.py        Algorithm 1, spending its budgets exactly
+  student.py        Algorithm 2, spending its budgets exactly
 compare/          the head-to-head itself, which is neither arm
   experiment.py     the runner: holds seeds, boards and budgets equal
   relabel.py        the staleness probe
@@ -89,7 +91,9 @@ regenerate.
 | `--flop-depth-limit` | 1 | flop lookahead when scoring; 2 is ~170x the work |
 | `--eval-every` | off | mid-run scoring cadence, for a learning curve |
 | `--checkpoint-every` | 10 | arm 2 student snapshots |
-| `--exploration` | 0.25 | arm 2: chance of descending a uniform-random strategy (appendix E's ε) |
+| `--exploration` | 0.25 | arm 2: SAMPLE_LEAF's ε — chance the one sampled player takes a random action at each descent step (appendix E) |
+| `--warm-start-iterations` | 0 | arm 2: `t_warm`; initialise each subgame's policy from θ_π instead of uniform |
+| `--policy-updates-per-iteration` | 0 | arm 2: gradient steps on θ_π, outside `--update-budget` |
 | `--purge-after-iterations` | off | arm 2: drop the oldest half of the buffer once, at this iteration |
 | `--actors` | 0 | arm 2: parallel generator processes; 0 = reproducible synchronous loop |
 | `--weight-sync-every` | 50 | gradient steps between publishing weights to actors |

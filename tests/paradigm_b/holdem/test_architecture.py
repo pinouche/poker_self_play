@@ -22,17 +22,26 @@ from paradigm_b.holdem.net.policy import (
     PolicyReplayBuffer,
     train_policy_net,
 )
+from paradigm_b.core.cfr.tabular_cfr import CFRConfig
+from paradigm_b.core.search.subgame import SubgameSolver
 from paradigm_b.holdem.selfplay import (
     HoldemReBeLConfig,
     HoldemSelfPlayConfig,
     _arrival_probability,
     collect_trajectory,
+    exploration_profile,
+    initialize_policy,
+    sample_iteration,
+    sample_leaf,
     train,
 )
 from paradigm_b.holdem.data.sampling import SituationConfig, sample_situation
 from paradigm_b.holdem.engine.space import TurnEndgameSpace
 from paradigm_b.holdem.net.leaf_values import ZeroLeafValues
-from paradigm_b.holdem.engine.public_tree import PublicState as HoldemPublicState
+from paradigm_b.holdem.engine.public_tree import (
+    PublicState as HoldemPublicState,
+    build_turn_tree,
+)
 from paradigm_b.holdem.engine.betting import BET_HALF, CALL, Betting
 
 
@@ -106,21 +115,41 @@ def test_holdem_policy_is_per_hand_and_normalised_over_legal_actions():
     assert torch.count_nonzero(probabilities[..., 5:]) == 0
 
 
-def test_holdem_self_play_records_a_quantizable_root_policy_target():
+def test_holdem_self_play_records_a_quantizable_policy_target_per_public_state():
+    """``for beta in G: add {beta, pi_bar(beta)} to D_pi`` — every state, not the root."""
     public = HoldemPublicState(betting=Betting(), board=(51, 47, 22, 6))
+    space = TurnEndgameSpace(public.board)
+    tree = build_turn_tree(public, depth_limit=1)
     examples = collect_trajectory(
         ZeroLeafValues(),
-        TurnEndgameSpace(public.board),
+        space,
         public,
         HoldemSelfPlayConfig(search_iterations=2, river_iterations=2),
         np.random.default_rng(0),
     )
 
-    policy = examples[0].policy
-    assert policy is not None
-    assert policy.target.shape == (NUM_COMBOS, 9)
-    np.testing.assert_allclose(policy.target.sum(axis=-1), 1.0)
-    assert set(np.flatnonzero(policy.legal_mask)) == set(public.legal_actions())
+    policies = examples[0].policies
+    assert 1 < len(policies) <= len(tree.decision_nodes())
+    assert {policy.agent_index for policy in policies} == {0, 1}
+    for policy in policies:
+        assert policy.target.shape == (NUM_COMBOS, 9)
+        np.testing.assert_allclose(policy.target.sum(axis=-1), 1.0)
+    assert set(np.flatnonzero(policies[0].legal_mask)) == set(public.legal_actions())
+
+
+def test_policy_targets_are_dropped_when_no_policy_network_consumes_them():
+    public = HoldemPublicState(betting=Betting(), board=(51, 47, 22, 6))
+    examples = collect_trajectory(
+        ZeroLeafValues(),
+        TurnEndgameSpace(public.board),
+        public,
+        HoldemSelfPlayConfig(
+            search_iterations=2, river_iterations=2, policy_targets=False
+        ),
+        np.random.default_rng(0),
+    )
+
+    assert all(example.policies == () for example in examples)
 
 
 def test_holdem_self_play_follows_a_sampled_flop_through_every_street():
@@ -136,7 +165,6 @@ def test_holdem_self_play_follows_a_sampled_flop_through_every_street():
         HoldemSelfPlayConfig(
             search_iterations=1,
             river_iterations=1,
-            warmup_fraction=0.0,
             exploration=0.0,
         ),
         rng,
@@ -179,14 +207,183 @@ def test_sampling_rejects_non_postflop_board_sizes(board_cards):
         )
 
 
-def test_holdem_self_play_defaults_to_algorithm_one_sampling():
+def test_holdem_self_play_defaults_to_algorithm_two_settings():
     config = HoldemSelfPlayConfig()
-    # No policy warm start, so Algorithm 1 samples the descent leaf uniformly
-    # over every CFR iterate.
-    assert config.warmup_fraction == 0.0
+    # "t_warm = 0 and pi_0 is uniform if no warm start" — the branch of
+    # INITIALIZE_POLICY this repo runs by default.
+    assert config.warm_start_iterations == 0
     # Appendix E: "for all experiments we set the probability to explore a
     # random action to eps = 25%".
     assert config.exploration == 0.25
+    # Algorithm 2 is *Linear* CFR-D: regret weighted by t, both averages
+    # weighted by t+1, and no separate discounting of the averages on top.
+    assert config.cfr == CFRConfig.linear_cfr_d()
+    assert (config.cfr.regret_alpha, config.cfr.regret_beta) == (1.0, 1.0)
+    assert config.cfr.strategy_gamma is None
+    assert config.cfr.linear_averaging and config.cfr.average_offset == 1
+
+
+def test_descent_iteration_is_sampled_proportionally_to_t():
+    """``t_sample ~ linear{t_warm+1, ..., T}``, not uniform."""
+    rng = np.random.default_rng(0)
+    drawn = np.array([sample_iteration(0, 4, rng) for _ in range(20_000)])
+
+    assert set(np.unique(drawn)) == {1, 2, 3, 4}
+    frequencies = np.array([(drawn == t).mean() for t in (1, 2, 3, 4)])
+    np.testing.assert_allclose(frequencies, np.array([1, 2, 3, 4]) / 10, atol=0.01)
+
+
+def test_sampled_iteration_never_precedes_the_warm_start():
+    rng = np.random.default_rng(0)
+    drawn = {sample_iteration(6, 8, rng) for _ in range(200)}
+
+    assert drawn == {7, 8}
+
+
+def _deterministic_profile(tree, space):
+    """A strategy list that always plays the first legal action."""
+    strategies = [None] * tree.num_nodes
+    for node in tree.decision_nodes():
+        strategy = np.zeros((space.num_hands, node.num_actions))
+        strategy[:, 0] = 1.0
+        strategies[node.index] = strategy
+    return strategies
+
+
+def test_sample_leaf_explores_with_one_player_not_both():
+    """SAMPLE_LEAF mixes eps of uniform into i* only; 1 - i* follows pi exactly."""
+    public = HoldemPublicState(betting=Betting(), board=(51, 47, 22, 6))
+    space = TurnEndgameSpace(public.board)
+    tree = build_turn_tree(public, depth_limit=1)
+    strategies = _deterministic_profile(tree, space)
+
+    profile = exploration_profile(tree, space, strategies, explorer=0, epsilon=0.25)
+
+    for node in tree.decision_nodes():
+        played = profile[node.public]
+        if node.player == 0:
+            expected = 0.75 * strategies[node.index] + 0.25 / node.num_actions
+            np.testing.assert_allclose(played, expected)
+        else:
+            np.testing.assert_array_equal(played, strategies[node.index])
+        np.testing.assert_allclose(played.sum(axis=1), 1.0)
+
+
+def test_sample_leaf_dilutes_one_players_range_and_leaves_the_others_alone():
+    """The consequence of exploring for i* only: one range widens, not both."""
+    public = HoldemPublicState(betting=Betting(), board=(51, 47, 22, 6))
+    space = TurnEndgameSpace(public.board)
+    tree = build_turn_tree(public, depth_limit=1)
+    strategies = _deterministic_profile(tree, space)
+    reach = space.initial_reach()
+    exploring = HoldemSelfPlayConfig(exploration=0.25)
+    on_policy = HoldemSelfPlayConfig(exploration=0.0)
+
+    explorers = set()
+    for seed in range(30):
+        _, leaf_reach = sample_leaf(
+            tree, space, strategies, reach, exploring, np.random.default_rng(seed)
+        )
+        # Both ranges lose the combos the dealt river uses, so the two masses
+        # are only comparable to each other — and one of them is strictly
+        # smaller, because exactly one player deviated from the deterministic
+        # profile with probability eps.
+        masses = leaf_reach.sum(axis=1)
+        assert masses.min() < masses.max()
+        explorers.add(int(np.argmin(masses)))
+
+    assert explorers == {0, 1}  # i* ~ unif{1, N}, redrawn every subgame
+
+    for seed in range(5):
+        _, leaf_reach = sample_leaf(
+            tree, space, strategies, reach, on_policy, np.random.default_rng(seed)
+        )
+        masses = leaf_reach.sum(axis=1)
+        assert masses[0] == pytest.approx(masses[1])
+
+
+def test_initialize_policy_is_uniform_and_unweighted_without_a_policy_network():
+    """"t_warm = 0 and pi_0 is uniform if no warm start"."""
+    public = HoldemPublicState(betting=Betting(), board=(51, 47, 22, 6))
+    space = TurnEndgameSpace(public.board)
+    tree = build_turn_tree(public, depth_limit=1)
+
+    assert (
+        initialize_policy(
+            tree, space, space.initial_reach(), HoldemSelfPlayConfig(), None
+        )
+        is None
+    )
+    # A network on its own is not enough: t_warm has to be asked for.
+    assert (
+        initialize_policy(
+            tree,
+            space,
+            space.initial_reach(),
+            HoldemSelfPlayConfig(warm_start_iterations=0),
+            HoldemPolicyNet(HoldemPolicyNetConfig(hidden_dim=8, num_hidden_layers=1)),
+        )
+        is None
+    )
+
+
+def test_initialize_policy_warm_starts_every_decision_node_from_theta_pi():
+    public = HoldemPublicState(betting=Betting(), board=(51, 47, 22, 6))
+    space = TurnEndgameSpace(public.board)
+    tree = build_turn_tree(public, depth_limit=1)
+    policy_net = HoldemPolicyNet(HoldemPolicyNetConfig(hidden_dim=8, num_hidden_layers=1))
+    config = HoldemSelfPlayConfig(warm_start_iterations=7)
+
+    warm = initialize_policy(tree, space, space.initial_reach(), config, policy_net)
+
+    assert warm.iterations == 7
+    assert all(warm.strategies[node.index] is not None for node in tree.decision_nodes())
+    for node in tree.decision_nodes():
+        strategy = warm.strategies[node.index]
+        assert strategy.shape == (space.num_hands, node.num_actions)
+        np.testing.assert_allclose(strategy.sum(axis=1), 1.0)
+        # Each node was asked about its own belief state, so the ranges the
+        # initialiser carried down are the ones pi_0 itself produces.
+        assert warm.reaches[node.index].shape == (2, space.num_hands)
+
+    # Regret matching on the seeded regrets has to give pi_0 straight back, or
+    # the first CFR iteration throws the warm start away.
+    solver = SubgameSolver(
+        tree, leaf_value_fn=ZeroLeafValues(), config=config.cfr, space=space
+    )
+    solver.solve(reach=space.initial_reach(), iterations=7, warm_start=warm)
+    assert solver.iteration == 7  # t starts at t_warm, so this ran nothing
+    for node in tree.decision_nodes():
+        np.testing.assert_allclose(
+            solver.current_strategy(node), warm.strategies[node.index]
+        )
+        # The average is reach-weighted, so it only reproduces pi_0 for the
+        # hands that can actually be held here — the board blocks the rest, and
+        # a zero-reach row falls back to uniform as it always does.
+        held = warm.reaches[node.index][node.player] > 0.0
+        np.testing.assert_allclose(
+            solver.average_strategy(node)[held], warm.strategies[node.index][held]
+        )
+
+
+def test_root_value_average_follows_the_linear_recursion():
+    """``v <- (t/(t+2))*v + (2/(t+2))*EV(pi_t)``, seeded with ``EV(pi_0)``."""
+    public = HoldemPublicState(betting=Betting(), board=(51, 47, 22, 6))
+    space = TurnEndgameSpace(public.board)
+    tree = build_turn_tree(public, depth_limit=None)
+    reach = space.initial_reach()
+    solver = SubgameSolver(tree, config=CFRConfig.linear_cfr_d(), space=space)
+
+    solver.solve(
+        reach=reach, iterations=6, store_iteration_values=True, seed_root_value=True
+    )
+
+    replayed = SubgameSolver(tree, config=CFRConfig.linear_cfr_d(), space=space)
+    expected = replayed.evaluate(reach, average=False)  # COMPUTE_EV(G, pi_0)
+    for t, values in enumerate(solver.iteration_values, start=1):
+        expected = (t / (t + 2)) * expected + (2 / (t + 2)) * values
+
+    np.testing.assert_allclose(solver.root_values(), expected)
 
 
 def test_leaf_arrival_probability_excludes_overlapping_private_hands():

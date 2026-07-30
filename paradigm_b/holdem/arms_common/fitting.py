@@ -16,7 +16,7 @@ tell which from the outside.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -80,6 +80,10 @@ class StudentResult:
     history: List[Dict[str, float]]
     initial_state: Dict[str, torch.Tensor]
     spend: SpendRecord = field(default_factory=SpendRecord)
+    # theta_pi, when the arm ran one.  Returned beside the value network rather
+    # than attached to it: assigning a module to ``net`` would register it, and
+    # the two arms' state dicts have to stay key-for-key comparable.
+    policy_net: Optional[nn.Module] = None
 
     @property
     def labels(self) -> int:

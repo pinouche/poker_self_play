@@ -19,7 +19,7 @@ exactly rather than estimated. Stages 0–3 are built and validated; stage 4
 Inside paradigm B, one open question has its own experiment: **is a labelled
 dataset a reusable asset, or do labels go stale?** Two arms run head to head at
 equal budgets — *arm 1* labels the world once and freezes it, *arm 2* is ReBeL
-Algorithm 1 and never freezes anything.
+Algorithm 2 and never freezes anything.
 
 ## Layout
 
@@ -30,7 +30,7 @@ paradigm_b/
   leduc/            stages 0-3: the machine, proved correct on a toy game
   holdem/           stage 4: real cards, 1,326-combo ranges
     arm1_fixed/     (2) frozen dataset             -> docs/arms.md
-    arm2_iterative/ (3) ReBeL Algorithm 1          -> docs/arms.md
+    arm2_iterative/ (3) ReBeL Algorithm 2          -> docs/arms.md
   cli/              leduc.py, holdem.py, compare.py
 common/         cards, hand evaluation, and the neural primitives both share
 docs/           the write-ups

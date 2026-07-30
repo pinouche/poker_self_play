@@ -67,9 +67,27 @@ def _add_compare_args(parser: argparse.ArgumentParser) -> None:
         "--exploration",
         type=float,
         default=0.25,
-        help="arm 2: probability of descending through a uniform-random "
-        "strategy instead of a CFR iterate (ReBeL appendix E's eps = 25%%).  "
-        "Measured worse at a 2,000-label budget; set 0.0 for small runs",
+        help="arm 2: SAMPLE_LEAF's eps — probability that the one sampled "
+        "player takes a uniform-random action at each step of the descent "
+        "(ReBeL appendix E's eps = 25%%).  Measured worse at a 2,000-label "
+        "budget; set 0.0 for small runs",
+    )
+    parser.add_argument(
+        "--warm-start-iterations",
+        type=int,
+        default=0,
+        help="arm 2: t_warm — initialise each subgame's policy from the policy "
+        "network and start CFR's counter here instead of at 0.  Needs a policy "
+        "network, so it implies --policy-updates-per-iteration",
+    )
+    parser.add_argument(
+        "--policy-updates-per-iteration",
+        type=int,
+        default=0,
+        help="arm 2: gradient steps on theta_pi per iteration, from the D_pi "
+        "targets search produces.  Off by default: these steps are outside "
+        "--update-budget, so a non-zero value stops the two arms being an "
+        "equal-compute comparison",
     )
     parser.add_argument(
         "--purge-after-iterations",
@@ -199,7 +217,19 @@ def run_compare(args: argparse.Namespace) -> None:
             eval_every=args.eval_every,
         ),
         iterative=OnlineStudentConfig(
-            self_play=HoldemSelfPlayConfig(exploration=args.exploration),
+            self_play=HoldemSelfPlayConfig(
+                exploration=args.exploration,
+                warm_start_iterations=args.warm_start_iterations,
+            ),
+            policy_updates_per_iteration=(
+                args.policy_updates_per_iteration
+                if args.policy_updates_per_iteration > 0
+                or args.warm_start_iterations <= 0
+                # A warm start needs a policy network that is actually being
+                # trained; warm-starting from an untouched random one would be
+                # strictly worse than the uniform policy it replaces.
+                else args.updates_per_iteration
+            ),
             actors=args.actors,
             learner_threads=args.learner_threads,
             weight_sync_every=args.weight_sync_every,

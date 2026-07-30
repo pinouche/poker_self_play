@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -65,6 +65,11 @@ import torch
 from paradigm_b.holdem.arms_common.situations import StreetMix, sample_mixed_situation
 from paradigm_b.holdem.data.sampling import SituationConfig
 from paradigm_b.holdem.net.leaf_values import NetLeafValues
+from paradigm_b.holdem.net.policy import (
+    HoldemPolicyNet,
+    HoldemPolicyNetConfig,
+    PolicyExample,
+)
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
 from paradigm_b.holdem.selfplay import Example, HoldemSelfPlayConfig, collect_trajectory
 
@@ -80,6 +85,12 @@ class ActorBatch:
     leaf_evaluations: int
     solver_calls: int
     weight_version: int
+    # D_pi, grouped per label so that clipping a batch against the label budget
+    # drops the right policy targets with it.  Empty unless the run trains
+    # theta_pi; the targets are quantised before they are sent, because a
+    # trajectory carries one per decision node and they are four times the size
+    # of a value label each.
+    policies: List[Tuple[PolicyExample, ...]] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.features)
@@ -113,7 +124,7 @@ class SharedWeights:
     rare relative to solving.
     """
 
-    def __init__(self, net: HoldemValueNet) -> None:
+    def __init__(self, net: torch.nn.Module) -> None:
         self.tensors: Dict[str, torch.Tensor] = {
             name: value.detach().cpu().clone().share_memory_()
             for name, value in net.state_dict().items()
@@ -121,7 +132,7 @@ class SharedWeights:
         self.version = mp.Value("i", 0)
         self.lock = mp.Lock()
 
-    def publish(self, net: HoldemValueNet) -> int:
+    def publish(self, net: torch.nn.Module) -> int:
         state = net.state_dict()
         with self.lock:
             for name, tensor in self.tensors.items():
@@ -129,7 +140,7 @@ class SharedWeights:
             self.version.value += 1
             return self.version.value
 
-    def load_into(self, net: HoldemValueNet) -> int:
+    def load_into(self, net: torch.nn.Module) -> int:
         with self.lock:
             version = self.version.value
             net.load_state_dict({k: v.clone() for k, v in self.tensors.items()})
@@ -147,8 +158,16 @@ def actor_loop(
     street_mix: StreetMix,
     seed: int,
     device: str,
+    shared_policy: Optional[SharedWeights] = None,
+    policy_config: Optional[HoldemPolicyNetConfig] = None,
 ) -> None:
-    """One actor: pull weights, run Algorithm 1, push labels, repeat."""
+    """One actor: pull weights, run Algorithm 2, push labels, repeat.
+
+    When the run trains theta_pi the actor holds a second network, synced the
+    same way, because ``INITIALIZE_POLICY`` needs it *while generating* — a
+    warm start read from a policy the learner published ten thousand steps ago
+    would warm-start search from a stale profile.
+    """
     torch.set_num_threads(1)  # actors are parallel; don't fight over cores
     rng = np.random.default_rng(seed + worker_index)
     net = HoldemValueNet(net_config)
@@ -156,14 +175,31 @@ def actor_loop(
     net.eval()
     leaves = _CountingLeaves(NetLeafValues(net, device=device))
 
+    policy_net: Optional[HoldemPolicyNet] = None
+    policy_version = -1
+    if shared_policy is not None and policy_config is not None:
+        policy_net = HoldemPolicyNet(policy_config)
+        policy_version = shared_policy.load_into(policy_net)
+        policy_net.eval()
+
     while not stop.is_set():
         if shared.version.value != version:
             version = shared.load_into(net)
             net.eval()
+        if policy_net is not None and shared_policy.version.value != policy_version:
+            policy_version = shared_policy.load_into(policy_net)
+            policy_net.eval()
 
         space, root, reach, _ = sample_mixed_situation(rng, situations, street_mix)
         examples: Sequence[Example] = collect_trajectory(
-            leaves, space, root, self_play, rng, reach=reach
+            leaves,
+            space,
+            root,
+            self_play,
+            rng,
+            reach=reach,
+            policy_net=policy_net,
+            device=device,
         )
         if not examples:
             continue
@@ -176,6 +212,9 @@ def actor_loop(
             leaf_evaluations=leaf_evaluations,
             solver_calls=solver_calls,
             weight_version=version,
+            policies=[
+                tuple(policy.quantised() for policy in e.policies) for e in examples
+            ],
         )
         while not stop.is_set():
             try:
@@ -199,6 +238,8 @@ class ActorPool:
         seed: int,
         device: str = "cpu",
         queue_size: int = 64,
+        policy_net: Optional[HoldemPolicyNet] = None,
+        policy_config: Optional[HoldemPolicyNetConfig] = None,
     ) -> None:
         if mp.parent_process() is not None:
             raise RuntimeError(
@@ -210,6 +251,7 @@ class ActorPool:
         context = mp.get_context("spawn")
         self.workers = workers
         self.shared = SharedWeights(net)
+        self.shared_policy = None if policy_net is None else SharedWeights(policy_net)
         self.queue: mp.Queue = context.Queue(maxsize=queue_size)
         self.stop = context.Event()
         self.processes = [
@@ -226,6 +268,8 @@ class ActorPool:
                     street_mix,
                     seed,
                     device,
+                    self.shared_policy,
+                    policy_config,
                 ),
                 daemon=True,
             )
@@ -237,8 +281,11 @@ class ActorPool:
             process.start()
         return self
 
-    def publish(self, net: HoldemValueNet) -> int:
-        return self.shared.publish(net)
+    def publish(self, net: HoldemValueNet, policy_net: Optional[HoldemPolicyNet] = None) -> int:
+        version = self.shared.publish(net)
+        if policy_net is not None and self.shared_policy is not None:
+            self.shared_policy.publish(policy_net)
+        return version
 
     def drain(self, timeout: float = 0.1, limit: int = 256) -> List[ActorBatch]:
         """Whatever the actors have produced; blocks briefly if nothing is ready."""
