@@ -18,6 +18,11 @@ steps depends on process scheduling. The synchronous loop in ``student.py``
 remains the one the fixed-vs-iterative comparison uses, because that comparison
 rests on both arms being deterministic given a seed.
 
+**The learner is held to a share of the cores.**  Actors pin themselves to one
+thread each, so a learner left on torch's default pool would run its backward
+pass across every core while all of them were already busy.  See
+:func:`learner_thread_count`.
+
 **Labels count when accepted, not when generated.**  Actors are stopped on the
 label that hits the cap, and anything already in flight is dropped rather than
 trained on. So the arm is charged for exactly ``label_budget`` labels — but a
@@ -28,9 +33,11 @@ the budget drift with the worker count, which would be worse.
 
 from __future__ import annotations
 
+import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -44,6 +51,57 @@ from paradigm_b.holdem.arms_common.fitting import StudentResult, fit_value_net
 from paradigm_b.holdem.arms_common.storage import PathLike, save_checkpoint
 from paradigm_b.holdem.net.value_net import HoldemValueNet
 from paradigm_b.holdem.selfplay import Buffer, Example
+
+
+def learner_thread_count(actors: int, requested: Optional[int] = None) -> int:
+    """How many threads the learner should take when ``actors`` are running.
+
+    Actors call ``torch.set_num_threads(1)``; the learner never did, so torch
+    sized its intra-op pool from the whole machine and every gradient step ran
+    a backward pass across all cores while eight actor processes were already
+    on them.  The oversubscription costs both sides — the learner's threads
+    spend their slice descheduling, and the actors lose the cores underneath
+    them mid-solve.
+
+    Leaving the learner the cores the actors are not using is the conservative
+    fix: it never takes a core an actor was counting on, and on the usual
+    ``actors < cores`` setting it still gets several.
+
+    Measured, 8 actors / xlarge net / 250 labels / 400 updates, medians of
+    three runs on a 16-logical-core M4 Max — the wall clock moves little
+    because these runs are generation-bound, but the learner's own time is
+    where the contention was, and it is unambiguous:
+
+    ====== ========== ============== ========
+    threads  wall      learner time   speedup
+    ====== ========== ============== ========
+    16      99.4s      87.9s          1.00x
+    8       92.1s      67.8s          1.08x
+    1       88.6s      39.6s          1.12x
+    ====== ========== ============== ========
+
+    So ``cpu_count - actors`` is the adaptive default, and it is most of the
+    win.  One thread measured slightly better still, because this machine's
+    16 logical cores are 12 performance plus 4 efficiency and eight actors
+    have already taken the cores worth having — a distinction no portable
+    formula can see.  Pass ``learner_threads=1`` for generation-bound runs;
+    raise it when the update budget is large enough that the learner, not the
+    actors, is the thing waiting.
+    """
+    if requested is not None:
+        return max(1, int(requested))
+    return max(1, (os.cpu_count() or 1) - max(actors, 0))
+
+
+@contextmanager
+def _learner_threads(count: int) -> Iterator[int]:
+    """Hold the learner to ``count`` threads, restoring the previous setting."""
+    previous = torch.get_num_threads()
+    torch.set_num_threads(count)
+    try:
+        yield count
+    finally:
+        torch.set_num_threads(previous)
 
 
 def _clip(batch: ActorBatch, room: int) -> ActorBatch:
@@ -100,8 +158,12 @@ def fit_online_student_async(
     iteration = 0
     started = time.perf_counter()
 
+    threads = learner_thread_count(
+        config.actors, getattr(config, "learner_threads", None)
+    )
+
     try:
-        with pool:
+        with _learner_threads(threads), pool:
             while spend.labels < label_budget or spend.updates < update_budget:
                 iteration += 1
 

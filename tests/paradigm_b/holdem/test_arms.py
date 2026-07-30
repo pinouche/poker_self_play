@@ -790,6 +790,43 @@ def test_the_async_loop_spends_both_budgets_exactly(tmp_path):
     assert len(journal) == 23
 
 
+def test_the_learner_leaves_the_actors_their_cores():
+    """Actors pin to one thread each; the learner must not claim all of them."""
+    import os
+
+    from paradigm_b.holdem.arm2_iterative.async_student import learner_thread_count
+
+    cores = os.cpu_count() or 1
+    assert learner_thread_count(actors=8) == max(1, cores - 8)
+    # More actors than cores must still leave the learner able to run.
+    assert learner_thread_count(actors=cores + 4) == 1
+    # An explicit request wins, and is still clamped to something runnable.
+    assert learner_thread_count(actors=8, requested=3) == 3
+    assert learner_thread_count(actors=8, requested=0) == 1
+
+
+def test_the_async_loop_restores_the_thread_setting_it_found():
+    """A run must not leave the process's torch config changed behind it."""
+    before = torch.get_num_threads()
+    fit_online_student(
+        OnlineStudentConfig(
+            trajectories_per_iteration=1,
+            updates_per_iteration=2,
+            batch_size=4,
+            self_play=HoldemSelfPlayConfig(search_iterations=2, river_iterations=2),
+            situations=SituationConfig(board_cards=5),
+            value_net=TINY_NET,
+            actors=2,
+            learner_threads=1,
+        ),
+        label_budget=2,
+        update_budget=2,
+        net=HoldemValueNet(TINY_NET),
+        rng=np.random.default_rng(0),
+    )
+    assert torch.get_num_threads() == before
+
+
 def test_actors_zero_keeps_the_reproducible_synchronous_path():
     """The comparison depends on determinism, so 0 must stay the default."""
     assert OnlineStudentConfig().actors == 0

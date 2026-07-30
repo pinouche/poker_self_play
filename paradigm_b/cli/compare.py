@@ -86,7 +86,17 @@ def _add_compare_args(parser: argparse.ArgumentParser) -> None:
         default=0,
         help="arm 2: actor processes generating trajectories in parallel.  0 "
         "keeps the reproducible synchronous loop, which is what a controlled "
-        "comparison wants; higher is much faster but not bit-reproducible",
+        "comparison wants; higher is much faster but not bit-reproducible.  "
+        "8 is the measured knee on a 16-logical-core M4 Max (4.8x; 16 actors "
+        "buy only 18%% more for double the processes)",
+    )
+    parser.add_argument(
+        "--learner-threads",
+        type=int,
+        default=None,
+        help="arm 2: threads the learner's gradient steps may use.  Default "
+        "leaves it the cores the actors are not on (cpu_count - actors); "
+        "ignored when --actors is 0",
     )
     parser.add_argument(
         "--weight-sync-every",
@@ -191,6 +201,7 @@ def run_compare(args: argparse.Namespace) -> None:
         iterative=OnlineStudentConfig(
             self_play=HoldemSelfPlayConfig(exploration=args.exploration),
             actors=args.actors,
+            learner_threads=args.learner_threads,
             weight_sync_every=args.weight_sync_every,
             purge_after_iterations=args.purge_after_iterations,
             purge_fraction=args.purge_fraction,

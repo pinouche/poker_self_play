@@ -26,19 +26,18 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from paradigm_b.core.cfr.tabular_cfr import CFRConfig
-from paradigm_b.holdem.engine.combos import CARD_IN_COMBO, COMBO_CARDS, NUM_COMBOS, board_mask
+from paradigm_b.holdem.engine.combos import (
+    CARD_IN_COMBO,
+    COMBO_CARDS,
+    NUM_COMBOS,
+    board_mask,
+    compatible_mass_batch,
+)
 from paradigm_b.holdem.engine.public_tree import PublicNode, PublicState, build_endgame_tree
 from paradigm_b.holdem.engine.showdown import showdown_values_batch
 from paradigm_b.holdem.engine.space import EndgameSpace
 
 NUM_PLAYERS = 2
-
-
-def compatible_mass_batch(reach: np.ndarray) -> np.ndarray:
-    """``(K, 1326)`` opponent mass that does not block each hand."""
-    masses = reach @ CARD_IN_COMBO.T  # (K, 52)
-    total = reach.sum(axis=1, keepdims=True)
-    return total - masses[:, COMBO_CARDS[:, 0]] - masses[:, COMBO_CARDS[:, 1]] + reach
 
 
 class BatchedRiverSolver:

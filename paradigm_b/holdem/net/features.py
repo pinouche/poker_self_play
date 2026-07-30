@@ -18,6 +18,7 @@ scalars, then three rounds of six two-value betting-history slots.
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import lru_cache
 from typing import Sequence
 
 import numpy as np
@@ -47,8 +48,24 @@ PUBLIC_DIM = BOARD_DIM + NUM_SCALARS + BETTING_HISTORY_DIM
 POT_CHIPS_INDEX = SCALAR_OFFSET + 5
 
 
+@lru_cache(maxsize=8192)
 def encode_public(public) -> np.ndarray:
-    """Structured board sets, public scalars, and ordered betting history."""
+    """Structured board sets, public scalars, and ordered betting history.
+
+    Cached, and the cache is worth more than it looks.  A depth-limited solve
+    re-encodes its entire leaf frontier on *every* CFR iteration — the ranges
+    move, but the public states do not — so without this the betting history of
+    each of ~360 leaves is replayed forty times per solve, through a chain of
+    frozen-dataclass ``replace`` calls that cost more than everything else in
+    the encoder put together.  It was 16% of generation time.
+
+    ``PublicState`` is a frozen dataclass and the public tree already keys a
+    dict on it, so it is hashable by construction.  The returned array is
+    marked read-only because callers copy it into a larger buffer and a cached
+    array must not be writable by them.  8,192 entries is ~13MB and comfortably
+    covers a whole solve, which is where all the reuse is; sizing it to span
+    many situations would only multiply memory across actor processes.
+    """
     betting = public.betting
     out = np.zeros(PUBLIC_DIM)
     for set_index, cards in enumerate(
@@ -73,6 +90,7 @@ def encode_public(public) -> np.ndarray:
         any(betting.is_aggressive(action) for action in betting.history[betting.betting_round])
     )
     out[BOARD_DIM + NUM_SCALARS :] = _encode_betting_history(betting)
+    out.setflags(write=False)
     return out
 
 

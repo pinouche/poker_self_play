@@ -245,3 +245,150 @@ def test_holdem_self_play_trains_and_returns_the_policy_network():
 
     assert isinstance(value_net.policy_net, HoldemPolicyNet)
     assert np.isfinite(history[0]["policy_loss"])
+
+def test_cached_encodings_cannot_be_corrupted_by_a_caller():
+    """``encode_public`` and ``deal_mask`` hand out shared arrays.
+
+    Both are cached because a depth-limited solve asks for the same public
+    states and the same dealt cards on every CFR iteration.  That makes the
+    returned arrays shared, so they must be read-only — a caller that scaled one
+    in place would silently poison every later solve rather than fail here.
+    """
+    from paradigm_b.holdem.engine.space import TurnEndgameSpace as Space
+
+    public = HoldemPublicState(betting=Betting(starting_pot=20, stack=100), board=(51, 47, 22, 6))
+    features = encode_holdem_public(public)
+    assert not features.flags.writeable
+    with pytest.raises(ValueError):
+        features[0] = 5.0
+    # The cache returns the same object, so identity is the point of the test.
+    assert encode_holdem_public(public) is features
+
+    mask = Space((51, 47, 22, 6)).deal_mask(34)
+    assert not mask.flags.writeable
+    with pytest.raises(ValueError):
+        mask[0] = 7.0
+
+    # And the values still come out right after all that poking.
+    np.testing.assert_array_equal(encode_holdem_public(public), features)
+
+
+def _two_pass_forward(net, features, possible):
+    """The two-trunk-pass forward, kept here as what the fused one must match.
+
+    Deliberately a test-local copy rather than a production code path: it exists
+    only to pin the fused implementation, so keeping it in the module would be
+    dead weight that someone would eventually have to wonder about.
+    """
+    from paradigm_b.holdem.net.features import (
+        BOARD_OFFSET, CARD_SET_DIM, NUM_CARD_SETS, POT_CHIPS_INDEX, RANGE_DIM,
+        SCALAR_OFFSET,
+    )
+
+    batch = features.shape[0]
+    ranges = features[..., :RANGE_DIM].reshape(-1, 2, NUM_COMBOS)
+    pot = features[..., POT_CHIPS_INDEX].reshape(-1, 1, 1) * net.pot_scale
+    board = features[..., BOARD_OFFSET:SCALAR_OFFSET].reshape(
+        batch, NUM_CARD_SETS, CARD_SET_DIM
+    )
+
+    def one(player):
+        index = torch.full((batch,), player, device=features.device, dtype=torch.long)
+        encoded = torch.cat(
+            (
+                features[..., :RANGE_DIM],
+                net.board_embedding(board).reshape(batch, -1),
+                features[..., SCALAR_OFFSET:],
+                net.agent_embedding(index),
+            ),
+            dim=-1,
+        )
+        return net.head(net.trunk(encoded))
+
+    raw = torch.stack([one(player) for player in range(2)], dim=1)
+    values = raw * possible.unsqueeze(1) * pot
+    excess = (ranges * values).sum(dim=(-2, -1), keepdim=True)
+    return values - 0.5 * excess * possible.unsqueeze(1)
+
+
+def test_fused_forward_is_algebraically_the_two_pass_forward():
+    """One trunk pass over 2B rows against two passes over B.
+
+    The two are the *same arithmetic on the same inputs*, but not bit-identical:
+    torch picks a different GEMM tiling for a 2B-row matrix than a B-row one, and
+    float32 addition is not associative.  So the exactness claim is made in
+    float64, where the accumulation-order difference falls below double
+    precision -- that is what actually establishes the algebra is unchanged.
+    Float32 is then only asked to agree to float32's own accuracy.
+    """
+    from paradigm_b.holdem.net.features import INPUT_DIM
+
+    config = HoldemValueNetConfig(
+        hidden_dim=32, num_residual_blocks=2, card_embedding_dim=8
+    )
+    # Relative, because the head's output is scaled by the pot and so lands in
+    # the thousands -- an absolute bound would be a bound on the pot, not on the
+    # arithmetic.  Both limits sit many orders below the ~1e-1 relative error a
+    # crossed player pair or a transposed reshape would produce.
+    for dtype, tolerance in ((torch.float64, 1e-12), (torch.float32, 1e-4)):
+        torch.manual_seed(0)
+        net = HoldemValueNet(config).eval().to(dtype)
+        features = torch.randn(5, INPUT_DIM, dtype=dtype)
+        possible = (torch.rand(5, NUM_COMBOS) > 0.2).to(dtype)
+
+        with torch.no_grad():
+            fused = net(features, possible)
+            reference = _two_pass_forward(net, features, possible)
+
+        assert fused.shape == (5, 2, NUM_COMBOS)
+        relative = (
+            (fused - reference).abs().max() / reference.abs().max()
+        ).item()
+        assert relative < tolerance, f"{dtype}: relative error {relative:.2e}"
+
+
+def test_fused_forward_keeps_the_players_distinct_and_ordered():
+    """A transposed reshape would swap the two players and still look sane."""
+    from paradigm_b.holdem.net.features import INPUT_DIM
+
+    torch.manual_seed(1)
+    net = HoldemValueNet(
+        HoldemValueNetConfig(hidden_dim=32, num_residual_blocks=2, card_embedding_dim=8)
+    ).eval()
+    features = torch.randn(4, INPUT_DIM)
+    possible = torch.ones(4, NUM_COMBOS)
+
+    with torch.no_grad():
+        values = net(features, possible)
+    # The agent embedding is the only asymmetry, so the two players' rows must
+    # differ -- if they matched, the embedding was not reaching the trunk.
+    assert not torch.allclose(values[:, 0], values[:, 1])
+
+
+def test_fused_forward_gradients_match_two_passes():
+    """The fused path is used in training too, so backward must agree as well.
+
+    In float64, for the same reason the forward comparison is: the two differ
+    only by float32 accumulation order, and asserting that away in double
+    precision is what shows the gradients are the same gradients.
+    """
+    from paradigm_b.holdem.net.features import INPUT_DIM
+
+    config = HoldemValueNetConfig(
+        hidden_dim=32, num_residual_blocks=2, card_embedding_dim=8
+    )
+    features = torch.randn(3, INPUT_DIM, dtype=torch.float64)
+    possible = torch.ones(3, NUM_COMBOS, dtype=torch.float64)
+    target = torch.randn(3, 2, NUM_COMBOS, dtype=torch.float64)
+
+    grads = []
+    for forward in (lambda n: n(features, possible),
+                    lambda n: _two_pass_forward(n, features, possible)):
+        torch.manual_seed(2)
+        net = HoldemValueNet(config).to(torch.float64)
+        loss = ((forward(net) - target) ** 2).mean()
+        loss.backward()
+        grads.append([p.grad.clone() for p in net.parameters()])
+
+    for fused, reference in zip(*grads):
+        torch.testing.assert_close(fused, reference, rtol=1e-7, atol=1e-6)

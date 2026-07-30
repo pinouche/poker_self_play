@@ -23,9 +23,10 @@ from paradigm_b.holdem.engine.combos import (
     pair_correction,
 )
 from paradigm_b.holdem.engine.public_tree import PublicState, build_turn_tree
+from paradigm_b.holdem.engine import showdown as showdown_module
 from paradigm_b.holdem.engine.showdown import showdown_values, showdown_values_brute_force
 from paradigm_b.holdem.engine.space import TurnEndgameSpace
-from paradigm_b.holdem.engine.strength import hand_ranks
+from paradigm_b.holdem.engine.strength import hand_ranks, hand_ranks_reference
 from paradigm_b.core.search import SubgameSolver, strategy_map
 from paradigm_b.core.search.best_response import subgame_exploitability
 
@@ -75,6 +76,34 @@ def test_strength_ordering_is_real_poker():
     assert ranks[combo_index(TURN_BOARD[0], 5)] == -1, "board cards cannot be held"
 
 
+@pytest.mark.parametrize("cards", [3, 4, 5])
+def test_vectorised_hand_ranks_matches_the_looped_evaluator(cards):
+    """The array evaluator against ``common.hand_evaluator``, combo for combo.
+
+    The vectorised version reimplements the category rules, so this is the only
+    thing standing between a packing bug and silently wrong showdown values.
+    """
+    rng = np.random.default_rng(cards)
+    for _ in range(12):
+        board = tuple(sorted(int(c) for c in rng.choice(52, cards, replace=False)))
+        np.testing.assert_array_equal(hand_ranks(board), hand_ranks_reference(board))
+
+
+def test_vectorised_hand_ranks_handles_degenerate_boards():
+    """Boards that exercise the awkward corners of the category rules."""
+    for board in (
+        (0, 1, 2, 3, 4),  # quads on board
+        (0, 4, 8, 12, 16),  # 2c-6c straight flush board
+        (0, 4, 8, 12, 48),  # 2c 3c 4c 5c Ac - wheel straight flush
+        (32, 36, 40, 44, 48),  # Tc Jc Qc Kc Ac - broadway straight flush
+        (48, 49, 50, 51, 44),  # four aces and a king
+    ):
+        board = tuple(sorted(board))
+        np.testing.assert_array_equal(
+            hand_ranks(board), hand_ranks_reference(board), err_msg=str(board)
+        )
+
+
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_fast_showdown_matches_the_definition(seed):
     """The linear-time version against the O(n^2) one it replaces."""
@@ -85,6 +114,68 @@ def test_fast_showdown_matches_the_definition(seed):
     fast = showdown_values(RIVER_BOARD, reach, 12.0)
     slow = showdown_values_brute_force(RIVER_BOARD, reach, 12.0)
     assert np.abs(fast - slow).max() < 1e-9
+
+
+@pytest.mark.parametrize("cards", [3, 4, 5])
+def test_showdown_index_is_right_on_boards_it_has_never_seen(cards):
+    """Guards the global-searchsorted trick in ``showdown_index``.
+
+    Its group boundaries are found with one search over a key that is only
+    monotone if the per-card blocks are laid out in card order with positions
+    ascending inside each.  A board where that assumption slips would produce
+    plausible-looking values, so this checks against the O(n^2) definition on
+    boards the cache has not been warmed with.
+    """
+    rng = np.random.default_rng(100 + cards)
+    for _ in range(4):
+        board = tuple(sorted(int(c) for c in rng.choice(52, cards, replace=False)))
+        reach = rng.random(NUM_COMBOS) * board_mask(board)
+        fast = showdown_values(board, reach, 9.0)
+        slow = showdown_values_brute_force(board, reach, 9.0)
+        assert np.abs(fast - slow).max() < 1e-9, board
+
+
+@pytest.mark.parametrize("cards", [3, 4, 5])
+def test_compiled_showdown_matches_the_array_implementation(cards):
+    """The numba kernel against the numpy one it dispatches away from.
+
+    Two independent implementations of the same prefix-sum argument, so this is
+    what catches an off-by-one in the compiled loop's group boundaries.  Skips
+    rather than fails where numba is absent, because running without it is a
+    supported configuration.
+    """
+    if not showdown_module.HAVE_NUMBA:
+        pytest.skip("numba not installed; the numpy path is the only one in use")
+    rng = np.random.default_rng(200 + cards)
+    for _ in range(4):
+        board = tuple(sorted(int(c) for c in rng.choice(52, cards, replace=False)))
+        mask = board_mask(board)
+        for reach in (
+            mask.copy(),  # uniform
+            rng.random(NUM_COMBOS) * mask,  # smooth
+            (rng.random(NUM_COMBOS) < 0.08) * rng.random(NUM_COMBOS) * mask,  # sparse
+        ):
+            compiled = showdown_values(board, reach, 7.5)
+            array = showdown_module.showdown_values_numpy(board, reach, 7.5)
+            assert np.abs(compiled - array).max() < 1e-9, board
+
+
+def test_showdown_falls_back_off_the_compiled_fast_path():
+    """A float32 or strided range must still be answered, not crash.
+
+    The compiled kernel is typed for contiguous float64, which is what the
+    solver produces; the batched generator works in float32.  Rather than copy
+    to enter the fast path, those inputs take the numpy one.
+    """
+    rng = np.random.default_rng(7)
+    mask = board_mask(RIVER_BOARD)
+    reach = rng.random(NUM_COMBOS) * mask
+    expected = showdown_module.showdown_values_numpy(RIVER_BOARD, reach, 3.0)
+
+    strided = showdown_values(RIVER_BOARD, np.repeat(reach, 2)[::2], 3.0)
+    np.testing.assert_allclose(strided, expected)
+    single = showdown_values(RIVER_BOARD, reach.astype(np.float32), 3.0)
+    np.testing.assert_allclose(single, expected, atol=1e-2)
 
 
 def test_showdown_is_zero_sum_over_a_shared_range():

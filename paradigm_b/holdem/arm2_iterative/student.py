@@ -65,6 +65,13 @@ class OnlineStudentConfig:
     # is what the fixed-vs-iterative comparison uses.  Anything higher runs the
     # Ape-X shape from ``actors.py``: much faster, not bit-reproducible.
     actors: int = 0
+    # Threads the learner may use for its own forward/backward passes.  Actors
+    # pin themselves to one thread each (``actors.py``); the learner does not,
+    # so by default torch hands it every core and its backward pass competes
+    # with every actor for the same cores.  ``None`` leaves it the cores the
+    # actors are not already occupying; an explicit value overrides that, and
+    # is ignored entirely on the synchronous path, where nothing competes.
+    learner_threads: Optional[int] = None
     # How many gradient steps between publishing weights to the actors.  Lower
     # means fresher labels and more copying; ReBeL's actors run a network some
     # way behind the learner's and it costs little.

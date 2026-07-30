@@ -77,6 +77,29 @@ class HoldemValueNet(nn.Module):
         self.pot_scale = self.config.pot_scale
 
     def forward(self, features: torch.Tensor, possible: torch.Tensor) -> torch.Tensor:
+        """``(batch, INPUT_DIM)`` -> ``(batch, 2, 1326)``, in one trunk pass.
+
+        Both players' values come from the same trunk with only the agent
+        embedding differing, so this used to be written as the obvious two
+        passes — one per player, batch rows each.  That recomputed the board
+        embedding twice and, more importantly, submitted two half-sized batches
+        to the GPU where one full-sized batch would do.  Fusing them is 1.13x
+        faster on both CPU and MPS.
+
+        The fused form assembles *byte-identical* trunk inputs — the tests check
+        that — but its output is not bit-identical in float32: torch picks a
+        different GEMM tiling for a 2B-row matrix than for a B-row one, and
+        float32 addition is not associative.  The gap is ~3e-7 absolute on the
+        raw head, and vanishes to ~7e-16 in float64, which is how the tests
+        establish that the algebra rather than the rounding is unchanged.  For
+        scale, a swapped player pair would show ~1e-1.
+
+        It matters more than 1.13x suggests, because during data generation the
+        network is the binding constraint: eight actor processes at batch ~224
+        already saturate this machine's GPU, so the forward pass is what caps
+        label throughput.
+        """
+        batch = features.shape[0]
         ranges = features[..., :RANGE_DIM].reshape(-1, NUM_PLAYERS, NUM_COMBOS)
         # In *chips*, not as a fraction: the head works in pot-sized units, so
         # this is what converts its output back to money.  Scaling by the
@@ -84,37 +107,39 @@ class HoldemValueNet(nn.Module):
         # of magnitude larger than its inputs, which it learns badly.
         pot = features[..., POT_CHIPS_INDEX].reshape(-1, 1, 1) * self.pot_scale
 
-        raw = torch.stack(
-            [self._indexed_raw(features, player) for player in range(NUM_PLAYERS)], dim=1
-        )
-        values = raw
-        values = values * possible.unsqueeze(1) * pot
-        excess = (ranges * values).sum(dim=(-2, -1), keepdim=True)
-        return values - 0.5 * excess * possible.unsqueeze(1)
-
-    def _indexed_raw(self, features: torch.Tensor, agent_index: int | torch.Tensor) -> torch.Tensor:
-        batch = features.shape[0]
-        if not torch.is_tensor(agent_index):
-            agent_index = torch.full((batch,), agent_index, device=features.device, dtype=torch.long)
-        else:
-            agent_index = agent_index.to(device=features.device, dtype=torch.long).reshape(-1)
-            if agent_index.numel() == 1:
-                agent_index = agent_index.expand(batch)
         board = features[..., BOARD_OFFSET:SCALAR_OFFSET].reshape(
             batch, NUM_CARD_SETS, CARD_SET_DIM
         )
-        public_features = features[..., SCALAR_OFFSET:]
-        embedded_board = self.board_embedding(board).reshape(batch, -1)
-        encoded = torch.cat(
+        # Everything except the agent embedding is shared between the two
+        # players, so it is built once.
+        shared = torch.cat(
             (
                 features[..., :RANGE_DIM],
-                embedded_board,
-                public_features,
-                self.agent_embedding(agent_index),
+                self.board_embedding(board).reshape(batch, -1),
+                features[..., SCALAR_OFFSET:],
             ),
             dim=-1,
         )
-        return self.head(self.trunk(encoded))
+        agents = torch.arange(NUM_PLAYERS, device=features.device, dtype=torch.long)
+        # Rows ``[0, batch)`` are player 0, ``[batch, 2 * batch)`` player 1 —
+        # ``repeat`` tiles the shared block, ``repeat_interleave`` holds each
+        # agent embedding constant across its block.
+        encoded = torch.cat(
+            (
+                shared.repeat(NUM_PLAYERS, 1),
+                self.agent_embedding(agents).repeat_interleave(batch, dim=0),
+            ),
+            dim=-1,
+        )
+        raw = (
+            self.head(self.trunk(encoded))
+            .reshape(NUM_PLAYERS, batch, NUM_COMBOS)
+            .transpose(0, 1)
+        )
+
+        values = raw * possible.unsqueeze(1) * pot
+        excess = (ranges * values).sum(dim=(-2, -1), keepdim=True)
+        return values - 0.5 * excess * possible.unsqueeze(1)
 
     def forward_indexed(
         self, features: torch.Tensor, possible: torch.Tensor, agent_index: torch.Tensor

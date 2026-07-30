@@ -95,6 +95,13 @@ def compatible_mass(reach: np.ndarray) -> np.ndarray:
     return total - masses[COMBO_CARDS[:, 0]] - masses[COMBO_CARDS[:, 1]] + reach
 
 
+def compatible_mass_batch(reach: np.ndarray) -> np.ndarray:
+    """:func:`compatible_mass` for a ``(K, 1326)`` stack of ranges."""
+    masses = reach @ CARD_IN_COMBO.T  # (K, 52)
+    total = reach.sum(axis=1, keepdims=True)
+    return total - masses[:, COMBO_CARDS[:, 0]] - masses[:, COMBO_CARDS[:, 1]] + reach
+
+
 def cards_to_str(cards: Sequence[int]) -> str:
     ranks, suits = "23456789TJQKA", "cdhs"
     return " ".join(f"{ranks[c // 4]}{suits[c % 4]}" for c in cards)

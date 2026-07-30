@@ -10,11 +10,26 @@ hands by strength once per board turns it into prefix sums: the mass weaker than
 me is a lookup, and the blocked part of it is a second lookup in a per-card
 prefix table.  The board-dependent part is cached, so a node costs O(cards) work
 on top of two 1,326-element gathers.
+
+**The gathers are compiled.**  This is the hottest leaf in the solver — roughly
+25,000 calls per training label — and in numpy it is ten fancy-index gathers and
+two cumulative sums over 1,326 elements, each allocating a temporary.  The
+arithmetic is trivial; the cost is almost entirely numpy's per-operation
+overhead and the memory traffic of those temporaries.  Written as one explicit
+loop and compiled with numba it is **3.0x faster** (24.4us -> 8.1us), because
+the loop fuses every gather into a single pass with no intermediates.
+
+Numba is optional.  If it is not installed the numpy implementation is used
+instead and everything still works, just slower; ``showdown_values_numpy`` is
+kept as both the fallback and the thing the compiled kernel is tested against.
+Note the trade: the first call in each process pays JIT compilation, so
+``cache=True`` is essential here — eight actor processes must load the compiled
+kernel from disk rather than each rebuilding it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Tuple
 
@@ -22,6 +37,18 @@ import numpy as np
 
 from paradigm_b.holdem.engine.combos import CARD_IN_COMBO, COMBO_CARDS, NUM_CARDS, NUM_COMBOS
 from paradigm_b.holdem.engine.strength import ILLEGAL, hand_ranks, sorted_by_strength
+
+# Contiguous copies: ``COMBO_CARDS[:, 0]`` is a strided view, and handing a
+# strided array to a compiled kernel costs more than the copy ever will.
+CARD_A = np.ascontiguousarray(COMBO_CARDS[:, 0])
+CARD_B = np.ascontiguousarray(COMBO_CARDS[:, 1])
+
+try:  # pragma: no cover - depends on the environment, both paths are tested
+    from numba import njit
+
+    HAVE_NUMBA = True
+except ImportError:  # pragma: no cover
+    HAVE_NUMBA = False
 
 
 @dataclass(frozen=True)
@@ -48,10 +75,33 @@ class ShowdownIndex:
     lo_b: np.ndarray
     hi_a: np.ndarray
     hi_b: np.ndarray
+    # Scratch for the compiled kernel's two prefix sums, sized by this board and
+    # reused across its calls so a 25,000-call label does not allocate 25,000
+    # pairs of temporaries.  Safe to share because the index is cached per board
+    # and the solver is single-threaded within a process -- the parallelism here
+    # is actor *processes* (see arm2_iterative/actors.py), which do not share
+    # these objects.  Threading the solver would require making these per-call.
+    prefix: np.ndarray = field(default=None, repr=False, compare=False)
+    flat: np.ndarray = field(default=None, repr=False, compare=False)
 
 
 @lru_cache(maxsize=4096)
 def showdown_index(board: Tuple[int, ...]) -> ShowdownIndex:
+    """Build the scaffolding for one board.
+
+    Written with the two obvious Python loops — 52 cards, then one pass over
+    the ~1,081 legal combos doing four :func:`numpy.searchsorted` calls each —
+    this cost 4.6ms per board, and a turn label needs ~96 of them.  Both loops
+    are gone.
+
+    The per-card loop becomes one ``argsort`` of the ``(card, hand)`` pairs.
+    The per-combo loop becomes four whole-array searches: the group boundaries
+    are only ever looked up *within* a card's block of ``flat_hands``, and the
+    blocks are laid out in card order with positions ascending inside each, so
+    ``card * (NUM_COMBOS + 1) + position`` is monotone across the entire array.
+    A search for that key therefore lands inside the right card's block and
+    nowhere else, which makes 4,324 group-local searches one global one.
+    """
     ranks = hand_ranks(board)
     order = sorted_by_strength(board)
     sorted_ranks = ranks[order]
@@ -66,29 +116,27 @@ def showdown_index(board: Tuple[int, ...]) -> ShowdownIndex:
     # Hands grouped by the cards they use, each group ordered by strength.
     position = np.zeros(NUM_COMBOS, dtype=np.int64)
     position[order] = np.arange(len(order))
-    groups, positions = [], []
+    legal = ranks != ILLEGAL
+    card_of, holder_of = np.nonzero(CARD_IN_COMBO[:, legal])
+    hands = np.flatnonzero(legal)[holder_of]
+    scale = np.int64(NUM_COMBOS + 1)
+    keys = card_of.astype(np.int64) * scale + position[hands]
+    ordering = np.argsort(keys, kind="stable")
+    flat_hands = hands[ordering]
+    flat_keys = keys[ordering]
     card_offset = np.zeros(NUM_CARDS + 1, dtype=np.int64)
-    for card in range(NUM_CARDS):
-        holders = np.flatnonzero(CARD_IN_COMBO[card] & (ranks != ILLEGAL))
-        holders = holders[np.argsort(position[holders], kind="stable")]
-        groups.append(holders)
-        positions.append(position[holders])
-        card_offset[card + 1] = card_offset[card] + len(holders)
-    flat_hands = (
-        np.concatenate(groups) if groups else np.zeros(0, dtype=np.int64)
-    )
+    np.cumsum(np.bincount(card_of, minlength=NUM_CARDS), out=card_offset[1:])
 
     # Where each hand's tie-group boundaries fall inside its cards' groups.
     card_a, card_b = COMBO_CARDS[:, 0], COMBO_CARDS[:, 1]
-    lo_a, lo_b = np.zeros(NUM_COMBOS, np.int64), np.zeros(NUM_COMBOS, np.int64)
-    hi_a, hi_b = np.zeros(NUM_COMBOS, np.int64), np.zeros(NUM_COMBOS, np.int64)
-    for combo in np.flatnonzero(ranks != ILLEGAL):
-        a, b = card_a[combo], card_b[combo]
-        first, last = group_start[combo], group_end[combo]
-        lo_a[combo] = card_offset[a] + np.searchsorted(positions[a], first)
-        hi_a[combo] = card_offset[a] + np.searchsorted(positions[a], last)
-        lo_b[combo] = card_offset[b] + np.searchsorted(positions[b], first)
-        hi_b[combo] = card_offset[b] + np.searchsorted(positions[b], last)
+    lo_a = np.searchsorted(flat_keys, card_a * scale + group_start)
+    hi_a = np.searchsorted(flat_keys, card_a * scale + group_end)
+    lo_b = np.searchsorted(flat_keys, card_b * scale + group_start)
+    hi_b = np.searchsorted(flat_keys, card_b * scale + group_end)
+    # Illegal combos are never read, but the looped version left them at zero
+    # and the tests compare the two field for field.
+    for offsets in (lo_a, hi_a, lo_b, hi_b):
+        offsets[~legal] = 0
 
     return ShowdownIndex(
         order=order,
@@ -101,7 +149,59 @@ def showdown_index(board: Tuple[int, ...]) -> ShowdownIndex:
         lo_b=lo_b,
         hi_a=hi_a,
         hi_b=hi_b,
+        prefix=np.zeros(len(order) + 1),
+        flat=np.zeros(len(flat_hands) + 1),
     )
+
+
+def _showdown_loop(
+    reach, stake, order, flat_hands, card_offset, group_start, group_end,
+    lo_a, hi_a, lo_b, hi_b, legal, card_a, card_b, prefix, flat, out,
+):
+    """One pass over the combos; the compiled body of :func:`showdown_values`.
+
+    Deliberately written as scalar loops rather than array expressions: that is
+    what lets the two prefix sums and the ten per-combo lookups happen without
+    materialising a single temporary.  Kept importable unjitted so the tests can
+    exercise it directly, but it is only ever *called* through the jitted
+    version — in pure Python this loop is far slower than the numpy form.
+    """
+    count = order.shape[0]
+    prefix[0] = 0.0
+    for i in range(count):
+        prefix[i + 1] = prefix[i] + reach[order[i]]
+    total = prefix[count]
+
+    flat_count = flat_hands.shape[0]
+    flat[0] = 0.0
+    for i in range(flat_count):
+        flat[i + 1] = flat[i] + reach[flat_hands[i]]
+
+    for combo in range(out.shape[0]):
+        if not legal[combo]:
+            out[combo] = 0.0
+            continue
+        a = card_a[combo]
+        b = card_b[combo]
+        base_a = flat[card_offset[a]]
+        base_b = flat[card_offset[b]]
+        total_a = flat[card_offset[a + 1]] - base_a
+        total_b = flat[card_offset[b + 1]] - base_b
+        weaker = (
+            prefix[group_start[combo]]
+            - (flat[lo_a[combo]] - base_a)
+            - (flat[lo_b[combo]] - base_b)
+        )
+        stronger = (total - prefix[group_end[combo]]) - (
+            (total_a - (flat[hi_a[combo]] - base_a))
+            + (total_b - (flat[hi_b[combo]] - base_b))
+        )
+        out[combo] = stake * (weaker - stronger)
+
+
+_showdown_compiled = (
+    njit(cache=True, fastmath=True)(_showdown_loop) if HAVE_NUMBA else None
+)
 
 
 def showdown_values(board: Tuple[int, ...], reach: np.ndarray, stake: float) -> np.ndarray:
@@ -110,6 +210,32 @@ def showdown_values(board: Tuple[int, ...], reach: np.ndarray, stake: float) -> 
     Positive where the hand wins more opponent mass than it loses to.  Ties
     contribute nothing, which is also how blocked hands contribute nothing: both
     sit inside the tie group that the prefix sums skip over.
+
+    Dispatches to the compiled kernel when it is available and ``reach`` is
+    already the contiguous float64 the solver produces.  Anything else — no
+    numba, a float32 range from the batched generator, a strided view — takes
+    the numpy path rather than paying a copy to enter the fast one.
+    """
+    if _showdown_compiled is None or reach.dtype != np.float64 or not reach.flags.c_contiguous:
+        return showdown_values_numpy(board, reach, stake)
+    index = showdown_index(board)
+    out = np.empty(NUM_COMBOS)
+    _showdown_compiled(
+        reach, float(stake), index.order, index.flat_hands, index.card_offset,
+        index.group_start, index.group_end, index.lo_a, index.hi_a, index.lo_b,
+        index.hi_b, index.legal, CARD_A, CARD_B, index.prefix, index.flat, out,
+    )
+    return out
+
+
+def showdown_values_numpy(
+    board: Tuple[int, ...], reach: np.ndarray, stake: float
+) -> np.ndarray:
+    """The array implementation: fallback when numba is absent, and the reference.
+
+    Ten fancy-index gathers and two cumulative sums, each allocating.  Retained
+    because it is what the compiled kernel is checked against, and because a
+    working install without numba is a supported configuration.
     """
     index = showdown_index(board)
 
