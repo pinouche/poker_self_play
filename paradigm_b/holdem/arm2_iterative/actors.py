@@ -62,7 +62,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from paradigm_b.holdem.arms_common.situations import StreetMix, sample_mixed_situation
+from paradigm_b.holdem.arms_common.situations import StreetMix, sample_trajectory_start
 from paradigm_b.holdem.data.sampling import SituationConfig
 from paradigm_b.holdem.net.leaf_values import NetLeafValues
 from paradigm_b.holdem.net.policy import (
@@ -133,17 +133,27 @@ class SharedWeights:
         self.lock = mp.Lock()
 
     def publish(self, net: torch.nn.Module) -> int:
-        state = net.state_dict()
+        # The device-to-host transfer happens *outside* the lock.  With the
+        # learner on ``mps`` this is ~75MB coming back across the bus, and
+        # holding the lock through it stalls every actor that happens to check
+        # for new weights meanwhile -- for the whole transfer, not for the
+        # memcpy that actually needs exclusion.  On a CPU learner ``.cpu()`` is
+        # a no-op view and this costs nothing.
+        state = {name: value.detach().cpu() for name, value in net.state_dict().items()}
         with self.lock:
             for name, tensor in self.tensors.items():
-                tensor.copy_(state[name].detach().cpu())
+                tensor.copy_(state[name])
             self.version.value += 1
             return self.version.value
 
     def load_into(self, net: torch.nn.Module) -> int:
         with self.lock:
             version = self.version.value
-            net.load_state_dict({k: v.clone() for k, v in self.tensors.items()})
+            # ``load_state_dict`` copies into the module's parameters, so the
+            # shared tensors can be handed to it directly.  Cloning them first
+            # made every sync copy the whole network twice -- once into the
+            # throwaway dict, once out of it.
+            net.load_state_dict(self.tensors)
         return version
 
 
@@ -160,6 +170,7 @@ def actor_loop(
     device: str,
     shared_policy: Optional[SharedWeights] = None,
     policy_config: Optional[HoldemPolicyNetConfig] = None,
+    preflop_start: bool = True,
 ) -> None:
     """One actor: pull weights, run Algorithm 2, push labels, repeat.
 
@@ -190,7 +201,9 @@ def actor_loop(
             policy_version = shared_policy.load_into(policy_net)
             policy_net.eval()
 
-        space, root, reach, _ = sample_mixed_situation(rng, situations, street_mix)
+        space, root, reach, _ = sample_trajectory_start(
+            rng, situations, street_mix, preflop_start
+        )
         examples: Sequence[Example] = collect_trajectory(
             leaves,
             space,
@@ -240,6 +253,7 @@ class ActorPool:
         queue_size: int = 64,
         policy_net: Optional[HoldemPolicyNet] = None,
         policy_config: Optional[HoldemPolicyNetConfig] = None,
+        preflop_start: bool = True,
     ) -> None:
         if mp.parent_process() is not None:
             raise RuntimeError(
@@ -270,6 +284,7 @@ class ActorPool:
                     device,
                     self.shared_policy,
                     policy_config,
+                    preflop_start,
                 ),
                 daemon=True,
             )

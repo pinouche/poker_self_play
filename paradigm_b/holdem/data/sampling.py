@@ -7,11 +7,20 @@ network was never asked the question that matters — *what is a board you have
 not seen worth?*
 
 DeepStack fixed this by generating each training situation at random: a random
-board, a random pot, and random ranges.  That is what this module does.  The
-ranges deliberately span shapes real betting produces — uniform when nobody has
-shown anything, sharply strength-tilted after a raise, capped when a player has
-only called, and sparse when a line is very narrow — because a value network is
-only useful on the range shapes it has actually seen.
+board, a random pot, and random ranges.  That is what most of this module does.
+The ranges deliberately span shapes real betting produces — uniform when nobody
+has shown anything, sharply strength-tilted after a raise, capped when a player
+has only called, and sparse when a line is very narrow — because a value network
+is only useful on the range shapes it has actually seen.
+
+**That is also the thing ReBeL's section 8 argues against**, and
+:func:`initial_situation` is the alternative: start every trajectory at the
+blinds, where the belief state is common knowledge and nothing has to be
+invented, and let self play produce the rest.  Both live here on purpose.  The
+random sampler is still what a *street-wise* dataset needs — arm 1 builds the
+river before the turn before the flop, and held-out evaluation pins one board
+per street — while a run that wants the paper's training distribution uses the
+initial one and never calls the sampler at all.
 """
 
 from __future__ import annotations
@@ -21,7 +30,16 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-from paradigm_b.holdem.engine.betting import Betting
+from paradigm_b.holdem.engine.betting import (
+    BET_PERTURBATION,
+    BIG_BLIND,
+    DEFAULT_BET_FRACTIONS,
+    SMALL_BLIND,
+    Betting,
+    perturbed_bet_fractions,
+    preflop_betting,
+    validate_bet_fractions,
+)
 from paradigm_b.holdem.engine.combos import NUM_CARDS, NUM_COMBOS, board_mask
 from paradigm_b.holdem.engine.public_tree import PublicState
 from paradigm_b.holdem.engine.space import TurnEndgameSpace
@@ -40,8 +58,32 @@ class SituationConfig:
     min_stack: int = 40
     max_stack: int = 200
     max_raises: int = 1
+    # The action abstraction every sampled situation is built with.  Carried
+    # here rather than left to ``Betting``'s default so that a run pins the
+    # abstraction it trained on: action *ids* shift when the number of sizes
+    # changes (all-in is always last), so a policy network trained under one
+    # set cannot be read under another.
+    bet_fractions: Tuple[float, ...] = DEFAULT_BET_FRACTIONS
+    # ReBeL's ``+/-0.1x pot`` jitter on each of those sizes, redrawn per
+    # situation.  Zero pins the abstraction exactly, which is what a
+    # reproducibility check or a like-for-like tree-size measurement wants.
+    perturb_bets: float = BET_PERTURBATION
+    # What a hand that starts at the blinds begins with.  100 big blinds is the
+    # standard heads-up stack; the blinds themselves are what put chips in the
+    # middle, so no ``starting_pot`` is invented.
+    preflop_stack: int = 200
+    blinds: Tuple[int, int] = (SMALL_BLIND, BIG_BLIND)
     # Boards to exclude — the held-out set, when measuring generalisation.
     excluded_boards: Tuple[Tuple[int, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        self.bet_fractions = validate_bet_fractions(self.bet_fractions)
+
+    def fractions(self, rng: np.random.Generator) -> Tuple[float, ...]:
+        """The bet sizes for one situation, jittered if the config asks for it."""
+        if self.perturb_bets <= 0.0:
+            return self.bet_fractions
+        return perturbed_bet_fractions(rng, self.bet_fractions, self.perturb_bets)
 
 
 def conflicts_with_held_out(board: Sequence[int], excluded: Sequence) -> bool:
@@ -130,11 +172,49 @@ def sample_situation(
         starting_pot=pot,
         stack=stack,
         max_raises=config.max_raises,
+        bet_fractions=config.fractions(rng),
         num_rounds=6 - config.board_cards,
     )
     space = TurnEndgameSpace(board)
     reach = np.stack([sample_range(rng, board) for _ in range(2)])
     return space, PublicState(betting=betting, board=board), reach
+
+
+def initial_situation(
+    rng: np.random.Generator, config: SituationConfig | None = None
+) -> Tuple[TurnEndgameSpace, PublicState, np.ndarray]:
+    """The belief state a hand actually starts in.  Nothing here is invented.
+
+    This is ReBeL's answer to the module above it, and the two are worth reading
+    against each other.  :func:`sample_situation` has to make up a board, a pot,
+    a stack and two ranges, and the ranges in particular come from a handcrafted
+    mixture of shapes chosen to look like what real betting produces.  That is
+    exactly the "handcrafted algorithm that would sample more realistic PBSs"
+    the paper declines to use, and its section 8 argues that training a value
+    network on a distribution of belief states that self play would never
+    produce is what makes such networks fail.
+
+    A hand that starts here has nothing to sample: before any action the ranges
+    are uniform over all 1,326 combinations, the board is empty and the blinds
+    are the pot.  Every belief state after it is reached by *play* — the CFR
+    iterate's own reach distribution, plus the exploration parameter — so the
+    training distribution is the agent's own, which is the whole claim.
+
+    The one thing still drawn at random is the bet sizes, and that is the
+    paper's own ``+/-0.1x pot`` perturbation rather than a prior over positions.
+    """
+    config = config or SituationConfig()
+    root = PublicState(
+        betting=preflop_betting(
+            stack=config.preflop_stack,
+            blinds=config.blinds,
+            bet_fractions=config.fractions(rng),
+            max_raises=config.max_raises,
+        ),
+        board=(),
+    )
+    space = TurnEndgameSpace(())
+    return space, root, space.initial_reach()
 
 
 def held_out_boards(

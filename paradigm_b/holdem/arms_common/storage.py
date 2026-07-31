@@ -39,12 +39,16 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Union
+from typing import Any, Dict, Mapping, Sequence, Union
 
+import numpy as np
 import torch
+
+from paradigm_b.holdem.arms_common.budget import SpendRecord
 
 PathLike = Union[str, Path]
 
@@ -188,3 +192,218 @@ class RunLayout:
         ):
             directory.mkdir(parents=True, exist_ok=True)
         return self
+
+
+# --- resuming a long run ----------------------------------------------------
+#
+# A 12-hour generation run that dies at hour 11 and has to start again is the
+# difference between an overnight experiment and a lost day.  Weights alone are
+# not enough to continue from: restart with a fresh Adam and the first few
+# hundred steps undo themselves while the moment estimates rebuild, and restart
+# with an empty replay buffer and the network is briefly trained on nothing but
+# the newest, most correlated labels.  So the whole learner is written down --
+# both networks, both optimisers, both buffers, the spend, the iteration counter
+# and the RNG.
+#
+# The buffers dominate the bytes: 60,000 examples is ~1.6GB, because each one
+# carries a 2,792-wide encoding, a 1,326 mask and a 2 x 1,326 target.  They are
+# written uncompressed and sliced to ``size``, so an early checkpoint is small
+# and a full one is a single sequential write.
+
+RUN_STATE_VERSION = 2
+
+
+def _buffer_order(size: int, capacity: int, next_index: int) -> np.ndarray:
+    """Indices of a circular buffer's contents, oldest first."""
+    if size < capacity:
+        return np.arange(size)
+    return np.concatenate([np.arange(next_index, capacity), np.arange(0, next_index)])
+
+
+def _save_circular(directory: Path, name: str, buffer, fields: Mapping[str, np.ndarray]) -> Dict[str, Any]:
+    """Write a circular buffer's live contents in oldest-first order.
+
+    Re-ordering rather than dumping the raw arrays is what makes the saved form
+    independent of where the write pointer happened to be, so a resumed buffer
+    evicts and purges in the same order it would have.  ``purge_oldest`` depends
+    on that ordering being recoverable, and a raw dump loses it.
+    """
+    order = _buffer_order(buffer.size, buffer.capacity, buffer._next)
+    for field_name, array in fields.items():
+        np.save(directory / f"{name}-{field_name}.npy", array[order])
+    return {"size": int(buffer.size), "capacity": int(buffer.capacity)}
+
+
+def _load_circular(directory: Path, name: str, buffer, fields: Sequence[str], meta: Mapping[str, Any]) -> None:
+    size = int(meta["size"])
+    if size > buffer.capacity:
+        raise ValueError(
+            f"saved {name} holds {size} examples but this run's capacity is "
+            f"{buffer.capacity}; raise buffer_size or the oldest data would be "
+            f"silently dropped on resume"
+        )
+    for field_name in fields:
+        array = np.load(directory / f"{name}-{field_name}.npy")
+        getattr(buffer, field_name)[:size] = array
+    buffer.size = size
+    buffer._next = size % buffer.capacity
+
+
+def run_state_fingerprint(config) -> Dict[str, Any]:
+    """What must match for a resume to be meaningful rather than merely possible.
+
+    The action abstraction is in here for a specific reason: action ids are
+    positional, so a buffer of policy targets recorded under
+    ``(0.5, 1.0)`` is not readable under ``(0.25, 0.5, 1.0, 2.0)`` -- id 2 means
+    a different bet and all-in has moved.  Resuming across that would train on
+    silently relabelled data and look like nothing was wrong.
+    """
+    value_net = config.value_net
+    return {
+        "version": RUN_STATE_VERSION,
+        "hidden_dim": int(value_net.hidden_dim),
+        "num_residual_blocks": int(value_net.num_residual_blocks),
+        "card_embedding_dim": int(value_net.card_embedding_dim),
+        "bet_fractions": [float(f) for f in config.situations.bet_fractions],
+        "max_raises": int(config.situations.max_raises),
+        "buffer_size": int(config.buffer_size),
+        "uses_policy_net": bool(config.uses_policy_net),
+    }
+
+
+def save_run_state(
+    directory: PathLike,
+    *,
+    config,
+    spend,
+    iteration: int,
+    trajectory_id: int,
+    rng,
+    net,
+    optimiser,
+    buffer,
+    initial_state: Mapping[str, "torch.Tensor"],
+    policy_net=None,
+    policy_optimiser=None,
+    policy_buffer=None,
+) -> Path:
+    """Write everything needed to continue this run, swapped in atomically."""
+    final = Path(directory)
+    staging = final.with_name(final.name + ".writing")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+
+    torch.save(net.state_dict(), staging / "value_net.pt")
+    torch.save(optimiser.state_dict(), staging / "value_optimiser.pt")
+    torch.save(dict(initial_state), staging / "initial_state.pt")
+    meta: Dict[str, Any] = {
+        "fingerprint": run_state_fingerprint(config),
+        "spend": spend.to_dict(),
+        "iteration": int(iteration),
+        "trajectory_id": int(trajectory_id),
+        "rng": rng.bit_generator.state,
+        "buffer": _save_circular(
+            staging,
+            "buffer",
+            buffer,
+            {"features": buffer.features, "masks": buffer.masks, "targets": buffer.targets},
+        ),
+    }
+    if policy_net is not None:
+        torch.save(policy_net.state_dict(), staging / "policy_net.pt")
+    if policy_optimiser is not None:
+        torch.save(policy_optimiser.state_dict(), staging / "policy_optimiser.pt")
+    if policy_buffer is not None:
+        meta["policy_buffer"] = _save_circular(
+            staging,
+            "policy",
+            policy_buffer,
+            {
+                "features": policy_buffer.features,
+                "agent_indices": policy_buffer.agent_indices,
+                "legal_masks": policy_buffer.legal_masks,
+                "targets": policy_buffer.targets,
+            },
+        )
+    write_json(meta, staging / "meta.json")
+
+    # Swap last, so a crash at any point above leaves the previous state whole.
+    previous = final.with_name(final.name + ".previous")
+    if previous.exists():
+        shutil.rmtree(previous)
+    if final.exists():
+        os.rename(final, previous)
+    os.rename(staging, final)
+    if previous.exists():
+        shutil.rmtree(previous)
+    return final
+
+
+def load_run_state(
+    directory: PathLike,
+    *,
+    config,
+    net,
+    optimiser,
+    buffer,
+    rng,
+    policy_net=None,
+    policy_optimiser=None,
+    policy_buffer=None,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    """Restore a saved run into the objects given, in place.
+
+    Returns the scalars the caller has to carry itself: the spend record, the
+    iteration and trajectory counters, and the weights the run originally
+    started from.
+    """
+    directory = Path(directory)
+    meta = json.loads((directory / "meta.json").read_text())
+
+    expected = run_state_fingerprint(config)
+    saved = meta.get("fingerprint", {})
+    if strict and saved != expected:
+        differing = {
+            key: (saved.get(key), expected.get(key))
+            for key in set(saved) | set(expected)
+            if saved.get(key) != expected.get(key)
+        }
+        raise ValueError(
+            f"refusing to resume {directory}: the saved run does not match this "
+            f"config (saved, wanted) = {differing}"
+        )
+
+    net.load_state_dict(torch.load(directory / "value_net.pt", map_location="cpu"))
+    optimiser.load_state_dict(
+        torch.load(directory / "value_optimiser.pt", map_location="cpu")
+    )
+    _load_circular(
+        directory, "buffer", buffer, ("features", "masks", "targets"), meta["buffer"]
+    )
+    if policy_net is not None and (directory / "policy_net.pt").exists():
+        policy_net.load_state_dict(
+            torch.load(directory / "policy_net.pt", map_location="cpu")
+        )
+    if policy_optimiser is not None and (directory / "policy_optimiser.pt").exists():
+        policy_optimiser.load_state_dict(
+            torch.load(directory / "policy_optimiser.pt", map_location="cpu")
+        )
+    if policy_buffer is not None and "policy_buffer" in meta:
+        _load_circular(
+            directory,
+            "policy",
+            policy_buffer,
+            ("features", "agent_indices", "legal_masks", "targets"),
+            meta["policy_buffer"],
+        )
+    rng.bit_generator.state = meta["rng"]
+
+    initial_state = torch.load(directory / "initial_state.pt", map_location="cpu")
+    return {
+        "spend": SpendRecord.from_dict(meta["spend"]),
+        "iteration": int(meta["iteration"]),
+        "trajectory_id": int(meta["trajectory_id"]),
+        "initial_state": initial_state,
+    }

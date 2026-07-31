@@ -48,7 +48,13 @@ from paradigm_b.holdem.arm2_iterative.journal import JournalEntry, TrajectoryJou
 from paradigm_b.holdem.arms_common.budget import SpendRecord
 from paradigm_b.holdem.arms_common.evaluation import EvaluationConfig, TestSituation, evaluate_agent
 from paradigm_b.holdem.arms_common.fitting import StudentResult, fit_value_net
-from paradigm_b.holdem.arms_common.storage import PathLike, save_checkpoint
+from paradigm_b.holdem.arms_common.storage import (
+    PathLike,
+    load_run_state,
+    save_checkpoint,
+    save_run_state,
+)
+from paradigm_b.holdem.arm2_iterative.student import _state_directory
 from paradigm_b.holdem.net.policy import (
     HoldemPolicyNet,
     PolicyReplayBuffer,
@@ -135,6 +141,7 @@ def fit_online_student_async(
     evaluation: Optional[EvaluationConfig] = None,
     journal_path: Optional[PathLike] = None,
     checkpoint_path: Optional[PathLike] = None,
+    state_path: Optional[PathLike] = None,
 ) -> StudentResult:
     """Algorithm 1 across ``config.actors`` processes, one learner here."""
     rng = rng if rng is not None else np.random.default_rng(config.seed)
@@ -160,6 +167,33 @@ def fit_online_student_async(
         )
         policy_buffer = PolicyReplayBuffer(config.policy_buffer_size)
 
+    state_directory = _state_directory(config, state_path, checkpoint_path)
+    trajectory_id = 0
+    iteration = 0
+    if config.resume_from is not None:
+        restored = load_run_state(
+            config.resume_from,
+            config=config,
+            net=net,
+            optimiser=optimiser,
+            buffer=buffer,
+            rng=rng,
+            policy_net=policy_net,
+            policy_optimiser=policy_optimiser,
+            policy_buffer=policy_buffer,
+        )
+        spend = restored["spend"]
+        iteration = restored["iteration"]
+        trajectory_id = restored["trajectory_id"]
+        initial_state = restored["initial_state"]
+        net.to(device)
+        if policy_net is not None:
+            policy_net.to(device)
+
+    # Built after the restore on purpose: ``ActorPool`` snapshots the network
+    # into shared memory at construction, so spawning it first would start
+    # every actor generating from freshly initialised weights and quietly
+    # poison the buffer for the first sync interval.
     pool = ActorPool(
         workers=config.actors,
         net=net,
@@ -167,13 +201,12 @@ def fit_online_student_async(
         self_play=config.generation_config(),
         situations=config.situations,
         street_mix=config.street_mix,
+        preflop_start=config.preflop_start,
         seed=config.seed,
         device=config.device,
         policy_net=policy_net,
         policy_config=config.policy_net if policy_net is not None else None,
     )
-    trajectory_id = 0
-    iteration = 0
     started = time.perf_counter()
 
     threads = learner_thread_count(
@@ -301,6 +334,34 @@ def fit_online_student_async(
                 ):
                     record.update(evaluate_agent(net, tests, evaluation))
                 history.append(record)
+
+                if state_directory is not None and (
+                    finished
+                    or (
+                        config.state_every is not None
+                        and iteration % config.state_every == 0
+                    )
+                ):
+                    # The actors keep generating through this; the learner is
+                    # the only writer of everything being saved, so a snapshot
+                    # taken here is self-consistent even though trajectories
+                    # are in flight.  Those in-flight labels are simply lost on
+                    # a resume, which costs at most one drain's worth.
+                    save_run_state(
+                        state_directory,
+                        config=config,
+                        spend=spend,
+                        iteration=iteration,
+                        trajectory_id=trajectory_id,
+                        rng=rng,
+                        net=net,
+                        optimiser=optimiser,
+                        buffer=buffer,
+                        initial_state=initial_state,
+                        policy_net=policy_net,
+                        policy_optimiser=policy_optimiser,
+                        policy_buffer=policy_buffer,
+                    )
 
                 if checkpoint_path is not None and (
                     finished

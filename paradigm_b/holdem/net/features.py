@@ -12,7 +12,11 @@ each set.  Betting history uses fixed sequential slots containing a presence
 bit and the chips added by that action as a fraction of the stack.
 
 Layout: two 1,326-entry ranges, three 52-card set indicators, eight public
-scalars, then three rounds of six two-value betting-history slots.
+scalars, then four rounds of six two-value betting-history slots.
+
+Preflop needs no special case here: its board sets are simply all zero, which
+is what distinguishes an undealt board from a dealt one, and its betting lands
+in the first history slot rather than being right-aligned away.
 """
 
 from __future__ import annotations
@@ -32,7 +36,10 @@ CARD_SET_DIM = NUM_CARDS
 BOARD_DIM = NUM_CARD_SETS * CARD_SET_DIM
 SCALAR_OFFSET = BOARD_OFFSET + BOARD_DIM
 NUM_SCALARS = 8
-NUM_BETTING_ROUNDS = 3
+# preflop, flop, turn, river.  A shorter game right-aligns into these slots (see
+# ``round_offset`` below), so a turn endgame's two rounds land in the last two
+# and a whole hand fills all four.
+NUM_BETTING_ROUNDS = 4
 MAX_ACTIONS_PER_ROUND = 6
 BETTING_SLOT_DIM = 2
 BETTING_HISTORY_DIM = NUM_BETTING_ROUNDS * MAX_ACTIONS_PER_ROUND * BETTING_SLOT_DIM
@@ -109,7 +116,12 @@ def _encode_betting_history(betting) -> np.ndarray:
         betting,
         betting_round=0,
         history=tuple(() for _ in betting.history),
-        contributions=(0, 0),
+        # The blinds, not zero.  They are forced chips rather than actions, so
+        # they never appear in ``history``; starting the replay from (0, 0)
+        # would charge the small blind's call the big blind's whole two chips
+        # instead of the one it actually adds, and every preflop increment
+        # downstream of it would be wrong by the same amount.
+        contributions=betting.blinds,
         folder=-1,
         showdown=False,
         awaiting_board=False,

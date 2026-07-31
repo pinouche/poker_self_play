@@ -24,7 +24,11 @@ from paradigm_b.holdem.arms_common.evaluation import (
     evaluate_agent,
     make_held_out_situations,
 )
-from paradigm_b.holdem.arms_common.situations import StreetMix, sample_mixed_situation
+from paradigm_b.holdem.arms_common.situations import (
+    LAYERS_PER_STREET,
+    StreetMix,
+    sample_mixed_situation,
+)
 from paradigm_b.holdem.arms_common.storage import RunLayout, read_json, write_json
 from paradigm_b.holdem.compare.experiment import ComparisonConfig, run_comparison
 from paradigm_b.holdem.arm1_fixed.build import DatasetBuildConfig, build_layered_dataset, slice_examples
@@ -34,6 +38,7 @@ from paradigm_b.holdem.arm2_iterative.journal import JournalEntry, TrajectoryJou
 from paradigm_b.holdem.arm2_iterative.student import OnlineStudentConfig, fit_online_student
 from paradigm_b.holdem.compare.relabel import decode_situation, measure_label_drift
 from paradigm_b.holdem.data.generation import GenerationConfig
+from paradigm_b.holdem.net.features import INPUT_DIM
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
 from paradigm_b.holdem.selfplay import HoldemSelfPlayConfig
 from paradigm_b.holdem.data.sampling import SituationConfig, conflicts_with_held_out, held_out_boards
@@ -328,7 +333,8 @@ def test_the_journal_records_every_label_with_its_iteration(tmp_path):
             updates_per_iteration=3,
             batch_size=8,
             self_play=HoldemSelfPlayConfig(search_iterations=3, river_iterations=3),
-            situations=SituationConfig(board_cards=4),
+            # No ``board_cards``: the default regime is preflop-rooted, so the
+            # street a trajectory starts on is not a knob any more.
             value_net=TINY_NET,
         ),
         label_budget=20,
@@ -347,11 +353,28 @@ def test_the_journal_records_every_label_with_its_iteration(tmp_path):
     iterations = journal.iterations()
     assert iterations[0] == 1
     assert list(iterations) == sorted(iterations)
-    # Every row carries a real postflop street.
-    assert set(np.unique(meta[:, 3])).issubset({3, 4, 5})
-    # A trajectory's steps are numbered from zero, descending the streets.
+    # Every row carries a real street, preflop included: a hand now starts at
+    # the blinds rather than on a sampled board.
+    assert set(np.unique(meta[:, 3])).issubset({0, 3, 4, 5})
+    # A trajectory's steps are numbered from zero, in the order they were
+    # emitted.
     first = meta[meta[:, 1] == meta[0, 1]]
     assert list(first[:, 2]) == list(range(len(first)))
+
+    # A complete trajectory is seven labels: a root on each of the four betting
+    # rounds, plus a pre-deal label on the three that have a deal in front of
+    # them.  They do not come out in street order, and that is the point of the
+    # back-fill — a pre-deal label cannot be written until the subgame on the
+    # far side of the chance node has been solved, so street k's pre-deal label
+    # trails street k+1's root:
+    #
+    #     preflop root, flop root, preflop pre-deal, turn root, flop pre-deal,
+    #     river root, turn pre-deal
+    full = [
+        rows for t in np.unique(meta[:, 1]) if len(rows := meta[meta[:, 1] == t]) == 7
+    ]
+    assert full, "no trajectory ran to the river within the budget"
+    assert list(full[0][:, 3]) == [0, 3, 0, 4, 3, 5, 4]
 
 
 def test_the_journal_can_be_read_one_iteration_at_a_time(tmp_path):
@@ -361,7 +384,7 @@ def test_the_journal_can_be_read_one_iteration_at_a_time(tmp_path):
         journal.add(
             [
                 JournalEntry(
-                    features=rng.standard_normal(2852).astype(np.float32),
+                    features=rng.standard_normal(INPUT_DIM).astype(np.float32),
                     mask=np.ones(1326, dtype=np.float32),
                     values=np.zeros((2, 1326), dtype=np.float32),
                     iteration=iteration,
@@ -383,16 +406,19 @@ def test_the_journal_can_be_read_one_iteration_at_a_time(tmp_path):
 def test_the_street_mix_matches_labels_not_starting_streets():
     """The mapping is an inversion, not a copy.
 
-    A trajectory yields one label per street it passes through on the way down,
-    so copying an artifact's label proportions onto the *starting* street
-    over-produces river labels.  Starting probabilities are the differences of
-    the cumulative label shares.
+    A trajectory yields labels at every street it passes through on the way
+    down, so copying an artifact's label proportions onto the *starting* street
+    does not reproduce them.  Starting probabilities are the differences of the
+    cumulative label shares — after dividing each street's count by how many
+    labels a visit to it collects, which is two everywhere but the river: a
+    root label, and the pre-deal label recorded on the way out.
     """
     mix = StreetMix.from_label_counts({"river": 100, "turn": 50, "flop": 50})
     starts = mix.normalised()
-    # flop 50, turn 50-50=0, river 100-50=50  ->  half flop starts, half river.
-    assert starts["flop"] == pytest.approx(0.5)
-    assert starts["river"] == pytest.approx(0.5)
+    # Per-visit counts first: flop 50/2=25, turn 50/2=25, river 100/1=100.
+    # Then differences: flop 25, turn 25-25=0, river 100-25=75.
+    assert starts["flop"] == pytest.approx(0.25)
+    assert starts["river"] == pytest.approx(0.75)
     assert starts.get("turn", 0.0) == pytest.approx(0.0)
     # And those starts really do reproduce the requested label mixture.
     shares = mix.label_shares()
@@ -407,26 +433,49 @@ def test_the_street_mix_matches_labels_not_starting_streets():
     assert set(drawn) <= {3, 4, 5}
 
 
-def test_naively_copying_label_shares_would_over_produce_river_labels():
-    """Guards the bug directly: the old behaviour is measurably wrong."""
+def test_naively_copying_label_shares_misses_the_requested_mixture():
+    """Guards the bug directly: the old behaviour is measurably wrong.
+
+    Note which way it is wrong now.  When every street collected one label the
+    naive copy over-produced river labels, because turn and flop starts pass
+    through the river as well.  Adding the pre-deal layer doubled the count at
+    every street *except* the river, which is the one with no deal in front of
+    it — enough to flip the sign.  The naive mapping now starves the river and
+    over-produces the streets above it.  Only the miss itself is the invariant;
+    the direction is a fact about the current layer counts, so it is asserted
+    from ``LAYERS_PER_STREET`` rather than hard-coded as a moral.
+    """
     counts = {"river": 71.0, "turn": 21.0, "flop": 7.0}
     naive = StreetMix(river=counts["river"], turn=counts["turn"], flop=counts["flop"])
     fixed = StreetMix.from_label_counts(counts)
     total = sum(counts.values())
     wanted = {k: v / total for k, v in counts.items()}
 
-    assert fixed.label_shares()["river"] == pytest.approx(wanted["river"], abs=1e-9)
-    # The naive mapping drifts the river share upward and starves the flop.
-    assert naive.label_shares()["river"] > wanted["river"] + 0.02
-    assert naive.label_shares()["flop"] < wanted["flop"]
+    for street in ("river", "turn", "flop"):
+        assert fixed.label_shares()[street] == pytest.approx(wanted[street], abs=1e-9)
+    # The naive copy misses by a wide margin, and undershoots the street that
+    # collects the fewest labels per visit.
+    assert LAYERS_PER_STREET["river"] < LAYERS_PER_STREET["flop"]
+    assert naive.label_shares()["river"] < wanted["river"] - 0.02
+    assert naive.label_shares()["flop"] > wanted["flop"]
 
 
 def test_labels_per_trajectory_is_what_budget_sizing_needs():
+    # ``2n - 1`` for a start with ``n`` betting rounds below it: a root label
+    # everywhere, plus a pre-deal label everywhere but the river.
     assert StreetMix(river=1, turn=0, flop=0).labels_per_trajectory == pytest.approx(1.0)
-    assert StreetMix(river=0, turn=0, flop=1).labels_per_trajectory == pytest.approx(3.0)
+    assert StreetMix(river=0, turn=1, flop=0).labels_per_trajectory == pytest.approx(3.0)
+    assert StreetMix(river=0, turn=0, flop=1).labels_per_trajectory == pytest.approx(5.0)
     # The mix from the first real run: 71/21/7 copied naively onto starts.
     naive = StreetMix(river=71, turn=21, flop=7)
-    assert naive.labels_per_trajectory == pytest.approx(1.36, abs=0.02)
+    assert naive.labels_per_trajectory == pytest.approx(1.71, abs=0.02)
+
+
+def test_a_preflop_rooted_trajectory_yields_seven_labels():
+    """Four roots and three pre-deal states — what ReBeL's two layers cost."""
+    from paradigm_b.holdem.arms_common.situations import preflop_labels_per_trajectory
+
+    assert preflop_labels_per_trajectory() == 7
 
 
 def test_a_label_target_deeper_streets_cannot_reach_is_clamped():
@@ -437,13 +486,22 @@ def test_a_label_target_deeper_streets_cannot_reach_is_clamped():
 
 
 def test_a_mismatched_budget_ratio_warns_rather_than_silently_wasting():
+    """Both regimes, because the two count labels per trajectory differently.
+
+    ``preflop_start`` is the switch: a preflop-rooted hand always yields seven
+    labels and ``street_mix`` is not consulted at all, so sizing a run against
+    the mixture when the run starts at the blinds is off by four times over.
+    Pinned explicitly here rather than inherited, so this test says which
+    regime it is measuring instead of tracking whichever is currently default.
+    """
     from paradigm_b.holdem.arm2_iterative.student import _warn_if_budgets_are_mismatched
 
-    # The first real run's settings: 8 trajectories of ~1.36 labels against 40
+    # The first real run's settings: 8 trajectories of ~1.71 labels against 40
     # updates, for budgets asking 0.5 labels per update.
     config = OnlineStudentConfig(
         trajectories_per_iteration=8,
         updates_per_iteration=40,
+        preflop_start=False,
         street_mix=StreetMix(river=71, turn=21, flop=7),
     )
     with pytest.warns(RuntimeWarning, match="budget ratio mismatch"):
@@ -453,11 +511,28 @@ def test_a_mismatched_budget_ratio_warns_rather_than_silently_wasting():
     good = OnlineStudentConfig(
         trajectories_per_iteration=8,
         updates_per_iteration=40,
+        preflop_start=False,
         street_mix=StreetMix.from_label_counts({"river": 40, "turn": 35, "flop": 25}),
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         _warn_if_budgets_are_mismatched(good, label_budget=2000, update_budget=4000)
+
+    # Preflop-rooted: seven labels a trajectory, so 8 x 7 = 56 per iteration
+    # against 40 updates needs a label budget 1.4x the update budget.
+    preflop = OnlineStudentConfig(
+        trajectories_per_iteration=8,
+        updates_per_iteration=40,
+        preflop_start=True,
+        # Deliberately a mixture that would size the run very differently, to
+        # show it is ignored rather than blended in.
+        street_mix=StreetMix(river=71, turn=21, flop=7),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _warn_if_budgets_are_mismatched(preflop, label_budget=5600, update_budget=4000)
+    with pytest.warns(RuntimeWarning, match="budget ratio mismatch"):
+        _warn_if_budgets_are_mismatched(preflop, label_budget=2000, update_budget=4000)
 
 
 def test_a_street_mix_needs_at_least_one_positive_weight():
@@ -604,7 +679,7 @@ def test_accuracy_ignores_hands_the_board_makes_impossible(tmp_path):
 
     net = HoldemValueNet(TINY_NET)
     rng = np.random.default_rng(0)
-    features = rng.standard_normal((4, 2852)).astype(np.float32)
+    features = rng.standard_normal((4, INPUT_DIM)).astype(np.float32)
     masks = np.zeros((4, 1326), dtype=np.float32)
     masks[:, :100] = 1.0  # only 100 legal hands
     targets = rng.standard_normal((4, 2, 1326)).astype(np.float32)
@@ -623,7 +698,7 @@ def test_a_perfect_predictor_scores_zero_error():
 
     net = HoldemValueNet(TINY_NET)
     rng = np.random.default_rng(1)
-    features = rng.standard_normal((6, 2852)).astype(np.float32)
+    features = rng.standard_normal((6, INPUT_DIM)).astype(np.float32)
     masks = np.ones((6, 1326), dtype=np.float32)
     # Use the network's own output as the target: error must vanish and R2 hit 1.
     targets = predict(net, features, masks)
@@ -657,7 +732,7 @@ def test_purging_drops_the_oldest_half_and_keeps_the_newest(tmp_path):
 
     def label(i):
         return Example(
-            features=np.full(2852, i, dtype=np.float32),
+            features=np.full(INPUT_DIM, i, dtype=np.float32),
             mask=np.ones(1326, dtype=np.float32),
             values=np.zeros((2, 1326), dtype=np.float32),
         )
@@ -748,7 +823,7 @@ def test_clipping_an_actor_batch_lands_on_the_budget():
     from paradigm_b.holdem.arm2_iterative.async_student import _clip
 
     batch = ActorBatch(
-        features=np.zeros((3, 2852), np.float32),
+        features=np.zeros((3, INPUT_DIM), np.float32),
         masks=np.ones((3, 1326), np.float32),
         targets=np.zeros((3, 2, 1326), np.float32),
         boards=[3, 4, 5],

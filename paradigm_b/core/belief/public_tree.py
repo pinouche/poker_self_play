@@ -15,7 +15,7 @@ and DeepStack search in.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 from paradigm_b.core.game.leduc import NUM_CARDS, Betting, card_name
@@ -104,16 +104,31 @@ class PublicTree:
     nodes: List[PublicNode]
     depth_limit: Optional[int]
     node_of_public: Dict[PublicState, PublicNode]
+    # Filled on first use.  A solve asks for these three times per CFR
+    # iteration — twice to sweep the decision nodes (regret matching, then
+    # discounting) and once for the leaf frontier — and each call used to
+    # rescan every node in the tree testing a string-valued ``kind``.  On a
+    # turn tree that is ~500 nodes x 3 x 40 iterations of pure Python for a
+    # list that cannot change: a tree is fully built before anyone reads it,
+    # and nothing mutates ``nodes`` afterwards.
+    _decision_nodes: Optional[List[PublicNode]] = field(
+        default=None, repr=False, compare=False
+    )
+    _leaves: Optional[List[PublicNode]] = field(default=None, repr=False, compare=False)
 
     @property
     def num_nodes(self) -> int:
         return len(self.nodes)
 
     def decision_nodes(self) -> List[PublicNode]:
-        return [n for n in self.nodes if n.is_decision]
+        if self._decision_nodes is None:
+            self._decision_nodes = [n for n in self.nodes if n.is_decision]
+        return self._decision_nodes
 
     def leaves(self) -> List[PublicNode]:
-        return [n for n in self.nodes if n.is_leaf]
+        if self._leaves is None:
+            self._leaves = [n for n in self.nodes if n.is_leaf]
+        return self._leaves
 
     def round_starts(self) -> List[PublicNode]:
         """Nodes that begin a betting round below the root.

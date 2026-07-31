@@ -37,8 +37,17 @@ import torch.nn as nn
 from paradigm_b.holdem.arms_common.budget import CountingLeafValues, SpendRecord
 from paradigm_b.holdem.arms_common.evaluation import EvaluationConfig, TestSituation, evaluate_agent
 from paradigm_b.holdem.arms_common.fitting import StudentResult, fit_value_net
-from paradigm_b.holdem.arms_common.situations import StreetMix, sample_mixed_situation
-from paradigm_b.holdem.arms_common.storage import PathLike, save_checkpoint
+from paradigm_b.holdem.arms_common.situations import (
+    StreetMix,
+    labels_from_street,
+    sample_trajectory_start,
+)
+from paradigm_b.holdem.arms_common.storage import (
+    PathLike,
+    load_run_state,
+    save_checkpoint,
+    save_run_state,
+)
 from paradigm_b.holdem.arm2_iterative.journal import JournalEntry, TrajectoryJournal
 from paradigm_b.holdem.net.policy import (
     HoldemPolicyNet,
@@ -64,6 +73,12 @@ class OnlineStudentConfig:
     self_play: HoldemSelfPlayConfig = field(default_factory=HoldemSelfPlayConfig)
     situations: SituationConfig = field(default_factory=SituationConfig)
     street_mix: StreetMix = field(default_factory=StreetMix)
+    # Start every trajectory at the blinds, which is ReBeL's own regime: the
+    # initial belief state is common knowledge, so no PBS distribution has to
+    # be handcrafted and ``street_mix`` is ignored.  Set it False to keep the
+    # DeepStack-style postflop sampler, which the fixed-vs-iterative comparison
+    # needs because it scores each street on its own held-out boards.
+    preflop_start: bool = True
     # ReBeL appendix E removes half the replay buffer after 20 of its 1,750
     # epochs, because the earliest labels were written by a random network.
     # ``None`` disables it; the labels still count against the label budget,
@@ -90,6 +105,20 @@ class OnlineStudentConfig:
     eval_every: Optional[int] = None
     # Keep a copy of the student every N iterations, so the run can be replayed.
     checkpoint_every: Optional[int] = None
+    # Write the *resumable* state — both networks, both optimisers, both
+    # buffers, the spend, the counters and the RNG — every N iterations.  A
+    # checkpoint is weights only and cannot continue a run: restarting from one
+    # rebuilds Adam's moments from scratch and trains the first few hundred
+    # steps against an empty replay buffer, which is a worse starting point
+    # than it looks.  ``None`` disables it.
+    #
+    # The buffers are what this costs: 60,000 examples is ~1.6GB, so at a
+    # 12-hour run a cadence around half an hour is the right order.
+    state_every: Optional[int] = None
+    # Continue from a directory written by ``state_every``.  Budgets are read as
+    # *totals*, so a run resumed at 400k of a 1M label budget generates the
+    # remaining 600k and then stops.
+    resume_from: Optional[str] = None
     value_net: HoldemValueNetConfig = field(default_factory=HoldemValueNetConfig)
     # theta_pi and D_pi.  Algorithm 2 carries a policy network alongside the
     # value network; it exists to warm-start search
@@ -133,6 +162,7 @@ def fit_online_student(
     evaluation: Optional[EvaluationConfig] = None,
     journal_path: Optional[PathLike] = None,
     checkpoint_path: Optional[PathLike] = None,
+    state_path: Optional[PathLike] = None,
 ) -> StudentResult:
     """Run Algorithm 1 until both budgets are exactly spent.
 
@@ -157,6 +187,7 @@ def fit_online_student(
             evaluation=evaluation,
             journal_path=journal_path,
             checkpoint_path=checkpoint_path,
+            state_path=state_path,
         )
 
     rng = rng if rng is not None else np.random.default_rng(config.seed)
@@ -186,6 +217,26 @@ def fit_online_student(
     situations = config.situations
     trajectory_id = 0
     iteration = 0
+
+    state_directory = _state_directory(config, state_path, checkpoint_path)
+    if config.resume_from is not None:
+        restored = load_run_state(
+            config.resume_from,
+            config=config,
+            net=net,
+            optimiser=optimiser,
+            buffer=buffer,
+            rng=rng,
+            policy_net=policy_net,
+            policy_optimiser=policy_optimiser,
+            policy_buffer=policy_buffer,
+        )
+        spend = restored["spend"]
+        iteration = restored["iteration"]
+        trajectory_id = restored["trajectory_id"]
+        initial_state = restored["initial_state"]
+        net.to(device)
+
     _warn_if_budgets_are_mismatched(config, label_budget, update_budget)
 
     while spend.labels < label_budget or spend.updates < update_budget:
@@ -200,8 +251,8 @@ def fit_online_student(
         for _ in range(config.trajectories_per_iteration):
             if spend.labels >= label_budget:
                 break
-            space, root, reach, board_cards = sample_mixed_situation(
-                rng, situations, config.street_mix
+            space, root, reach, board_cards = sample_trajectory_start(
+                rng, situations, config.street_mix, config.preflop_start
             )
             examples = collect_trajectory(
                 leaf_values,
@@ -296,6 +347,23 @@ def fit_online_student(
             record.update(evaluate_agent(net, tests, evaluation))
         history.append(record)
 
+        if state_directory is not None and _due(iteration, config.state_every, finished):
+            save_run_state(
+                state_directory,
+                config=config,
+                spend=spend,
+                iteration=iteration,
+                trajectory_id=trajectory_id,
+                rng=rng,
+                net=net,
+                optimiser=optimiser,
+                buffer=buffer,
+                initial_state=initial_state,
+                policy_net=policy_net,
+                policy_optimiser=policy_optimiser,
+                policy_buffer=policy_buffer,
+            )
+
         if checkpoint_path is not None and _due(iteration, config.checkpoint_every, finished):
             save_checkpoint(
                 net.state_dict(),
@@ -319,6 +387,20 @@ def fit_online_student(
     )
 
 
+def _labels_per_trajectory(config: "OnlineStudentConfig") -> float:
+    """How many labels one trajectory is expected to yield, under either regime.
+
+    A preflop-rooted hand passes through four betting rounds and emits a label
+    at each root plus one at each of the three pre-deal belief states it stops
+    in front of.  A postflop start emits fewer, and how many depends on the
+    street mixture.  Budget sizing needs the right one or a run silently spends
+    one of its two budgets long before the other.
+    """
+    if config.preflop_start:
+        return float(labels_from_street(0))
+    return config.street_mix.labels_per_trajectory
+
+
 def _warn_if_budgets_are_mismatched(
     config: OnlineStudentConfig, label_budget: int, update_budget: int
 ) -> None:
@@ -331,9 +413,7 @@ def _warn_if_budgets_are_mismatched(
     after training has stopped looks like a fair comparison in the results file
     and is not one, so this is worth a loud warning rather than a docstring.
     """
-    per_iteration = (
-        config.trajectories_per_iteration * config.street_mix.labels_per_trajectory
-    )
+    per_iteration = config.trajectories_per_iteration * _labels_per_trajectory(config)
     if per_iteration <= 0 or config.updates_per_iteration <= 0:
         return
 
@@ -360,7 +440,7 @@ def _warn_if_budgets_are_mismatched(
         round(
             (label_budget / update_budget)
             * config.updates_per_iteration
-            / config.street_mix.labels_per_trajectory
+            / _labels_per_trajectory(config)
         ),
         1,
     )
@@ -374,6 +454,28 @@ def _warn_if_budgets_are_mismatched(
         RuntimeWarning,
         stacklevel=3,
     )
+
+
+def _state_directory(
+    config, state_path: Optional[PathLike], checkpoint_path: Optional[PathLike]
+) -> Optional[Path]:
+    """Where the resumable state goes, if the run wants one.
+
+    Defaults to a sibling of the checkpoint directory rather than inside it:
+    checkpoints are a series and get globbed, the run state is a single
+    directory that is swapped in place, and mixing them makes both harder to
+    reason about.
+    """
+    if config.state_every is None and state_path is None:
+        return None
+    if state_path is not None:
+        return Path(state_path)
+    if checkpoint_path is None:
+        raise ValueError(
+            "state_every needs somewhere to write: pass state_path, or a "
+            "checkpoint_path to derive it from"
+        )
+    return Path(checkpoint_path).parent / "run_state"
 
 
 def _due(iteration: int, every: Optional[int], finished: bool) -> bool:

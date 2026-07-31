@@ -74,6 +74,15 @@ class ComparisonConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     value_net: HoldemValueNetConfig = field(default_factory=HoldemValueNetConfig)
     # Make the online arm draw streets in the artifact's own proportions.
+    #
+    # This also pins the online arm to the street-wise sampler, because a
+    # street mixture is only meaningful there: the preflop-rooted regime starts
+    # every hand at the blinds and never consults ``street_mix`` at all, so
+    # leaving it on would compute a matched mixture and then quietly ignore it,
+    # and the two arms would differ in input distribution as well as in label
+    # freshness — which is the one thing this comparison exists to isolate.
+    # Set it to False to compare against a preflop-rooted online arm instead,
+    # accepting that the arms then differ in two ways at once.
     match_street_mix: bool = True
     seed: int = 0
     device: str = "cpu"
@@ -241,8 +250,13 @@ def run_comparison(
     if config.match_street_mix:
         counts = {k: v for k, v in store.counts().items() if k in STREET_SOURCES}
         if counts:
+            # ``preflop_start=False`` alongside the mix, not instead of it: the
+            # preflop regime ignores ``street_mix``, so setting one without the
+            # other matches nothing.
             iterative_config = replace(
-                iterative_config, street_mix=StreetMix.from_label_counts(counts)
+                iterative_config,
+                street_mix=StreetMix.from_label_counts(counts),
+                preflop_start=False,
             )
     iterative_student = fit_online_student(
         iterative_config,

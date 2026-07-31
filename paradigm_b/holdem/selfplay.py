@@ -1,13 +1,25 @@
-"""ReBeL self play on a postflop hold'em endgame.
+"""ReBeL self play on a hold'em hand.
 
 Algorithm 2 of Brown et al. 2020 — ReBeL with Linear CFR-D data generation —
 line by line, with the differences hold'em forces:
 
-* a trajectory starts on any postflop street and follows the sampled CFR
-  iterate's reach distribution through every later street; the river solve runs
-  to real showdowns, so its values are exact;
+* a trajectory starts at the blinds (or, for an endgame run, on any postflop
+  street) and follows the sampled CFR iterate's reach distribution through
+  every later street; the river solve runs to real showdowns, so its values are
+  exact;
 * every example carries its own hand mask, because which of the 1,326 combos
   are possible depends on all five board cards.
+
+**Each pass emits two labels, not one.**  A subgame ends where its betting
+round ends, so the belief states the network is *queried* at sit in front of a
+board deal while the ones it is trained at — subgame roots — sit behind one.
+Those are ReBeL's two layers of values, and both need labels or the network is
+never trained on the question it is actually asked.  The pre-deal label is
+back-filled: the trajectory parks it (:class:`PendingDeal`), deals the board,
+solves the next subgame, and uses that root's value as a one-sample estimate of
+the average over boards.  Unbiased, and noisier than the exact enumeration that
+used to happen inside the tree — which is the trade that buys a preflop
+subgame at all, the flop deal having 19,600 outcomes.
 
 The correspondence to the pseudocode, since the whole point of this module is
 that it *is* the pseudocode:
@@ -31,6 +43,7 @@ that it *is* the pseudocode:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import comb
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -226,6 +239,7 @@ def collect_trajectory(
     public = root
     reach = space.initial_reach() if reach is None else np.asarray(reach, float)
     examples: List[Example] = []
+    pending: Optional[PendingDeal] = None
 
     while True:
         tree = build_turn_tree(public, depth_limit=config.depth_limit)
@@ -270,6 +284,23 @@ def collect_trajectory(
                     board=tuple(public.board),
                 )
             )
+            # The second of ReBeL's two value layers.  The subgame above this
+            # one stopped in front of a board deal and asked the network what
+            # that belief state was worth; this is the answer, and without it
+            # the network would be trained only on states it is never queried
+            # at and queried only at states it never sees a label for.
+            if pending is not None:
+                target = pre_deal_target(values, pending)
+                if target is not None:
+                    examples.append(
+                        Example(
+                            features=pending.features,
+                            mask=pending.mask,
+                            values=target,
+                            board=pending.board,
+                        )
+                    )
+        pending = None
 
         if not has_leaves:
             return examples
@@ -277,8 +308,92 @@ def collect_trajectory(
         chosen = sample_leaf(tree, space, solver.captured_strategy, reach, config, rng)
         if chosen is None:
             return examples
-        leaf, reach = chosen
-        public = leaf.public
+        leaf, leaf_reach = chosen
+
+        # SAMPLE_LEAF stops at the end of a betting round, so getting to the
+        # next subgame means dealing the board ourselves.
+        public, reach, deal_mask, weight = sample_deal(leaf.public, leaf_reach, rng)
+        pending = PendingDeal(
+            features=encode_pbs(space.pbs(leaf.public, leaf_reach)),
+            mask=board_mask(tuple(leaf.public.board)),
+            board=tuple(leaf.public.board),
+            mass_before=leaf_reach.sum(axis=1),
+            mass_after=reach.sum(axis=1),
+            weight=weight,
+            deal_mask=deal_mask,
+        )
+
+
+@dataclass
+class PendingDeal:
+    """A pre-deal belief state, held back until the next subgame prices it.
+
+    A subgame now stops at the *end* of its betting round, so the thing the
+    value network is asked about at the depth limit is a belief state whose
+    board has not come out yet.  Nothing in that subgame knows what it is
+    worth — the answer lives on the other side of the chance node — so the
+    example is parked here and completed once the next subgame has been solved.
+    """
+
+    features: np.ndarray
+    mask: np.ndarray
+    board: Tuple[int, ...]
+    # Reach mass per player before and after the deal, and the importance
+    # weight; together these turn one sampled board's value into an estimate of
+    # the average over every board.  See :func:`pre_deal_target`.
+    mass_before: np.ndarray
+    mass_after: np.ndarray
+    weight: float
+    deal_mask: np.ndarray
+
+
+def sample_deal(public: PublicState, reach: np.ndarray, rng: np.random.Generator):
+    """Turn over the next chance outcome and narrow both ranges by it.
+
+    Returns the post-deal public state, the narrowed reach vectors, and the
+    importance weight that makes one sampled outcome an unbiased stand-in for
+    the average over all of them.
+
+    That weight is not 1, and the reason is card removal.  The solver's exact
+    chance node (:meth:`SubgameSolver._chance_values`) weights each outcome by
+    ``1 / C(free - 4, k)`` — the deal is conditioned on both players already
+    holding two cards each — while sampling uniformly from the cards the *board*
+    has not used draws from ``C(free, k)`` candidates.  The ratio corrects the
+    difference.  It is close to one (48/44 for a river, 1.28 for a flop) but it
+    is a systematic scale error on a whole layer of training labels, not noise
+    that averages away.
+    """
+    free = public.undealt_cards()
+    count = public.cards_to_deal
+    chosen = rng.choice(len(free), size=count, replace=False)
+    cards = tuple(sorted(int(free[i]) for i in chosen))
+    deal_mask = board_mask(cards)
+    weight = comb(len(free), count) / comb(len(free) - 2 * NUM_PLAYERS, count)
+    return public.with_cards(cards), reach * deal_mask, deal_mask, float(weight)
+
+
+def pre_deal_target(
+    values: np.ndarray, pending: PendingDeal
+) -> Optional[np.ndarray]:
+    """The label for a pre-deal belief state, from the post-deal one's value.
+
+    Both are stored per unit of *opponent reach mass* (see :func:`normalise`),
+    and the deal changes that mass — it removes every hand using a board card —
+    so the post-deal label has to be rescaled by the ratio before it describes
+    the same quantity on the other side of the chance node.  Miss the rescaling
+    and the pre-deal layer is trained on values that are systematically a few
+    percent too large, in a direction that depends on how much of the range the
+    board happened to block.
+    """
+    before = pending.mass_before
+    if before.min() <= 0.0:
+        return None
+    out = np.empty_like(values)
+    for player in range(NUM_PLAYERS):
+        opponent = 1 - player
+        ratio = pending.mass_after[opponent] / before[opponent]
+        out[player] = values[player] * ratio * pending.weight * pending.deal_mask
+    return out
 
 
 def sample_iteration(warm_iterations: int, total: int, rng: np.random.Generator) -> int:

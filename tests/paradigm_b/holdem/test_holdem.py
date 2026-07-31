@@ -12,7 +12,14 @@ import numpy as np
 import pytest
 
 from paradigm_b.core.cfr import CFRConfig
-from paradigm_b.holdem.engine.betting import ALL_IN, BET_POT, CALL, FOLD, Betting
+from paradigm_b.holdem.engine.betting import (
+    ALL_IN,
+    BET_POT,
+    CALL,
+    FIRST_BET,
+    FOLD,
+    Betting,
+)
 from paradigm_b.holdem.engine.combos import (
     COMBO_CARDS,
     NUM_COMBOS,
@@ -212,11 +219,20 @@ def test_folding_costs_what_you_put_in_plus_your_half_of_the_pot():
 
 
 # --- the tree ---------------------------------------------------------------
+def _deal_one(public):
+    """Turn over the next card at a pre-deal leaf, lowest undealt one first."""
+    return public.with_board(public.undealt_cards()[0])
+
+
 def test_turn_tree_shape():
     tree = build_turn_tree(endgame_root(), depth_limit=1)
     endings = {leaf.public.betting.history for leaf in tree.leaves()}
-    assert len(tree.leaves()) == 48 * len(endings), "one leaf per river per line"
-    assert all(len(leaf.public.board) == 5 for leaf in tree.leaves())
+    # One leaf per betting line, in front of the deal rather than 48 behind it:
+    # the depth limit falls where the round's betting ends.
+    assert len(tree.leaves()) == len(endings), "one leaf per line, before the deal"
+    assert all(len(leaf.public.board) == 4 for leaf in tree.leaves())
+    assert all(leaf.public.awaiting_board for leaf in tree.leaves())
+    assert not any(node.is_chance for node in tree.nodes)
     assert all(node.public.betting_round == 0 for node in tree.decision_nodes())
 
     full = build_turn_tree(endgame_root(), depth_limit=None)
@@ -226,7 +242,9 @@ def test_turn_tree_shape():
 
 
 def test_every_river_card_is_dealt_once():
-    tree = build_turn_tree(endgame_root(), depth_limit=1)
+    # Only an unbounded tree still expands the deal; a depth-limited one stops
+    # in front of it and lets the value network price the whole chance node.
+    tree = build_turn_tree(endgame_root(), depth_limit=None)
     chance = [n for n in tree.nodes if n.is_chance][0]
     assert len(chance.boards) == 48, "52 cards less the four on the turn"
     assert len(set(chance.boards)) == 48
@@ -286,13 +304,23 @@ def test_translation_is_exact_at_the_abstraction_sizes():
 
 
 def test_translation_splits_off_tree_bets_and_stays_monotone():
+    # A two-size abstraction, pinned rather than inherited from the default.
+    # This is a test of the *mapping*, not of which sizes ship: reading it
+    # against whatever ``DEFAULT_BET_FRACTIONS`` happens to be made it depend
+    # on action id 2 meaning "the smaller of two bets", which stopped being
+    # true the moment a 0.25x size was added below it.
     from paradigm_b.holdem.engine.translation import translate_bet
 
-    betting = Betting(starting_pot=20, stack=200, max_raises=1)  # sizes: 10, 20, all-in
+    smallest = FIRST_BET  # sizes: 10, 20, all-in
+    betting = Betting(
+        starting_pot=20, stack=200, max_raises=1, bet_fractions=(0.5, 1.0)
+    )
     split = translate_bet(betting, 15)
     assert len(split) == 2 and sum(split.values()) == pytest.approx(1.0)
     # As the real bet grows, weight moves off the small size and never back.
-    weights = [translate_bet(betting, amount).get(2, 0.0) for amount in range(10, 21)]
+    weights = [
+        translate_bet(betting, amount).get(smallest, 0.0) for amount in range(10, 21)
+    ]
     assert all(a >= b for a, b in zip(weights, weights[1:]))
     assert weights[0] == pytest.approx(1.0) and weights[-1] == pytest.approx(0.0)
 
@@ -368,15 +396,18 @@ def test_a_flop_rooted_tree_reaches_the_river_one_street_at_a_time():
     from paradigm_b.holdem.engine.public_tree import build_endgame_tree
 
     flop = build_endgame_tree(flop_root(), depth_limit=1)
-    assert len(flop.leaves()) == 49 * len(
+    assert len(flop.leaves()) == len(
         {leaf.public.betting.history for leaf in flop.leaves()}
     )
-    assert all(len(leaf.public.board) == 4 for leaf in flop.leaves())
+    assert all(len(leaf.public.board) == 3 for leaf in flop.leaves())
 
-    turn = build_endgame_tree(flop.leaves()[0].public, depth_limit=1)
-    assert all(len(leaf.public.board) == 5 for leaf in turn.leaves())
+    # Crossing a street now means dealing the board, because the subgame
+    # stopped before the chance node rather than after it.
+    turn_public = _deal_one(flop.leaves()[0].public)
+    turn = build_endgame_tree(turn_public, depth_limit=1)
+    assert all(len(leaf.public.board) == 4 for leaf in turn.leaves())
 
-    river = build_endgame_tree(turn.leaves()[0].public, depth_limit=1)
+    river = build_endgame_tree(_deal_one(turn.leaves()[0].public), depth_limit=1)
     assert river.leaves() == [], "the river runs to real showdowns"
     assert any(node.is_terminal for node in river.nodes)
 
@@ -407,7 +438,7 @@ def test_chance_weights_match_the_cards_actually_left():
     root = flop_root()
     # 52 less three board cards and four hole cards.
     assert space.chance_weight(root) == pytest.approx(1 / 45)
-    turn = build_endgame_tree(root, depth_limit=1).leaves()[0].public
+    turn = _deal_one(build_endgame_tree(root, depth_limit=1).leaves()[0].public)
     assert space.chance_weight(turn) == pytest.approx(1 / 44)
 
 
@@ -415,8 +446,8 @@ def test_a_flop_endgame_solves_at_the_river():
     from paradigm_b.holdem.engine.public_tree import build_endgame_tree
 
     flop = build_endgame_tree(flop_root(), depth_limit=1)
-    turn = build_endgame_tree(flop.leaves()[0].public, depth_limit=1)
-    river_public = turn.leaves()[0].public
+    turn = build_endgame_tree(_deal_one(flop.leaves()[0].public), depth_limit=1)
+    river_public = _deal_one(turn.leaves()[0].public)
     space = TurnEndgameSpace((51, 47, 22))
     tree = build_endgame_tree(river_public, depth_limit=None)
     reach = space.initial_reach() * board_mask(tuple(river_public.board))
@@ -469,6 +500,14 @@ def test_values_scale_linearly_with_the_pot():
     This is what lets one solve label examples at every pot size, and it is
     exact — until integer chip rounding bites, which is why generation uses a
     reference pot large enough that it does not.
+
+    **How large "large enough" is depends on the abstraction.**  A bet is
+    ``round(fraction * pot)``, so the property holds only where every reachable
+    pot times every fraction is a whole number of chips.  With sizes
+    (0.5, 1.0) an even pot sufficed; adding a 0.25x size makes the binding
+    requirement a pot divisible by 8 — the quarter has to survive the pot
+    growing by half after a quarter-pot bet and a call.  Verified directly:
+    pots 40/80/160 scale exactly under the default sizes, 20 and 100 do not.
     """
     from paradigm_b.holdem.engine.public_tree import build_endgame_tree
     from paradigm_b.holdem.data.sampling import sample_range
@@ -479,7 +518,7 @@ def test_values_scale_linearly_with_the_pot():
     reach = np.stack([sample_range(rng, board, "dirichlet") for _ in range(2)])
 
     values = {}
-    for pot, stack in ((20, 100), (80, 400)):
+    for pot, stack in ((40, 200), (160, 800)):
         root = PublicState(
             betting=Betting(starting_pot=pot, stack=stack, max_raises=1), board=board
         )
@@ -489,7 +528,7 @@ def test_values_scale_linearly_with_the_pot():
         solver.solve(reach=reach, iterations=30)
         values[pot] = solver.root_values()
 
-    assert np.abs(values[80] - 4.0 * values[20]).max() < 1e-9
+    assert np.abs(values[160] - 4.0 * values[40]).max() < 1e-9
 
 
 def test_batched_river_solver_matches_solving_one_at_a_time():
@@ -593,6 +632,26 @@ def test_bootstrapped_target_matches_an_exact_solve():
     This separates "is the bootstrap arithmetic right" from "is the network
     good" — the confusion that is otherwise impossible to untangle, and the only
     check of the turn layer that does not depend on a trained network.
+
+    **Run near convergence, not at an arbitrary iteration count.**  Both sides
+    are solved to the same number of CFR iterations, so at a low count the
+    residual is dominated by how far *both* solvers still are from their own
+    fixed point — which depends on how many decision nodes the abstraction has,
+    not on whether the bootstrap arithmetic is correct.  Measured, same board
+    and ranges, weighted gap by iterations:
+
+    ================  =====  =====  =====
+    bet fractions       120    240    480
+    ================  =====  =====  =====
+    (0.5, 1.0)        1.556  0.404  0.132
+    (0.25 .. 2.0)     1.767  0.901  0.210
+    ================  =====  =====  =====
+
+    Both go to zero; the wider abstraction is simply behind at equal effort.
+    Gating at 120 therefore measured convergence rate and broke the moment a
+    third and fourth bet size were added.  240 with a 1.5 bound keeps a real
+    check — a broken bootstrap does not converge at all — without pinning the
+    test to one abstraction's node count.
     """
     from paradigm_b.holdem.data.bootstrap import BootstrapConfig, normalise_values, street_state
     from paradigm_b.holdem.engine.public_tree import build_endgame_tree
@@ -605,7 +664,7 @@ def test_bootstrapped_target_matches_an_exact_solve():
     public = PublicState(betting=street_state(config, 100, 300), board=board)
     rng = np.random.default_rng(0)
     reach = np.stack([sample_range(rng, board, "dirichlet") for _ in range(2)])
-    iterations = 120
+    iterations = 240
 
     depth_limited = SubgameSolver(
         build_endgame_tree(public, depth_limit=1),
@@ -631,6 +690,6 @@ def test_bootstrapped_target_matches_an_exact_solve():
     weighted = float(
         (reach[:, live] * np.abs(bootstrapped - exact)[:, live]).sum()
     )
-    assert weighted < 2.0, weighted
+    assert weighted < 1.5, weighted
 
 

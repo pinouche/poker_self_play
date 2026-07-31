@@ -11,6 +11,7 @@ from paradigm_b.holdem.net.features import (
     CARD_SET_DIM,
     HISTORY_OFFSET,
     MAX_ACTIONS_PER_ROUND,
+    NUM_BETTING_ROUNDS,
     encode_pbs as encode_holdem_pbs,
     encode_public as encode_holdem_public,
 )
@@ -68,13 +69,15 @@ def test_holdem_betting_history_preserves_action_order_and_sizes():
 
     features = encode_holdem_public(public)
     history = features[HISTORY_OFFSET - BOARD_OFFSET :].reshape(
-        3, MAX_ACTIONS_PER_ROUND, 2
+        NUM_BETTING_ROUNDS, MAX_ACTIONS_PER_ROUND, 2
     )
 
-    assert np.count_nonzero(history[0]) == 0
-    np.testing.assert_allclose(history[1, :2], [[1.0, 0.1], [1.0, 0.1]])
-    assert np.count_nonzero(history[1, 2:]) == 0
-    assert np.count_nonzero(history[2]) == 0
+    # Four slots now that a hand can start preflop, and a two-round endgame
+    # right-aligns into the last two of them.
+    assert np.count_nonzero(history[:2]) == 0
+    np.testing.assert_allclose(history[2, :2], [[1.0, 0.1], [1.0, 0.1]])
+    assert np.count_nonzero(history[2, 2:]) == 0
+    assert np.count_nonzero(history[3]) == 0
 
 
 def test_holdem_betting_history_keeps_rounds_separate():
@@ -84,12 +87,12 @@ def test_holdem_betting_history_keeps_rounds_separate():
 
     features = encode_holdem_public(public)
     history = features[HISTORY_OFFSET - BOARD_OFFSET :].reshape(
-        3, MAX_ACTIONS_PER_ROUND, 2
+        NUM_BETTING_ROUNDS, MAX_ACTIONS_PER_ROUND, 2
     )
 
-    assert np.count_nonzero(history[0]) == 0
-    np.testing.assert_allclose(history[1, :2], [[1.0, 0.1], [1.0, 0.1]])
-    np.testing.assert_allclose(history[2, :2], [[1.0, 0.0], [1.0, 0.0]])
+    assert np.count_nonzero(history[:2]) == 0
+    np.testing.assert_allclose(history[2, :2], [[1.0, 0.1], [1.0, 0.1]])
+    np.testing.assert_allclose(history[3, :2], [[1.0, 0.0], [1.0, 0.0]])
 
 
 def test_holdem_betting_history_rejects_more_than_six_actions_per_round():
@@ -171,12 +174,23 @@ def test_holdem_self_play_follows_a_sampled_flop_through_every_street():
         reach=reach,
     )
 
-    assert [int(example.mask.sum()) for example in examples] == [1176, 1128, 1081]
+    # Two layers per street: each subgame's root, then the pre-deal belief
+    # state it stopped in front of, back-filled once the next one is solved.
+    # Hence flop, turn, flop-again, river, turn-again.
+    assert [int(example.mask.sum()) for example in examples] == [
+        1176,
+        1128,
+        1176,
+        1081,
+        1128,
+    ]
 
 
 @pytest.mark.parametrize(
     ("board_cards", "expected_rounds", "expected_examples"),
-    [(3, 3, 3), (4, 2, 2), (5, 1, 1)],
+    # 2n - 1 labels from n betting rounds: a root apiece, plus a pre-deal one
+    # for every deal the trajectory crosses.
+    [(3, 3, 5), (4, 2, 3), (5, 1, 1)],
 )
 def test_sampled_trajectory_covers_every_remaining_postflop_street(
     board_cards, expected_rounds, expected_examples

@@ -82,8 +82,8 @@ class EndgameSpace(HandSpace):
         """
         betting = public.betting
         values = np.empty((NUM_PLAYERS, self.num_hands))
-        mask = self.possible_mask(public)
         if betting.folder >= 0:
+            mask = self.possible_mask(public)
             winner = 1 - betting.folder
             stake = betting.fold_returns()[winner]
             for player in range(NUM_PLAYERS):
@@ -96,10 +96,18 @@ class EndgameSpace(HandSpace):
                     * mask
                 )
             return values
+        # The showdown branch never wanted the mask: ``showdown_values`` skips
+        # blocked combos in its prefix sums, so its answer is already zero
+        # there.  Computing it up front for both branches cost a board-tuple
+        # hash and a cache lookup on every one of the ~40,000 showdowns a label
+        # walks, for a value only the fold branch reads.
         stake = betting.showdown_stake()
         board = tuple(public.board)
-        values[0] = self.pair_correction * showdown_values(board, reach[1], stake)
-        values[1] = self.pair_correction * showdown_values(board, reach[0], stake)
+        # Written straight into the rows that are about to be returned, then
+        # scaled in place — same arithmetic, four fewer 1,326-vectors per call.
+        showdown_values(board, reach[1], stake, out=values[0])
+        showdown_values(board, reach[0], stake, out=values[1])
+        values *= self.pair_correction
         return values
 
 

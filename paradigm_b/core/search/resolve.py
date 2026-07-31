@@ -26,12 +26,23 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from paradigm_b.core.belief.public_tree import PublicNode, PublicState, PublicTree, build_public_tree
+from paradigm_b.core.belief.public_tree import (
+    LEAF,
+    PublicNode,
+    PublicState,
+    PublicTree,
+    build_public_tree,
+)
 from paradigm_b.core.belief.ranges import NUM_PLAYERS, PBS, initial_reach
 from paradigm_b.core.cfr.policy import TabularPolicy
 from paradigm_b.core.cfr.tabular_cfr import CFRConfig
 from paradigm_b.core.game.tree import GameTree
-from paradigm_b.core.search.evaluate import leaf_counterfactual_values, range_values, reaches_at
+from paradigm_b.core.search.evaluate import (
+    leaf_counterfactual_values,
+    leaf_reaches,
+    range_values,
+    reaches_at,
+)
 from paradigm_b.core.search.policy import StrategyMap, strategy_map, tabular_policy_from_strategies
 from paradigm_b.core.search.space import LEDUC_SPACE, HandSpace
 from paradigm_b.core.search.subgame import Gadget, LeafValueFn, SubgameSolver
@@ -143,19 +154,64 @@ class ContinualResolver:
     ) -> List[Tuple[PublicNode, np.ndarray]]:
         """Where to stop and solve again, with the ranges arriving there.
 
-        Every start of a betting round below this solve's root.  When the depth
-        limit is one round those are exactly the leaves, and this is ordinary
-        depth-limited search.  When the lookahead reaches further, they are the
-        points DeepStack calls again at instead of following the plan it already
-        computed — which matters, because the plan was computed against ranges
-        that the opponent's actual betting has since narrowed.
+        Every start of a betting round below this solve's root.  When the
+        lookahead reaches past a board deal these are nodes of this tree, and
+        they are the points DeepStack calls again at instead of following the
+        plan it already computed — which matters, because the plan was computed
+        against ranges that the opponent's actual betting has since narrowed.
+
+        With the depth limit at one round the tree stops *in front of* the deal,
+        so there are no such nodes and the next belief states have to be dealt
+        out by hand — see :meth:`_across_the_deal`.
         """
         points = tree.round_starts()
-        if not points:
-            return []
-        return reaches_at(
-            tree, strategies, reach, {node.public for node in points}, space=self.space
-        )
+        if points:
+            return reaches_at(
+                tree, strategies, reach, {node.public for node in points}, space=self.space
+            )
+        return self._across_the_deal(tree, strategies, reach)
+
+    def _across_the_deal(
+        self, tree: PublicTree, strategies: StrategyMap, reach: np.ndarray
+    ) -> List[Tuple[PublicNode, np.ndarray]]:
+        """Step each end-of-round leaf over the chance node in front of it.
+
+        A subgame that ends where the betting ends leaves the agent holding a
+        belief state the board has not been dealt into yet, so the states to
+        solve next are one outcome away: every card the deck can still turn
+        over, with both ranges narrowed by it.  This is the enumeration that
+        used to happen inside the tree, moved to the only place that can still
+        afford to do it — outside the CFR loop, once per solve rather than once
+        per iteration.
+
+        The synthesised nodes are marked ``LEAF`` so that :meth:`_promise` holds
+        the next solve to the value network's opinion of the post-deal belief
+        state, which is exactly the promise a post-deal leaf carried before.
+
+        A deal of more than one card is left alone.  Only the flop is like that,
+        and its 19,600 outcomes are not something continual re-solving can walk;
+        the pre-deal leaf keeps its network value and the recursion stops there,
+        which is the honest behaviour for a bounded agent.
+        """
+        out: List[Tuple[PublicNode, np.ndarray]] = []
+        for leaf, leaf_reach in leaf_reaches(tree, strategies, reach, space=self.space):
+            public = leaf.public
+            if not public.awaiting_board or public.cards_to_deal != 1:
+                continue
+            for card in public.undealt_cards():
+                mask = self.space.deal_mask(card)
+                child_reach = leaf_reach * mask
+                if child_reach.sum() <= 0.0:
+                    continue
+                out.append(
+                    (
+                        PublicNode(
+                            index=-1, kind=LEAF, public=public.with_board(card)
+                        ),
+                        child_reach,
+                    )
+                )
+        return out
 
     def _promise(
         self,

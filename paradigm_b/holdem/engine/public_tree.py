@@ -1,9 +1,21 @@
-"""The public tree of a hold'em turn endgame.
+"""The public tree of a hold'em hand, or of any endgame inside it.
 
 Same shape as the Leduc public tree — decision, chance, terminal, leaf — with a
 board that is a tuple of cards rather than one card, and a chance node that
 deals 44 rivers instead of 4 boards.  The node and tree containers are shared;
 only the state and the expansion differ.
+
+**Where the depth limit falls.**  A truncated branch ends at the *end* of its
+betting round, before the board is dealt — ReBeL's subgame boundary, and the
+reason its value network has to learn six layers of values (the end of each
+round as well as the start of the next) where DeepStack learned three.  The
+alternative, expanding the chance node and truncating after the deal, is what
+this tree used to do; it is exact but it costs one network evaluation per board
+per frontier line, and preflop it is not available at all, because the flop deal
+has C(50,3) = 19,600 outcomes against the river's 44.  Since a value network is
+queried at the truncation point and trained at subgame roots, moving the
+boundary means both layers now need training labels — see
+``holdem/selfplay.py``, which emits them.
 """
 
 from __future__ import annotations
@@ -14,6 +26,8 @@ from typing import Optional, Tuple
 from paradigm_b.core.belief.public_tree import CHANCE, DECISION, LEAF, TERMINAL, PublicNode, PublicTree
 from paradigm_b.holdem.engine.betting import Betting
 from paradigm_b.holdem.engine.combos import NUM_CARDS, cards_to_str
+
+FLOP_CARDS = 3
 
 
 @dataclass(frozen=True)
@@ -49,7 +63,27 @@ class PublicState:
         return replace(self, betting=self.betting.apply(action))
 
     def with_board(self, card: int) -> "PublicState":
-        return PublicState(betting=self.betting.deal_board(), board=self.board + (card,))
+        return self.with_cards((card,))
+
+    def with_cards(self, cards: Tuple[int, ...]) -> "PublicState":
+        """Reveal a whole chance outcome at once — one card, or a three-card flop."""
+        return PublicState(
+            betting=self.betting.deal_board(), board=self.board + tuple(cards)
+        )
+
+    def undealt_cards(self) -> Tuple[int, ...]:
+        """Cards the deck can still turn over, ignoring anyone's hole cards."""
+        return tuple(c for c in range(NUM_CARDS) if c not in self.board)
+
+    @property
+    def cards_to_deal(self) -> int:
+        """How many cards the next chance outcome turns over.
+
+        Three preflop and one thereafter, which is the whole reason a preflop
+        subgame cannot enumerate its chance node: C(50,3) is 19,600 boards
+        against 48 for the turn.
+        """
+        return FLOP_CARDS if not self.board else 1
 
     def __str__(self) -> str:  # pragma: no cover - debugging aid
         return f"<{cards_to_str(self.board)} | {self.betting}>"
@@ -81,26 +115,30 @@ def _expand(public: PublicState, tree: PublicTree, last_round: Optional[int]) ->
         return node
 
     if public.awaiting_board:
-        beyond_limit = last_round is not None and public.betting_round > last_round
-        rivers = tuple(c for c in range(NUM_CARDS) if c not in public.board)
-        node = PublicNode(index=index, kind=CHANCE, public=public, boards=rivers)
+        if last_round is not None and public.betting_round > last_round:
+            # The depth limit, and it falls here rather than past the deal: the
+            # betting of this round is finished, the board is not yet out, and
+            # what this belief state is worth is exactly what the value network
+            # is for.  Stopping in front of the chance node instead of behind
+            # it is what makes a preflop subgame possible.
+            node = PublicNode(index=index, kind=LEAF, public=public)
+            tree.nodes.append(node)
+            tree.node_of_public[public] = node
+            return node
+
+        if public.cards_to_deal != 1:
+            raise ValueError(
+                f"expanding this chance node enumerates a {public.cards_to_deal}"
+                "-card deal (19,600 flops); a subgame that reaches the flop deal "
+                "must stop in front of it, which is what depth_limit=1 does"
+            )
+        cards = tuple(c for c in range(NUM_CARDS) if c not in public.board)
+        node = PublicNode(index=index, kind=CHANCE, public=public, boards=cards)
         tree.nodes.append(node)
         tree.node_of_public[public] = node
-        children = []
-        for card in rivers:
-            child_public = public.with_board(card)
-            if child_public.is_terminal:
-                child = _expand(child_public, tree, last_round)
-            elif beyond_limit:
-                child = PublicNode(
-                    index=len(tree.nodes), kind=LEAF, public=child_public
-                )
-                tree.nodes.append(child)
-                tree.node_of_public[child_public] = child
-            else:
-                child = _expand(child_public, tree, last_round)
-            children.append(child)
-        node.children = tuple(children)
+        node.children = tuple(
+            _expand(public.with_board(card), tree, last_round) for card in cards
+        )
         return node
 
     actions = public.legal_actions()

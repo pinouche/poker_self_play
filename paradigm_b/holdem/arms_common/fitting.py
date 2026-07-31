@@ -47,7 +47,15 @@ def fit_value_net(
     if steps <= 0:
         return 0.0, 0
     net.train()
-    total = 0.0
+    # ``loss.item()`` inside the loop is a synchronisation point: on an
+    # accelerator it blocks until that step's backward has actually finished,
+    # so the queue drains to empty once per gradient step and the next step's
+    # work cannot be enqueued behind it.  The losses are only ever summed for
+    # a reported average, so the reads are deferred: detached scalars are kept
+    # (no graph, 40 floats) and converted after the loop, where the work is
+    # already done.  The arithmetic is unchanged -- the same float32 values,
+    # widened and summed in Python floats in the same order.
+    losses: List[torch.Tensor] = []
     for _ in range(steps):
         features, masks, targets = sample_fn(batch_size, rng)
         optimiser.zero_grad(set_to_none=True)
@@ -60,6 +68,9 @@ def fit_value_net(
         )
         loss.backward()
         optimiser.step()
+        losses.append(loss.detach())
+    total = 0.0
+    for loss in losses:
         total += float(loss.item())
     return total, steps
 

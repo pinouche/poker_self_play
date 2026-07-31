@@ -48,6 +48,7 @@ from paradigm_b.holdem.engine.space import TurnEndgameSpace
 from paradigm_b.holdem.net.leaf_values import NetLeafValues
 from paradigm_b.core.search import ContinualResolver, ResolveConfig
 from paradigm_b.core.search.best_response import subgame_exploitability
+from paradigm_b.holdem.arms_common.lbr import LBRConfig, lbr_values
 
 
 @dataclass
@@ -83,6 +84,13 @@ class EvaluationConfig:
     # ~11,000 solves.  ``None`` for any street asks for the exact tree.
     flop_tree_depth_limit: Optional[int] = 1
     device: str = "cpu"
+    # Also score with a responder that is allowed *off* the agent's abstraction
+    # (see :mod:`.lbr`).  Off by default: it is a second pair of traversals per
+    # situation, and — more to the point — it answers a different question from
+    # the exact best response above, which stays the headline number because it
+    # is the one that is exact.
+    local_best_response: bool = False
+    lbr: LBRConfig = field(default_factory=LBRConfig)
 
     def tree_depth_limit(self, board_cards: int) -> Optional[int]:
         return self.flop_tree_depth_limit if board_cards == 3 else None
@@ -138,19 +146,23 @@ def all_held_out_boards(
     )
 
 
-def exploitability_on(
+def scores_on(
     net: HoldemValueNet,
     situation: TestSituation,
     search_iterations: int,
     safe_resolving: bool,
     device: str = "cpu",
     tree_depth_limit: Optional[int] = None,
-) -> float:
-    """Exploitability of ``net`` played as a continual-resolving agent.
+    lbr: Optional[LBRConfig] = None,
+) -> Dict[str, float]:
+    """Every score for ``net`` played as a continual-resolving agent, here.
 
     ``tree_depth_limit`` bounds both the scoring tree and the agent's own
     re-solving, and the same network prices the resulting leaves on both sides,
     so the agent is never charged for a horizon it was not given.
+
+    Passing ``lbr`` adds the off-abstraction responder's numbers alongside the
+    exact one, computed against the identical strategy.
     """
     net.eval()
     leaf_values = NetLeafValues(net, situation.space, device=device)
@@ -185,7 +197,29 @@ def exploitability_on(
         leaf_value_fn=leaf_values if tree.leaves() else None,
         space=situation.space,
     )
-    return float(total)
+    scores = {"exploitability": float(total)}
+    if lbr is not None:
+        # Same strategy, same situation, a responder with different actions.
+        # Re-solving to get the strategy a second time would double the cost of
+        # the expensive half for nothing.
+        scores.update(
+            lbr_values(situation.space, filled, situation.root, situation.reach, lbr)
+        )
+    return scores
+
+
+def exploitability_on(
+    net: HoldemValueNet,
+    situation: TestSituation,
+    search_iterations: int,
+    safe_resolving: bool,
+    device: str = "cpu",
+    tree_depth_limit: Optional[int] = None,
+) -> float:
+    """Just the exact best-response number; see :func:`scores_on`."""
+    return scores_on(
+        net, situation, search_iterations, safe_resolving, device, tree_depth_limit
+    )["exploitability"]
 
 
 def evaluate_agent(
@@ -212,22 +246,45 @@ def evaluate_agent(
     for board_cards, street_situations in sorted(situations.items()):
         name = STREET_NAMES.get(board_cards, str(board_cards))
         per_board = [
-            exploitability_on(
+            scores_on(
                 net,
                 situation,
                 config.search_iterations,
                 config.safe_resolving,
                 config.device,
                 tree_depth_limit=config.tree_depth_limit(board_cards),
+                lbr=config.lbr if config.local_best_response else None,
             )
             for situation in street_situations
         ]
-        scores[name] = float(np.mean(per_board))
-        scores[f"{name}_worst"] = float(np.max(per_board))
-    street_means = [v for k, v in scores.items() if not k.endswith("_worst")]
+        exploitabilities = [board["exploitability"] for board in per_board]
+        scores[name] = float(np.mean(exploitabilities))
+        scores[f"{name}_worst"] = float(np.max(exploitabilities))
+        if config.local_best_response:
+            for key in ("lbr_classic", "lbr_full"):
+                scores[f"{name}_{key}"] = float(
+                    np.mean([board[key] for board in per_board])
+                )
+    # Averaged over the street keys *by name*, not by pattern-matching the
+    # score dict.  The old "everything that is not ``_worst``" rule silently
+    # swallowed any new per-street entry — the LBR ones would have been
+    # averaged into the headline exploitability without a word.
+    street_names = [
+        STREET_NAMES.get(cards, str(cards)) for cards in sorted(situations)
+    ]
+    street_means = [scores[name] for name in street_names if name in scores]
     scores["aggregate_all_streets"] = (
         float(np.mean(street_means)) if street_means else float("nan")
     )
+    if config.local_best_response:
+        for key in ("lbr_classic", "lbr_full"):
+            per_street = [
+                scores[f"{name}_{key}"]
+                for name in street_names
+                if f"{name}_{key}" in scores
+            ]
+            if per_street:
+                scores[f"aggregate_{key}"] = float(np.mean(per_street))
     # Streets where the agent's own re-solve is depth-limited, and therefore
     # where the network actually decides anything.  The river is not one.
     sensitive = [

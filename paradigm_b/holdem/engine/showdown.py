@@ -117,8 +117,20 @@ def showdown_index(board: Tuple[int, ...]) -> ShowdownIndex:
     position = np.zeros(NUM_COMBOS, dtype=np.int64)
     position[order] = np.arange(len(order))
     legal = ranks != ILLEGAL
-    card_of, holder_of = np.nonzero(CARD_IN_COMBO[:, legal])
-    hands = np.flatnonzero(legal)[holder_of]
+    # Every legal hand contributes exactly two (card, hand) entries, so the
+    # table can be written down directly.  Reading them off
+    # ``nonzero(CARD_IN_COMBO[:, legal])`` instead materialised a (52, ~1081)
+    # boolean and scanned all 56,000 cells to find the ~2,160 that are set —
+    # twenty-six times the work, on the second-hottest board-table path.
+    #
+    # The pairing is what has to survive: ``repeat`` gives each hand twice,
+    # ``COMBO_CARDS[...].reshape(-1)`` gives its two cards in the same order.
+    # The subsequent sort makes the order this arrives in irrelevant anyway —
+    # ``card * scale + position`` is unique per entry, because a position
+    # identifies one hand — so the result is the same array either way.
+    legal_hands = np.flatnonzero(legal)
+    hands = np.repeat(legal_hands, 2)
+    card_of = COMBO_CARDS[legal_hands].reshape(-1)
     scale = np.int64(NUM_COMBOS + 1)
     keys = card_of.astype(np.int64) * scale + position[hands]
     ordering = np.argsort(keys, kind="stable")
@@ -204,7 +216,12 @@ _showdown_compiled = (
 )
 
 
-def showdown_values(board: Tuple[int, ...], reach: np.ndarray, stake: float) -> np.ndarray:
+def showdown_values(
+    board: Tuple[int, ...],
+    reach: np.ndarray,
+    stake: float,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
     """``(1326,)`` counterfactual values against an opponent holding ``reach``.
 
     Positive where the hand wins more opponent mass than it loses to.  Ties
@@ -215,11 +232,23 @@ def showdown_values(board: Tuple[int, ...], reach: np.ndarray, stake: float) -> 
     already the contiguous float64 the solver produces.  Anything else — no
     numba, a float32 range from the batched generator, a strided view — takes
     the numpy path rather than paying a copy to enter the fast one.
+
+    ``out`` writes the result into a caller-owned row instead of a fresh array.
+    The kernel always wrote into a buffer it had just allocated, and a terminal
+    node has somewhere to put the answer already — its own ``(2, 1326)`` value
+    array — so at ~40,000 terminal evaluations per label that is 40,000
+    allocations spent on nothing.  Must be contiguous float64; a row of a
+    C-contiguous ``(2, 1326)`` array is.
     """
     if _showdown_compiled is None or reach.dtype != np.float64 or not reach.flags.c_contiguous:
-        return showdown_values_numpy(board, reach, stake)
+        values = showdown_values_numpy(board, reach, stake)
+        if out is None:
+            return values
+        out[:] = values
+        return out
     index = showdown_index(board)
-    out = np.empty(NUM_COMBOS)
+    if out is None:
+        out = np.empty(NUM_COMBOS)
     _showdown_compiled(
         reach, float(stake), index.order, index.flat_hands, index.card_offset,
         index.group_start, index.group_end, index.lo_a, index.hi_a, index.lo_b,
