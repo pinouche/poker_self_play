@@ -134,8 +134,53 @@ class OnlineStudentConfig:
     policy_net: HoldemPolicyNetConfig = field(default_factory=HoldemPolicyNetConfig)
     policy_buffer_size: int = 20_000
     policy_updates_per_iteration: int = 0
+    # ReBeL appendix D, the full-game recipe: "Adam optimizer with learning
+    # rate 3 x 10^-4 and halved the learning rate every 800 epochs.  One epoch
+    # is 2,560,000 examples and the batch size 1024."
+    #
+    # The halving is expressed in *examples seen* rather than held on a
+    # scheduler object, so it survives a resume for free: the schedule is a
+    # pure function of ``spend.updates * batch_size``, which the run state
+    # already carries.  A stateful ``lr_scheduler`` would have to be saved and
+    # restored, and silently resets to full learning rate if it is not.
+    #
+    # At this project's scale it never fires.  800 epochs is 2,000,000 steps at
+    # batch 1024; a 12-hour run here is ~45,000.  It is here so the recipe is
+    # the paper's rather than nearly the paper's, and so a longer run behaves.
+    examples_per_epoch: int = 2_560_000
+    lr_halve_every_epochs: Optional[int] = 800
+    # Stop cleanly after this many seconds, whatever the budgets say.  Sizing a
+    # run by label budget requires knowing the generation rate in advance, and
+    # that rate moves with every config change -- ``updates_per_iteration``
+    # alone swings it several-fold, because the learner and the actors share
+    # one GPU.  A wall-clock bound makes "a twelve-hour run" mean twelve hours
+    # rather than a guess, and the per-iteration ratio (112 labels to 5
+    # updates) is preserved whatever it gets through.  State is written on the
+    # way out, so the run is resumable and the budgets stay totals.
+    max_seconds: Optional[float] = None
+    # Labels that must be *accepted* per gradient step.  This is the knob that
+    # sets reuse (presentations per label = batch_size / labels_per_update), and
+    # on the actor path it is the only thing that can.
+    #
+    # ``trajectories_per_iteration`` governs the ratio on the synchronous path
+    # only: there, one iteration generates exactly that many trajectories and
+    # then trains.  An actor-driven learner instead drains whatever has arrived
+    # and takes ``updates_per_iteration`` steps regardless, so the ratio falls
+    # out of how fast the actors happen to be relative to the learner -- 4.3
+    # labels per update when 22.4 was intended, i.e. 236x reuse instead of 46x.
+    # Setting this throttles the learner to the intended ratio whatever the
+    # relative speeds turn out to be.
+    labels_per_update: Optional[float] = None
     seed: int = 0
     device: str = "cpu"
+
+    def learning_rate_at(self, examples_seen: int) -> float:
+        """ReBeL's halving schedule, as a function of examples presented."""
+        if not self.lr_halve_every_epochs:
+            return self.learning_rate
+        epochs = examples_seen / max(self.examples_per_epoch, 1)
+        halvings = int(epochs // self.lr_halve_every_epochs)
+        return self.learning_rate * (0.5 ** halvings)
 
     @property
     def uses_policy_net(self) -> bool:
@@ -239,7 +284,10 @@ def fit_online_student(
 
     _warn_if_budgets_are_mismatched(config, label_budget, update_budget)
 
+    deadline = None if config.max_seconds is None else time.perf_counter() + config.max_seconds
     while spend.labels < label_budget or spend.updates < update_budget:
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
         iteration += 1
 
         # -- generate ------------------------------------------------------
@@ -305,6 +353,7 @@ def fit_online_student(
 
         # -- train ---------------------------------------------------------
         training_started = time.perf_counter()
+        _apply_learning_rate(optimiser, config, spend.updates * config.batch_size)
         steps = min(config.updates_per_iteration, update_budget - spend.updates)
         total, done = fit_value_net(
             net, optimiser, loss_fn, _sampler(buffer), steps, config.batch_size, device, rng
@@ -378,6 +427,26 @@ def fit_online_student(
 
     if journal is not None:
         journal.flush(iteration)
+    # Always on the way out, not only on the cadence: a run stopped by
+    # ``max_seconds`` breaks at the top of an iteration, so the last scheduled
+    # write could otherwise be up to ``state_every`` iterations stale and that
+    # much generation would have to be redone on resume.
+    if state_directory is not None:
+        save_run_state(
+            state_directory,
+            config=config,
+            spend=spend,
+            iteration=iteration,
+            trajectory_id=trajectory_id,
+            rng=rng,
+            net=net,
+            optimiser=optimiser,
+            buffer=buffer,
+            initial_state=initial_state,
+            policy_net=policy_net,
+            policy_optimiser=policy_optimiser,
+            policy_buffer=policy_buffer,
+        )
     return StudentResult(
         net=net,
         history=history,
@@ -454,6 +523,14 @@ def _warn_if_budgets_are_mismatched(
         RuntimeWarning,
         stacklevel=3,
     )
+
+
+def _apply_learning_rate(optimiser, config, examples_seen: int) -> float:
+    """Set the optimiser's learning rate from the schedule; returns it."""
+    lr = config.learning_rate_at(examples_seen)
+    for group in optimiser.param_groups:
+        group["lr"] = lr
+    return lr
 
 
 def _state_directory(

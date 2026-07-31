@@ -54,7 +54,10 @@ from paradigm_b.holdem.arms_common.storage import (
     save_checkpoint,
     save_run_state,
 )
-from paradigm_b.holdem.arm2_iterative.student import _state_directory
+from paradigm_b.holdem.arm2_iterative.student import (
+    _apply_learning_rate,
+    _state_directory,
+)
 from paradigm_b.holdem.net.policy import (
     HoldemPolicyNet,
     PolicyReplayBuffer,
@@ -215,7 +218,14 @@ def fit_online_student_async(
 
     try:
         with _learner_threads(threads), pool:
+            deadline = (
+                None
+                if config.max_seconds is None
+                else time.perf_counter() + config.max_seconds
+            )
             while spend.labels < label_budget or spend.updates < update_budget:
+                if deadline is not None and time.perf_counter() >= deadline:
+                    break
                 iteration += 1
 
                 # 1. Collect whatever finished while we were training.
@@ -279,7 +289,17 @@ def fit_online_student_async(
                 # 2. Train on whatever is in the buffer.  An empty buffer only
                 #    happens on the first pass, before any actor has finished.
                 training = time.perf_counter()
+                _apply_learning_rate(
+                    optimiser, config, spend.updates * config.batch_size
+                )
                 steps = min(config.updates_per_iteration, update_budget - spend.updates)
+                if config.labels_per_update:
+                    # Never get ahead of the data: the learner may only have
+                    # taken as many steps as the labels accepted so far entitle
+                    # it to.  Without this the learner runs at its own speed and
+                    # the reuse ratio is an accident of scheduling.
+                    earned = int(spend.labels / config.labels_per_update)
+                    steps = max(0, min(steps, earned - spend.updates))
                 total, done = 0.0, 0
                 if len(buffer):
                     total, done = fit_value_net(
@@ -377,6 +397,22 @@ def fit_online_student_async(
     finally:
         if journal is not None:
             journal.flush(iteration)
+        if state_directory is not None:
+            save_run_state(
+                state_directory,
+                config=config,
+                spend=spend,
+                iteration=iteration,
+                trajectory_id=trajectory_id,
+                rng=rng,
+                net=net,
+                optimiser=optimiser,
+                buffer=buffer,
+                initial_state=initial_state,
+                policy_net=policy_net,
+                policy_optimiser=policy_optimiser,
+                policy_buffer=policy_buffer,
+            )
 
     spend.training_seconds = min(spend.training_seconds, time.perf_counter() - started)
     return StudentResult(

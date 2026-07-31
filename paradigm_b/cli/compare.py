@@ -122,6 +122,23 @@ def _add_compare_args(parser: argparse.ArgumentParser) -> None:
         default=50,
         help="gradient steps between publishing weights to the actors",
     )
+    parser.add_argument(
+        "--state-every",
+        type=int,
+        default=None,
+        help="arm 2: write a resumable run state (both networks, both "
+        "optimisers, both buffers, the spend and the RNG) every N iterations.  "
+        "~1.9GB per write, so half-hourly is the right order on a long run",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="arm 2: continue a run from a --state-every directory.  Budgets "
+        "are read as totals, so the run finishes the original budget rather "
+        "than spending it again",
+    )
+    parser.add_argument("--buffer-size", type=int, default=60_000)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=1536)
@@ -235,6 +252,9 @@ def run_compare(args: argparse.Namespace) -> None:
             weight_sync_every=args.weight_sync_every,
             purge_after_iterations=args.purge_after_iterations,
             purge_fraction=args.purge_fraction,
+            buffer_size=args.buffer_size,
+            state_every=args.state_every,
+            resume_from=args.resume_from,
             trajectories_per_iteration=args.trajectories_per_iteration,
             updates_per_iteration=args.updates_per_iteration,
             batch_size=args.batch_size,
