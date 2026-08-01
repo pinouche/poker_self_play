@@ -35,7 +35,7 @@ flop ``depth_limit``  tree size       leaf network evaluations
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -222,12 +222,56 @@ def exploitability_on(
     )["exploitability"]
 
 
+def _stderr(values: Sequence[float]) -> float:
+    """Standard error of the mean over *situations*, not over hands.
+
+    Worth being exact about what this is and is not, because the ReBeL paper
+    reports a ``±`` on its LBR column and it is a different quantity.  There,
+    LBR is an opponent that *plays hands*: 881 ± 94 mbb/g is a sample mean over
+    dealt hands and the ± is the sampling error of a match that could have gone
+    otherwise.  Here, nothing is dealt — :mod:`.lbr` walks the whole tree
+    against full 1,326-combo ranges and enumerates every runout, so one
+    situation's number is exact and repeating the measurement returns it bit for
+    bit.
+
+    What *is* uncertain here is which situations were drawn.  The held-out
+    boards, pots, stacks and starting ranges come from a sampler, and the spread
+    across them is large.  So this is the error bar of "what would this agent
+    score on an average situation from this distribution", which is the honest
+    analogue of the paper's ±, and it needs ``boards_per_street`` above 1 to
+    exist at all.
+
+    ``ddof=1`` because these are a sample of situations, not the population.
+    """
+    if len(values) < 2:
+        return 0.0
+    return float(np.std(values, ddof=1) / np.sqrt(len(values)))
+
+
+def _aggregate_stderr(stderrs: Sequence[float]) -> float:
+    """The stderr of a mean of per-street means, streets taken as independent.
+
+    Each street is scored on its own held-out boards, drawn without conflict
+    with the others', so the errors do not share a situation and add in
+    quadrature: ``se = sqrt(sum(se_i^2)) / k``.
+    """
+    if not stderrs:
+        return 0.0
+    return float(np.sqrt(sum(s * s for s in stderrs)) / len(stderrs))
+
+
 def evaluate_agent(
     net: HoldemValueNet,
     situations: Dict[int, Tuple[TestSituation, ...]],
     config: EvaluationConfig,
 ) -> Dict[str, float]:
     """Mean per-street exploitability, plus the aggregate over streets.
+
+    Every mean is reported with a ``_stderr`` beside it, over the held-out
+    situations that went into it — see :func:`_stderr` for why that is dispersion
+    over *situations* and not the paper's dispersion over *hands*.  With one
+    board per street it is zero, which is the truth: a single situation has a
+    mean and no spread.
 
     The aggregate is the mean over *streets*, not over situations, so a street
     that happens to carry more held-out boards does not dominate the headline.
@@ -260,11 +304,13 @@ def evaluate_agent(
         exploitabilities = [board["exploitability"] for board in per_board]
         scores[name] = float(np.mean(exploitabilities))
         scores[f"{name}_worst"] = float(np.max(exploitabilities))
+        scores[f"{name}_stderr"] = _stderr(exploitabilities)
+        scores[f"{name}_boards"] = float(len(per_board))
         if config.local_best_response:
             for key in ("lbr_classic", "lbr_full"):
-                scores[f"{name}_{key}"] = float(
-                    np.mean([board[key] for board in per_board])
-                )
+                values = [board[key] for board in per_board]
+                scores[f"{name}_{key}"] = float(np.mean(values))
+                scores[f"{name}_{key}_stderr"] = _stderr(values)
     # Averaged over the street keys *by name*, not by pattern-matching the
     # score dict.  The old "everything that is not ``_worst``" rule silently
     # swallowed any new per-street entry — the LBR ones would have been
@@ -276,6 +322,9 @@ def evaluate_agent(
     scores["aggregate_all_streets"] = (
         float(np.mean(street_means)) if street_means else float("nan")
     )
+    scores["aggregate_all_streets_stderr"] = _aggregate_stderr(
+        [scores[f"{name}_stderr"] for name in street_names if f"{name}_stderr" in scores]
+    )
     if config.local_best_response:
         for key in ("lbr_classic", "lbr_full"):
             per_street = [
@@ -285,6 +334,13 @@ def evaluate_agent(
             ]
             if per_street:
                 scores[f"aggregate_{key}"] = float(np.mean(per_street))
+                scores[f"aggregate_{key}_stderr"] = _aggregate_stderr(
+                    [
+                        scores[f"{name}_{key}_stderr"]
+                        for name in street_names
+                        if f"{name}_{key}_stderr" in scores
+                    ]
+                )
     # Streets where the agent's own re-solve is depth-limited, and therefore
     # where the network actually decides anything.  The river is not one.
     sensitive = [
@@ -292,6 +348,13 @@ def evaluate_agent(
         for cards in sorted(situations)
         if cards < 5 and STREET_NAMES[cards] in scores
     ]
+    scores["aggregate_stderr"] = _aggregate_stderr(
+        [
+            scores[f"{STREET_NAMES[cards]}_stderr"]
+            for cards in sorted(situations)
+            if cards < 5 and f"{STREET_NAMES[cards]}_stderr" in scores
+        ]
+    ) if sensitive else scores["aggregate_all_streets_stderr"]
     scores["aggregate"] = float(np.mean(sensitive)) if sensitive else scores[
         "aggregate_all_streets"
     ]

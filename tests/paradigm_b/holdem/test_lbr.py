@@ -17,6 +17,8 @@ scoring four times the searching responder.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -33,6 +35,7 @@ from paradigm_b.holdem.engine.betting import DEFAULT_BET_FRACTIONS, Betting
 from paradigm_b.holdem.engine.combos import board_mask
 from paradigm_b.holdem.engine.public_tree import PublicState, build_endgame_tree
 from paradigm_b.holdem.engine.showdown import showdown_values
+from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
 from paradigm_b.holdem.engine.space import TurnEndgameSpace
 
 RIVER_BOARD = (51, 47, 22, 6, 34)
@@ -205,3 +208,66 @@ def test_checkdown_equity_averages_the_runouts_on_the_turn():
     np.testing.assert_allclose(
         checkdown_equity(space, turn, villain), expected, atol=1e-12
     )
+
+
+def test_the_stderr_is_over_situations_and_is_absent_from_a_single_one():
+    """What the ``+/-`` means here, pinned.
+
+    ReBeL's Table 1 reports LBR as 881 +/- 94 mbb/g, and that ± is sampling
+    error over *dealt hands*.  Nothing is dealt here: the responder walks the
+    whole tree against full ranges and enumerates every runout, so one situation
+    is exact and repeating it is bit-identical.  The dispersion that does exist
+    is over which held-out situations were drawn, so it needs more than one of
+    them and it is zero — not small — when there is only one.
+    """
+    from paradigm_b.holdem.arms_common.evaluation import (
+        EvaluationConfig,
+        evaluate_agent,
+        make_held_out_situations,
+    )
+    from paradigm_b.holdem.data.sampling import SituationConfig
+
+    net = HoldemValueNet(HoldemValueNetConfig(hidden_dim=16, num_residual_blocks=1, card_embedding_dim=8))
+    net.eval()
+    config = EvaluationConfig(search_iterations=2, local_best_response=True, streets=(5,))
+
+    single = evaluate_agent(
+        net,
+        make_held_out_situations(np.random.default_rng(0), SituationConfig(), streets=(5,), boards_per_street=1),
+        replace(config, boards_per_street=1),
+    )
+    assert single["river_boards"] == 1.0
+    assert single["river_stderr"] == 0.0
+    assert single["river_lbr_full_stderr"] == 0.0
+
+    several = evaluate_agent(
+        net,
+        make_held_out_situations(np.random.default_rng(0), SituationConfig(), streets=(5,), boards_per_street=4),
+        replace(config, boards_per_street=4),
+    )
+    assert several["river_boards"] == 4.0
+    assert several["river_stderr"] > 0.0
+    assert several["river_lbr_full_stderr"] > 0.0
+
+
+def test_repeating_an_evaluation_returns_the_same_number():
+    """The LBR figure is a computation, not a measurement: no run-to-run noise."""
+    from paradigm_b.holdem.arms_common.evaluation import (
+        EvaluationConfig,
+        evaluate_agent,
+        make_held_out_situations,
+    )
+    from paradigm_b.holdem.data.sampling import SituationConfig
+
+    net = HoldemValueNet(HoldemValueNetConfig(hidden_dim=16, num_residual_blocks=1, card_embedding_dim=8))
+    net.eval()
+    tests = make_held_out_situations(
+        np.random.default_rng(0), SituationConfig(), streets=(5,), boards_per_street=2
+    )
+    config = EvaluationConfig(
+        boards_per_street=2, search_iterations=2, local_best_response=True, streets=(5,)
+    )
+    first = evaluate_agent(net, tests, config)
+    second = evaluate_agent(net, tests, config)
+    assert first["river_lbr_full"] == second["river_lbr_full"]
+    assert first["river_lbr_classic"] == second["river_lbr_classic"]

@@ -133,6 +133,98 @@ def checkdown_equity(
     return total / max(len(runouts), 1)
 
 
+def split_response(
+    strategy: Optional[np.ndarray],
+    agent_reach: np.ndarray,
+    betting: Betting,
+    num_hands: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split the agent's range into the mass that folds, calls and raises.
+
+    ``strategy`` is the agent's per-hand action probabilities at this state, or
+    ``None`` where nothing produced behaviour for it — uniform, matching what
+    the scoring path fills in, so an agent measured here plays as it does there.
+
+    **A round the agent cannot act in is all "called".**  Once a call closes the
+    betting, the next thing that happens is a card, not a decision — but a
+    ``Betting`` that is awaiting a board still answers ``legal_actions`` and
+    ``to_move``, so asking it who folds returns a strategy over actions nobody
+    is going to take.  Left unguarded, the myopic responder priced its own
+    round-closing call as though the agent might still raise over it, subtracted
+    the concession term for that imaginary raise, and reported a *lower* bound
+    than it should have.
+    """
+    zero = np.zeros(num_hands)
+    if betting.is_terminal or betting.awaiting_board:
+        return zero.copy(), agent_reach.copy(), zero.copy()
+
+    actions = betting.legal_actions()
+    if strategy is None:
+        strategy = np.full((num_hands, len(actions)), 1.0 / len(actions))
+    folded, called, raised = zero.copy(), zero.copy(), zero.copy()
+    for index, action in enumerate(actions):
+        share = agent_reach * strategy[:, index]
+        if action == FOLD:
+            folded += share
+        elif betting.is_aggressive(action):
+            raised += share
+        else:
+            called += share
+    return folded, called, raised
+
+
+def checkdown_value(
+    space: EndgameSpace,
+    real: Betting,
+    board: Tuple[int, ...],
+    folded: np.ndarray,
+    called: np.ndarray,
+    raised: np.ndarray,
+    hero: int,
+    rng: Optional[np.random.Generator] = None,
+    rollout_samples: Optional[int] = None,
+) -> np.ndarray:
+    """Classic LBR's per-hand value of a state, assuming the hand checks down.
+
+    Three terms, priced at ``real``'s chips, against the agent's range split by
+    :func:`split_response`.  This is the whole of the myopic responder's
+    arithmetic and it is shared: :class:`_Walker` uses it to score a tree, and
+    :mod:`.lbr_match` uses it to choose an action in a dealt hand, so the two
+    can disagree about what LBR *does* but never about what an action is worth.
+    """
+    correction = space.pair_correction
+    mask = board_mask(board) if len(board) == 5 else space.root_mask()
+
+    # They fold: the responder takes the pot as it stood, against exactly the
+    # mass of agent hands that folded.
+    pot_if_folded = float(real.contributions[1 - hero]) + real.starting_pot / 2.0
+    fold_term = correction * pot_if_folded * compatible_mass(folded) * mask
+
+    # They call: showdown, at the stake that would then be at risk.
+    #
+    # ``min(contributions)`` is the right stake at a *settled* terminal, and
+    # exactly wrong here: this state is the responder's bet, before the agent
+    # has matched it, so the minimum is still the agent's old contribution and
+    # the responder's own money silently drops out of the showdown.  It got the
+    # fold equity for free and could only lose the dead pot, which is why the
+    # myopic responder was scoring four times the searching one.  A call levels
+    # the contributions at the larger of the two, so that is what is at risk.
+    stake = float(max(real.contributions)) + real.starting_pot / 2.0
+    equity = checkdown_equity(space, board, called, rng, rollout_samples)
+    call_term = correction * stake * equity
+
+    # They raise, and the responder gives up.  Pricing a raise as though it were
+    # a call is what made this responder score *above* the fully searching one —
+    # it collected a free check-down at a stake it would have had to pay again
+    # to reach, which is not a bound on anything.  Conceding is the conservative
+    # reading, and conservative is the whole point: LBR's number is only
+    # meaningful as a lower bound.
+    committed = float(real.contributions[hero]) + real.starting_pot / 2.0
+    raise_term = -correction * committed * compatible_mass(raised) * mask
+
+    return fold_term + call_term + raise_term
+
+
 class _Walker:
     """One responder, walking the real game while the agent walks its own.
 
@@ -331,67 +423,28 @@ class _Walker:
             public = PublicState(betting=real, board=board)
             return self.space.terminal_values(public, reach)[self.hero]
 
-        folded, called, raised, pot_if_folded = self._agent_response(
-            real, seen, board, reach
+        folded, called, raised = self._agent_response(real, seen, board, reach)
+        return checkdown_value(
+            self.space,
+            real,
+            board,
+            folded,
+            called,
+            raised,
+            self.hero,
+            self.rng,
+            self.config.rollout_samples,
         )
-        correction = self.space.pair_correction
-        mask = board_mask(board) if len(board) == 5 else self.space.root_mask()
-
-        # They fold: the responder takes the pot as it stood, against exactly
-        # the mass of agent hands that folded.
-        fold_term = correction * pot_if_folded * compatible_mass(folded) * mask
-
-        # They call: showdown, at the stake that would then be at risk.
-        #
-        # ``min(contributions)`` is the right stake at a *settled* terminal, and
-        # exactly wrong here: this state is the responder's bet, before the
-        # agent has matched it, so the minimum is still the agent's old
-        # contribution and the responder's own money silently drops out of the
-        # showdown.  It got the fold equity for free and could only lose the
-        # dead pot, which is why the myopic responder was scoring four times the
-        # searching one.  A call levels the contributions at the larger of the
-        # two, so that is what is at risk.
-        stake = float(max(real.contributions)) + real.starting_pot / 2.0
-        equity = checkdown_equity(
-            self.space, board, called, self.rng, self.config.rollout_samples
-        )
-        call_term = correction * stake * equity
-
-        # They raise, and the responder gives up.  Pricing a raise as though it
-        # were a call is what made this responder score *above* the fully
-        # searching one — it collected a free check-down at a stake it would
-        # have had to pay again to reach, which is not a bound on anything.
-        # Conceding is the conservative reading, and conservative is the whole
-        # point: LBR's number is only meaningful as a lower bound.
-        committed = float(real.contributions[self.hero]) + real.starting_pot / 2.0
-        raise_term = -correction * committed * compatible_mass(raised) * mask
-
-        return fold_term + call_term + raise_term
 
     def _agent_response(self, real, seen, board, reach):
         """Split the agent's range three ways: folds, calls, and raises."""
         public = PublicState(betting=seen, board=board)
-        actions = seen.legal_actions()
-        strategy = self.strategies.get(public)
-        if strategy is None:
-            strategy = np.full((self.space.num_hands, len(actions)), 1.0 / len(actions))
-
-        agent_reach = reach[self.agent]
-        folded = np.zeros(self.space.num_hands)
-        called = np.zeros(self.space.num_hands)
-        raised = np.zeros(self.space.num_hands)
-        for index, action in enumerate(actions):
-            share = agent_reach * strategy[:, index]
-            if action == FOLD:
-                folded += share
-            elif seen.is_aggressive(action):
-                raised += share
-            else:
-                called += share
-        # What the responder collects when the agent gives up: the money in the
-        # middle before its own bet went in, plus its share of the dead pot.
-        pot_if_folded = float(real.contributions[self.agent]) + real.starting_pot / 2.0
-        return folded, called, raised, pot_if_folded
+        return split_response(
+            self.strategies.get(public),
+            reach[self.agent],
+            seen,
+            self.space.num_hands,
+        )
 
 
 def lbr_values(

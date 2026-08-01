@@ -79,7 +79,7 @@ mkdir -p runs/rebel-full && nohup python run_arm2.py --run runs/rebel-full \
   --actors 8 --learner-threads 1 --device mps \
   --hidden-dim 1536 --residual-blocks 6 --hours 168 \
   --progress-every-hours 5 --progress-slumbot-hands 1000 \
-  --progress-slumbot-workers 4 --progress-boards 1 \
+  --progress-slumbot-workers 4 --progress-boards 3 \
   > runs/rebel-full/log.txt 2>&1 &
 ```
 
@@ -120,16 +120,43 @@ is not a fixed amount of work — its rate moves several-fold with
 `--labels-per-update`, so an iteration count is a poor proxy for a duration):
 
 ```
-progress iter 1,626  labels 6,809  updates 33  expl 17.39 (f14.4 t20.4 r14.6)  lbr 48.6  [0.6 min]
+progress iter 91,000  labels 1,240,912  updates 6,059  expl 23.66+/-5.5 (f16.5 t30.8 r0.7)  lbr 45.3+/-9.9  n=3/street  slumbot -412+/-398 mbb/g over 1000 hands  [13.8 min]
 ```
 
-`expl` is exploitability against a best responder on held-out boards, `lbr` the
-off-abstraction responder, and with `--progress-slumbot-hands` the line carries
-mbb/g against Slumbot with its standard error — which at 1,000 hands is still
-~+/-400 mbb/g, so read the series and not any single point. Both halves run on a
-background thread against a snapshot, so the learner never waits for them; each
-evaluation costs ~15-20 min of four threads. `python watch_arm2.py --run
-runs/rebel-full --follow` shows the same line under the live spend.
+(the `expl` and `lbr` halves are a real measurement, of an *untrained* network
+at 3 boards/street — not a result)
+
+`expl` is exploitability against an exact best responder on held-out boards,
+`lbr` the off-abstraction responder from `arms_common/lbr.py`, and
+`--progress-slumbot-hands` adds mbb/g against the real Slumbot server. Both
+halves run on a background thread against a weight snapshot, so the learner
+never waits for them. `python watch_arm2.py --run runs/rebel-full --follow`
+shows the same line under the live spend.
+
+**The two ± are not the same quantity, and neither is ReBeL's.** Table 1 of the
+paper reports LBR as 881 ± 94 mbb/g: LBR *played hands* there, so the ± is
+sampling error over the hands dealt. Nothing is dealt on this side —
+`lbr_values` walks the whole tree against full 1,326-combo ranges and enumerates
+every runout, so a situation's number is exact and repeating the evaluation
+returns it bit for bit. What is uncertain here is *which held-out situations
+were drawn*, and that spread is large, so the ± on `expl` and `lbr` is the
+standard error over situations (`ddof=1`, streets added in quadrature for the
+aggregate). It needs `--progress-boards` above 1 to exist and is printed only
+when it does — a single board has a mean and no spread, and `+/-0.0` would read
+as precision rather than as one sample. The Slumbot ± *is* the paper's kind:
+Monte Carlo over dealt hands, and at 1,000 hands it is still ~±400 mbb/g.
+
+Because the held-out boards are fixed by `--seed` for the whole run, successive
+progress points attack the identical situations — the series is paired, so a
+change between two points is a change in the network even where the ± is wide.
+The ± says how far the *level* might be from the situation distribution's mean;
+it does not blur the trend. Costs, measured on one thread at the full net size:
+**0.8 min** per evaluation at 1 board/street, **3.6 min** at 3, plus ~10 min for
+1,000 Slumbot hands over 4 workers. `--progress-boards 3` is the recommended
+setting — it is what buys the ± at all, and ~14 min every 5 hours is under 5% of
+four of the sixteen cores. Those same two measurements are themselves the
+argument for it: the identical untrained network scored `expl 21.98` on one set
+of held-out boards and `23.66 ± 5.5` on another.
 
 **Restarting.** State (both nets, both optimisers, the buffer, the spend, the
 RNG) is written every `--state-every` iterations and again on the way out, so a

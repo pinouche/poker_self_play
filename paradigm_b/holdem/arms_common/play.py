@@ -37,6 +37,7 @@ costs nothing and keeps the arithmetic in range.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Optional, Sequence, Tuple
 
@@ -104,6 +105,27 @@ class ResolvingAgent:
         self.solves = 0
 
     # --- the belief state --------------------------------------------------
+    def clone(self) -> "ResolvingAgent":
+        """A copy that can be advanced without touching this one.
+
+        What a local-best-response opponent needs: "if I bet this, how much of
+        your range folds?" is answered by advancing a *copy* through the bet and
+        reading the strategy it re-solves, leaving the hand actually being
+        played untouched.  See :mod:`.lbr_match`.
+
+        The network, the leaf evaluator, the space and the config are shared —
+        they are read-only here — while the belief state, which is not, is
+        copied.  ``_strategies`` is shared by reference and never mutated in
+        place: a clone that re-solves rebinds its own, so the original keeps the
+        map it had.  The RNG is shared too, which is safe only because probing
+        never calls :meth:`act`; a clone that acted would consume draws the
+        original was going to make.
+        """
+        other = copy.copy(self)
+        other.reach = self.reach.copy()
+        other.solves = 0
+        return other
+
     @property
     def opponent(self) -> int:
         return 1 - self.seat
@@ -112,6 +134,16 @@ class ResolvingAgent:
         total = self.reach[player].sum()
         if total > 0.0:
             self.reach[player] /= total
+
+    def strategy_for(self, public: Optional[PublicState] = None) -> np.ndarray:
+        """The per-hand strategy here, re-solving if this is a new subgame.
+
+        Public because a best-response opponent is *defined* against a known
+        strategy: LBR asks what the agent does at a state, and answering that is
+        part of being measurable, not a leak.  What stays private is
+        :attr:`hand` — the two cards this agent was actually dealt.
+        """
+        return self._strategy_at(public if public is not None else self.public)
 
     def _strategy_at(self, public: PublicState) -> np.ndarray:
         """The resolved strategy here, re-solving if we have left the subgame.

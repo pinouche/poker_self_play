@@ -36,6 +36,7 @@ import numpy as np
 import torch
 
 from paradigm_b.holdem.arms_common.evaluation import EvaluationConfig, evaluate_agent
+from paradigm_b.holdem.arms_common.lbr_match import LbrMatchConfig
 from paradigm_b.holdem.arms_common.play import PlayConfig
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
 
@@ -64,6 +65,14 @@ class ProgressConfig:
     # training run should not start doing that unless it was asked to.
     slumbot_hands: int = 0
     slumbot_play: PlayConfig = field(default_factory=PlayConfig)
+    # Hands of *LBR as an opponent* — ReBeL Table 1's form of the number, where
+    # LBR is dealt cards and the ± is sampling error over hands.  Zero (the
+    # default) leaves only the exact tree LBR above, which is the stronger
+    # measurement; this one exists to be quotable next to a published figure.
+    # See :mod:`.lbr_match` for why they are not the same quantity.
+    lbr_match_hands: int = 0
+    lbr_match_workers: int = 1
+    lbr_match: LbrMatchConfig = field(default_factory=LbrMatchConfig)
     # Concurrent Slumbot sessions.  One is the safe default *during training*:
     # this evaluation already shares a machine with the learner, and buying a
     # faster measurement with the learner's cores is usually the wrong trade.
@@ -144,6 +153,18 @@ def evaluate_against_slumbot(
     }
 
 
+def _pm(stderr: Optional[float]) -> str:
+    """``+/-`` the standard error, or nothing when there is not one.
+
+    A single held-out board per street gives a mean and no spread, and printing
+    ``+/-0.0`` there would read as "measured precisely" when it means "measured
+    once".  See :func:`~.evaluation._stderr` for what this dispersion is over —
+    situations, not hands, which is not the same quantity as the ± in ReBeL's
+    Table 1.
+    """
+    return f"+/-{stderr:.1f}" if stderr else ""
+
+
 def summarise(record: Dict[str, float]) -> str:
     """One line per evaluation, for the run's log.
 
@@ -164,9 +185,20 @@ def summarise(record: Dict[str, float]) -> str:
             for name in ("flop", "turn", "river")
             if name in record
         )
-        parts.append(f"expl {record['aggregate']:.2f} ({streets})")
+        parts.append(
+            f"expl {record['aggregate']:.2f}{_pm(record.get('aggregate_stderr'))}"
+            f" ({streets})"
+        )
     if "aggregate_lbr_full" in record:
-        parts.append(f"lbr {record['aggregate_lbr_full']:.1f}")
+        parts.append(
+            f"lbr {record['aggregate_lbr_full']:.1f}"
+            f"{_pm(record.get('aggregate_lbr_full_stderr'))}"
+        )
+    if record.get("flop_boards", 0) > 1:
+        # Only worth saying when there is a spread to have: at one board a
+        # street has a mean and no dispersion, and the +/- above is absent
+        # rather than zero-width by luck.
+        parts.append(f"n={int(record['flop_boards'])}/street")
     if "slumbot_hands" in record:
         # Never the point estimate alone: at a few hundred hands the interval
         # is wider than any edge this project can produce.
@@ -278,6 +310,16 @@ class ProgressEvaluator:
                             device=self.config.device,
                             local_best_response=self.config.local_best_response,
                         ),
+                    )
+                )
+            if self.config.lbr_match_hands > 0:
+                record.update(
+                    evaluate_against_lbr(
+                        net,
+                        self.config.lbr_match_hands,
+                        self.config.lbr_match,
+                        seed=iteration,
+                        workers=self.config.lbr_match_workers,
                     )
                 )
             if self.config.slumbot_hands > 0:
