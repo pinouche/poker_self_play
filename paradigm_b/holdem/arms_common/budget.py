@@ -40,6 +40,19 @@ class SpendRecord:
     solver_calls: int = 0
     generation_seconds: float = 0.0
     training_seconds: float = 0.0
+    # Time in the journal, which is a debugging artifact rather than part of
+    # either algorithm.  Kept *out* of ``total_seconds`` so that turning the
+    # journal on does not charge an arm for compute the algorithm never needed
+    # — but recorded, because an untimed section of the loop is how the schema-1
+    # manifest silently ate 66% of a 12-hour run.  Any wall clock unaccounted
+    # for by these three is a bug in the accounting, not a rounding error.
+    journal_seconds: float = 0.0
+    # Time the learner spent scoring itself *on its own thread*.  Off-thread
+    # progress evaluations do not appear here — they cost the run contention,
+    # not wall clock — so a large number here means a foreground evaluator is
+    # eating the run.  Excluded from ``total_seconds`` for the same reason as
+    # ``journal_seconds``: measuring an arm is not work its algorithm does.
+    eval_seconds: float = 0.0
 
     @property
     def total_seconds(self) -> float:

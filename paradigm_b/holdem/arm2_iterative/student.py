@@ -208,6 +208,7 @@ def fit_online_student(
     journal_path: Optional[PathLike] = None,
     checkpoint_path: Optional[PathLike] = None,
     state_path: Optional[PathLike] = None,
+    progress=None,
 ) -> StudentResult:
     """Run Algorithm 1 until both budgets are exactly spent.
 
@@ -233,6 +234,13 @@ def fit_online_student(
             journal_path=journal_path,
             checkpoint_path=checkpoint_path,
             state_path=state_path,
+            progress=progress,
+        )
+    if progress is not None:
+        raise ValueError(
+            "progress evaluation needs the async loop; it exists to keep the "
+            "learner working while a measurement runs, and the synchronous "
+            "path has no other thread to keep working"
         )
 
     rng = rng if rng is not None else np.random.default_rng(config.seed)
@@ -341,7 +349,9 @@ def fit_online_student(
             trajectory_id += 1
         spend.generation_seconds += time.perf_counter() - generation_started
         if journal is not None:
+            journalling = time.perf_counter()
             journal.flush(iteration)
+            spend.journal_seconds += time.perf_counter() - journalling
 
         # Flush the random-network era out of the buffer, once.
         purged = 0
@@ -427,6 +437,7 @@ def fit_online_student(
 
     if journal is not None:
         journal.flush(iteration)
+        journal.close()
     # Always on the way out, not only on the cadence: a run stopped by
     # ``max_seconds`` breaks at the top of an iteration, so the last scheduled
     # write could otherwise be up to ``state_every`` iterations stale and that

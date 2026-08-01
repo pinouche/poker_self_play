@@ -33,11 +33,17 @@ Stack is 20,000 with blinds 50/100 — 200 big blinds, confirmed by an accepted
 ``b20000`` shove.
 
 **One big blind is 100 chips**, so mbb/g is ``chips / 100 * 1000`` per hand.
+
+**Sessions are independent**, which is what makes
+:func:`play_session_parallel` sound: several tokens playing at once are several
+players, and the server has always had those.  One token played concurrently
+would be one player answering their own hand twice, and no API here offers it.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -277,6 +283,108 @@ def play_hand(client: SlumbotClient, policy: Policy, index: int) -> HandResult:
     )
 
 
+def split_hands(hands: int, workers: int) -> List[Tuple[int, int]]:
+    """``(first index, count)`` per worker, in **pairs** wherever it can be.
+
+    Seat alternation is per session — every token starts you in the big blind
+    and flips from there — so a worker that plays an odd number of hands plays
+    one more from the blind than from the button.  Splitting in pairs keeps each
+    worker's own seats balanced, which keeps the whole session's seats balanced
+    to within the single leftover hand an odd ``hands`` leaves over.  Splitting
+    naively (``hands // workers``) would instead give four workers four extra
+    big blinds, which is a real bias in the reported mbb/g and an invisible one.
+    """
+    workers = max(1, min(int(workers), max(1, hands)))
+    pairs, leftover = divmod(max(0, hands), 2)
+    counts = [2 * (pairs // workers) for _ in range(workers)]
+    for index in range(pairs % workers):
+        counts[index] += 2
+    if leftover:
+        counts[0] += 1
+    split: List[Tuple[int, int]] = []
+    start = 0
+    for count in counts:
+        if count:
+            split.append((start, count))
+            start += count
+    return split
+
+
+class _Session:
+    """The bookkeeping every worker shares: log handle, winnings, first error."""
+
+    def __init__(
+        self,
+        log_path: Optional[Path],
+        on_hand: Optional[Callable[[HandResult, SessionSummary], None]],
+    ) -> None:
+        self.lock = threading.Lock()
+        # Set by the first worker to fail, and checked by all of them between
+        # hands.  A session that has already gone wrong should stop talking to
+        # the server rather than run the remaining hands into the same error.
+        self.stop = threading.Event()
+        self.error: Optional[BaseException] = None
+        self.winnings: List[int] = []
+        self.started = time.perf_counter()
+        self.on_hand = on_hand
+        self.handle = None
+        if log_path is not None:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            self.handle = open(log_path, "a", buffering=1)
+
+    def record(self, result: HandResult) -> None:
+        """One finished hand.  Held under the lock so callers need no locking.
+
+        The log is append-as-you-go rather than collect-then-write: a session of
+        any useful length runs for hours, and a crash at hour three should leave
+        three hours of hands on disk rather than nothing.  With workers the
+        lines interleave, so they arrive out of index order — every line carries
+        its own ``hand`` and ``client_pos``, so nothing downstream needs them
+        ordered.
+        """
+        with self.lock:
+            self.winnings.append(result.winnings)
+            if self.handle is not None:
+                self.handle.write(json.dumps(result.to_dict()) + "\n")
+            if self.on_hand is not None:
+                self.on_hand(result, summarise(self.winnings, self.elapsed))
+
+    def fail(self, error: BaseException) -> None:
+        with self.lock:
+            if self.error is None:
+                self.error = error
+        self.stop.set()
+
+    @property
+    def elapsed(self) -> float:
+        return time.perf_counter() - self.started
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+def _play_chunk(
+    worker: int,
+    start: int,
+    count: int,
+    policy_factory: Callable[[int], Policy],
+    client_factory: Callable[[int], SlumbotClient],
+    session: _Session,
+) -> None:
+    """One worker's hands, on its own client and its own policy."""
+    try:
+        client = client_factory(worker)
+        policy = policy_factory(worker)
+        for index in range(start, start + count):
+            if session.stop.is_set():
+                return
+            session.record(play_hand(client, policy, index))
+    except BaseException as error:  # noqa: BLE001 - re-raised on the caller's thread
+        session.fail(error)
+
+
 def play_session(
     hands: int,
     policy: Policy,
@@ -284,28 +392,85 @@ def play_session(
     client: Optional[SlumbotClient] = None,
     on_hand: Optional[Callable[[HandResult, SessionSummary], None]] = None,
 ) -> SessionSummary:
-    """Play ``hands`` hands, logging each one as it finishes.
+    """Play ``hands`` hands in a single session, logging each one as it finishes."""
+    return play_session_parallel(
+        hands,
+        policy_factory=lambda _: policy,
+        workers=1,
+        log_path=log_path,
+        client_factory=(lambda _: client) if client is not None else None,
+        on_hand=on_hand,
+    )
 
-    Written as append-as-you-go rather than collect-then-write: a session of any
-    useful length runs for hours, and a crash at hour three should leave three
-    hours of hands on disk rather than nothing.
+
+def play_session_parallel(
+    hands: int,
+    policy_factory: Callable[[int], Policy],
+    workers: int = 4,
+    log_path: Optional[Path] = None,
+    client_factory: Optional[Callable[[int], SlumbotClient]] = None,
+    on_hand: Optional[Callable[[HandResult, SessionSummary], None]] = None,
+) -> SessionSummary:
+    """The same session, played by ``workers`` concurrent clients.
+
+    **Why this exists.**  A hand is a handful of request/response round trips
+    with a decision between each, and the two halves do not overlap: measured
+    here, a round trip to ``slumbot.com`` costs ~0.35s and a re-solving agent
+    spends ~1.2s per hand thinking, so a sequential 1000-hand session is roughly
+    half wall clock spent watching a socket.  Workers fill that gap with each
+    other's thinking, and the session becomes bounded by the CPU it can actually
+    use instead of by the round trip.
+
+    **Why it is legitimate.**  Each worker holds its own client and therefore
+    its own session token, which is exactly the "several people playing Slumbot
+    at once" case the server already serves; nothing is shared between them and
+    no hand is played faster or with more information than it would be alone.
+    What is *not* legitimate is playing a single session concurrently, and the
+    factory signature is what prevents it: there is no way to hand this function
+    one client to share.  Keep ``workers`` modest for the same reason — it is
+    someone else's machine, and four is the tested default.
+
+    ``policy_factory`` gets one call per worker and must return a *fresh* policy
+    each time.  A re-solving policy carries a hand's belief state across
+    decisions, so two workers sharing one would interleave two hands into the
+    same agent and quietly corrupt both.  It receives the worker index so the
+    caller can seed each one differently.
+
+    The result is the same ``SessionSummary`` the sequential path returns —
+    mean and variance do not care what order the hands arrived in — and seats
+    stay balanced because :func:`split_hands` hands out even-sized chunks.
     """
-    client = client or SlumbotClient()
-    winnings: List[int] = []
-    started = time.perf_counter()
-    handle = None
-    if log_path is not None:
-        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        handle = open(log_path, "a", buffering=1)
+    split = split_hands(hands, workers)
+    client_factory = client_factory or (lambda _: SlumbotClient())
+    session = _Session(Path(log_path) if log_path is not None else None, on_hand)
     try:
-        for index in range(hands):
-            result = play_hand(client, policy, index)
-            winnings.append(result.winnings)
-            if handle is not None:
-                handle.write(json.dumps(result.to_dict()) + "\n")
-            if on_hand is not None:
-                on_hand(result, summarise(winnings, time.perf_counter() - started))
+        if len(split) <= 1:
+            # Sequential stays genuinely sequential: no thread, so a failure
+            # arrives with the stack that produced it.
+            for worker, (start, count) in enumerate(split):
+                _play_chunk(worker, start, count, policy_factory, client_factory, session)
+                if session.error is not None:
+                    raise session.error
+        else:
+            threads = [
+                threading.Thread(
+                    target=_play_chunk,
+                    args=(worker, start, count, policy_factory, client_factory, session),
+                    name=f"slumbot-{worker}",
+                    daemon=True,
+                )
+                for worker, (start, count) in enumerate(split)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            if session.error is not None:
+                # Every worker has stopped by now, and the hands they did
+                # finish are on disk and in the summary the caller will not
+                # get.  Raising is still right: a session that lost a worker
+                # is a session with an unplanned number of hands in it.
+                raise session.error
     finally:
-        if handle is not None:
-            handle.close()
-    return summarise(winnings, time.perf_counter() - started)
+        session.close()
+    return summarise(session.winnings, session.elapsed)

@@ -34,7 +34,12 @@ from paradigm_b.holdem.compare.experiment import ComparisonConfig, run_compariso
 from paradigm_b.holdem.arm1_fixed.build import DatasetBuildConfig, build_layered_dataset, slice_examples
 from paradigm_b.holdem.arm1_fixed.store import DatasetStore
 from paradigm_b.holdem.arm1_fixed.student import FixedStudentConfig, fit_fixed_student
-from paradigm_b.holdem.arm2_iterative.journal import JournalEntry, TrajectoryJournal
+from paradigm_b.holdem.arm2_iterative.journal import (
+    MANIFEST_FILENAME,
+    SHARD_LOG_FILENAME,
+    JournalEntry,
+    TrajectoryJournal,
+)
 from paradigm_b.holdem.arm2_iterative.student import OnlineStudentConfig, fit_online_student
 from paradigm_b.holdem.compare.relabel import decode_situation, measure_label_drift
 from paradigm_b.holdem.data.generation import GenerationConfig
@@ -400,6 +405,94 @@ def test_the_journal_can_be_read_one_iteration_at_a_time(tmp_path):
     examples, meta = reopened.read(iteration=2)
     assert len(examples) == 1
     assert int(meta[0, 0]) == 2
+
+
+def _one_entry_journal(path, iterations):
+    journal = TrajectoryJournal(path)
+    rng = np.random.default_rng(0)
+    for iteration in iterations:
+        journal.add(
+            [
+                JournalEntry(
+                    features=rng.standard_normal(INPUT_DIM).astype(np.float32),
+                    mask=np.ones(1326, dtype=np.float32),
+                    values=np.zeros((2, 1326), dtype=np.float32),
+                    iteration=iteration,
+                    trajectory=iteration,
+                    step=0,
+                    board_cards=4,
+                )
+            ]
+        )
+        journal.flush(iteration)
+    return journal
+
+
+def test_the_journal_index_does_not_grow_with_the_number_of_shards(tmp_path):
+    """The index is appended to, never rewritten.
+
+    Schema 1 kept the shard list in ``manifest.json`` and rewrote it on every
+    flush, which is quadratic: the 12-hour run of 2026-08-01 spent 66% of its
+    wall clock re-serialising a 35 MB manifest 137,081 times.  The guard is
+    that the *header* stays O(1) — if the shard list ever moves back into it,
+    the file grows with the run and this fails.
+    """
+    journal = _one_entry_journal(tmp_path / "journal", range(1, 201))
+    journal.close()
+
+    manifest = json.loads((tmp_path / "journal" / MANIFEST_FILENAME).read_text())
+    assert "shards" not in manifest, "the shard list belongs in the append-only log"
+    assert manifest["total"] == 200
+
+    header = (tmp_path / "journal" / MANIFEST_FILENAME).stat().st_size
+    log = (tmp_path / "journal" / SHARD_LOG_FILENAME).stat().st_size
+    # The header does not know how many shards there are; the log does.
+    assert header < 200, f"header is {header} bytes, it should not scale with shards"
+    assert log > header
+
+    lines = (tmp_path / "journal" / SHARD_LOG_FILENAME).read_text().splitlines()
+    assert len(lines) == 200
+
+
+def test_a_journal_killed_mid_write_still_reads(tmp_path):
+    """A torn final line costs that shard, not the whole run's history."""
+    journal = _one_entry_journal(tmp_path / "journal", range(1, 21))
+    journal.close()
+
+    log = tmp_path / "journal" / SHARD_LOG_FILENAME
+    # Simulate a kill between write and flush: the last line is half there.
+    text = log.read_text()
+    log.write_text(text[: -len(text.splitlines()[-1]) // 2])
+    # The header still says the run finished with 20; the log is what counts.
+    reopened = TrajectoryJournal.open(tmp_path / "journal")
+    assert len(reopened.shards) == 19
+    assert len(reopened) == 19
+    examples, _ = reopened.read(iteration=19)
+    assert len(examples) == 1
+
+
+def test_a_schema_1_journal_still_reads(tmp_path):
+    """The 29 GB of journals already on disk keep working."""
+    journal = _one_entry_journal(tmp_path / "journal", range(1, 6))
+    journal.close()
+    shards = [json.loads(line) for line in (
+        tmp_path / "journal" / SHARD_LOG_FILENAME
+    ).read_text().splitlines()]
+
+    # Rewrite the directory the way schema 1 left it: everything in the
+    # manifest, no shard log.
+    (tmp_path / "journal" / SHARD_LOG_FILENAME).unlink()
+    (tmp_path / "journal" / MANIFEST_FILENAME).write_text(
+        json.dumps({"schema_version": 1, "total": 5, "shards": shards})
+    )
+
+    reopened = TrajectoryJournal.open(tmp_path / "journal")
+    assert len(reopened.shards) == 5
+    assert len(reopened) == 5
+    assert reopened.iterations() == (1, 2, 3, 4, 5)
+    examples, meta = reopened.read(iteration=3)
+    assert len(examples) == 1
+    assert int(meta[0, 0]) == 3
 
 
 # --- the street mixture -----------------------------------------------------

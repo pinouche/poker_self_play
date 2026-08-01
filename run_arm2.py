@@ -31,6 +31,14 @@ Typical use::
 
     nohup python run_arm2.py --run runs/arm2-12h > runs/arm2-12h/log.txt 2>&1 &
     python run_arm2.py --run runs/arm2-12h --resume     # after a crash
+    python run_arm2.py --run runs/arm2-drift --journal  # to analyse the labels
+
+``--journal`` is off by default.  It records every label so the arm's central
+claim -- that labels drift as the network improves -- can be checked after the
+fact, but it is **not** run state: ``--resume`` reads only ``<run>/run_state``,
+which carries the buffer, the net, the optimiser and the RNG.  A run that will
+only ever be trained and scored should leave it off; the 12-hour run of
+2026-08-01 spent 29GB and 548,325 files on a journal nothing has read.
 """
 
 from __future__ import annotations
@@ -53,6 +61,8 @@ from paradigm_b.holdem.arms_common.evaluation import (
     make_held_out_situations,
 )
 from paradigm_b.holdem.arms_common.lbr import LBRConfig
+from paradigm_b.holdem.arms_common.play import PlayConfig
+from paradigm_b.holdem.arms_common.progress import ProgressConfig, ProgressEvaluator
 from paradigm_b.holdem.arms_common.storage import save_checkpoint, write_json
 from paradigm_b.holdem.data.sampling import SituationConfig
 from paradigm_b.holdem.net.value_net import HoldemValueNetConfig
@@ -86,9 +96,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--journal",
         action="store_true",
-        default=True,
-        help="log every label to disk (~27GB at 1M) so the reuse ratio can be "
-        "swept later without regenerating anything",
+        default=False,
+        help="log every label to disk so the labels-drift-as-the-net-improves "
+        "claim can be checked afterwards, or the reuse ratio swept without "
+        "regenerating anything. Off by default: it is an *analysis* artifact, "
+        "not run state — resuming reads only <run>/run_state, so a training "
+        "loop that will never be analysed pays ~27GB and 550k files at 1M "
+        "labels for nothing",
     )
     parser.add_argument("--no-journal", dest="journal", action="store_false")
     parser.add_argument(
@@ -97,6 +111,58 @@ def parse_args() -> argparse.Namespace:
         help="continue from <run>/run_state rather than starting fresh",
     )
     parser.add_argument("--eval-boards", type=int, default=2)
+    # --- measuring progress during the run --------------------------------
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=None,
+        help="iterations between progress evaluations; off by default. Results "
+        "append to <run>/progress.jsonl, one line each, and run on a "
+        "background thread so the learner is never blocked waiting for them",
+    )
+    parser.add_argument(
+        "--progress-every-hours",
+        type=float,
+        default=None,
+        help="wall clock between progress evaluations, which is usually the "
+        "cadence actually wanted: an iteration is one drain plus whatever "
+        "gradient steps the label throttle has earned, so its rate moves "
+        "several-fold with --labels-per-update and an iteration count is a "
+        "guess at a duration. May be combined with --progress-every, in which "
+        "case whichever comes round first fires",
+    )
+    parser.add_argument(
+        "--progress-boards",
+        type=int,
+        default=1,
+        help="held-out boards per street for each progress evaluation",
+    )
+    parser.add_argument(
+        "--progress-search-iterations",
+        type=int,
+        default=40,
+        help="CFR iterations the progress evaluation re-solves with",
+    )
+    parser.add_argument(
+        "--progress-slumbot-hands",
+        type=int,
+        default=0,
+        help="hands to play against Slumbot at each progress evaluation. Zero "
+        "(the default) never contacts the network. Slumbot answers at roughly "
+        "one hand a second, so 200 hands is a ~3 minute session -- and at "
+        "+/-200bb a hand, a few hundred hands is a noisy number: read it with "
+        "its stderr, which is written alongside it",
+    )
+    parser.add_argument(
+        "--progress-slumbot-workers",
+        type=int,
+        default=1,
+        help="concurrent Slumbot sessions per progress evaluation. Each is a "
+        "separate token, so seats stay balanced and the sessions are "
+        "independent. Roughly half a sequential session is idle network wait, "
+        "so 4 workers is ~3x the hands per minute -- but it spends the "
+        "learner's cores to get there, which is why the default is 1",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print and exit")
     return parser.parse_args()
 
@@ -168,6 +234,59 @@ def main() -> None:
         return
 
     torch.manual_seed(args.seed)
+
+    progress = None
+    if args.progress_every or args.progress_every_hours:
+        # Its own held-out boards, drawn from the same excluded set the run was
+        # told to avoid, so a progress number and the final score are asking
+        # about the same kind of board rather than the same two boards.
+        progress_tests = make_held_out_situations(
+            np.random.default_rng(args.seed + 1),
+            SituationConfig(),
+            streets=(3, 4, 5),
+            boards_per_street=args.progress_boards,
+        )
+        progress = ProgressEvaluator(
+            ProgressConfig(
+                every=args.progress_every,
+                every_seconds=(
+                    args.progress_every_hours * 3600.0
+                    if args.progress_every_hours
+                    else None
+                ),
+                boards=args.progress_boards,
+                search_iterations=args.progress_search_iterations,
+                slumbot_hands=args.progress_slumbot_hands,
+                slumbot_workers=args.progress_slumbot_workers,
+                slumbot_play=PlayConfig(
+                    search_iterations=args.progress_search_iterations,
+                    device="cpu",
+                ),
+                device="cpu",
+            ),
+            net_config=config.value_net,
+            tests=progress_tests,
+            path=run / "progress.jsonl",
+        )
+        cadence = " and ".join(
+            part
+            for part in (
+                f"every {args.progress_every} iterations" if args.progress_every else "",
+                f"every {args.progress_every_hours}h" if args.progress_every_hours else "",
+            )
+            if part
+        )
+        print(
+            f"progress: {cadence} -> {run}/progress.jsonl"
+            + (
+                f", including {args.progress_slumbot_hands} hands vs Slumbot"
+                f" over {args.progress_slumbot_workers} session(s)"
+                if args.progress_slumbot_hands
+                else ""
+            ),
+            flush=True,
+        )
+
     started = time.perf_counter()
     result = fit_online_student(
         config,
@@ -176,6 +295,7 @@ def main() -> None:
         journal_path=(run / "journal") if args.journal else None,
         checkpoint_path=run / "checkpoints",
         state_path=run / "run_state",
+        progress=progress,
     )
     wall = time.perf_counter() - started
 

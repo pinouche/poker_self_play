@@ -20,6 +20,18 @@ Written as append-only shards, one per flush, exactly like the offline artifact
 rather than a corrupt file.  Metadata is stored per row (iteration, street,
 trajectory id, step within the trajectory) so a reader can slice by any of them
 without re-deriving anything from the encoded features.
+
+**The index is append-only too, and that is not a detail.**  Schema 1 kept the
+shard list inside ``manifest.json`` and rewrote the whole file on every flush.
+That is quadratic in shard count, and it does not stay small: the 12-hour run
+of 2026-08-01 wrote 137,081 shards, so it re-serialised a manifest growing to
+35 MB once per iteration and spent **66% of its wall clock** doing it — more
+than generation and training combined, and invisible because the cost sat
+between the two ``Spend`` timers.  Doubling a run quadruples that work, so it
+was the thing capping run length rather than the solver.  Schema 2 appends one
+JSON line per shard to ``shards.jsonl`` and leaves ``manifest.json`` as a small
+O(1) header.  Schema 1 journals still read, so the runs already on disk keep
+working.
 """
 
 from __future__ import annotations
@@ -27,7 +39,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, TextIO, Tuple
 
 import numpy as np
 
@@ -36,9 +48,33 @@ from paradigm_b.holdem.arms_common.storage import PathLike, write_json
 from paradigm_b.holdem.net.features import INPUT_DIM
 from paradigm_b.holdem.data.generation import Examples
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 MANIFEST_FILENAME = "manifest.json"
+SHARD_LOG_FILENAME = "shards.jsonl"
 NUM_PLAYERS = 2
+
+
+def _read_shard_log(path: Path) -> List[Dict[str, Any]]:
+    """Every complete line of a shard log, stopping at a torn one.
+
+    A kill between ``write`` and ``flush`` can leave the final line truncated.
+    Everything before it was flushed and is good, so the log is read up to the
+    first line that will not parse rather than refusing to open at all — the
+    same "a dead run leaves readable history" property the shards themselves
+    have.
+    """
+    shards: List[Dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                shards.append(json.loads(line))
+            except json.JSONDecodeError:
+                break
+    return shards
 
 
 @dataclass
@@ -60,9 +96,21 @@ class TrajectoryJournal:
     def __init__(self, path: PathLike) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
-        self.shards: List[Dict[str, Any]] = []
+        # Pick up where a previous process left off rather than starting the
+        # count from zero.  A resumed run rewinds ``iteration`` to the last
+        # state snapshot, so iteration numbers *do* repeat across a resume;
+        # carrying the shard index forward is what keeps the filenames unique
+        # and the earlier history readable.  (Schema 1 could not do this: a
+        # fresh journal rewrote manifest.json and dropped every shard the
+        # previous process had recorded.)
+        existing = self.path / SHARD_LOG_FILENAME
+        self.shards: List[Dict[str, Any]] = (
+            _read_shard_log(existing) if existing.exists() else []
+        )
         self._pending: List[JournalEntry] = []
-        self._total = 0
+        self._total = sum(int(shard["count"]) for shard in self.shards)
+        self._shard_log: Optional[TextIO] = existing.open("a", encoding="utf-8")
+        self._write_manifest()
 
     def __len__(self) -> int:
         return self._total + len(self._pending)
@@ -73,6 +121,20 @@ class TrajectoryJournal:
 
     def add(self, entries: Sequence[JournalEntry]) -> None:
         self._pending.extend(entries)
+
+    def close(self) -> None:
+        """Release the shard log and refresh the header.  Safe to call twice."""
+        if self._shard_log is not None:
+            self._shard_log.flush()
+            self._shard_log.close()
+            self._shard_log = None
+        self._write_manifest()
+
+    def __enter__(self) -> "TrajectoryJournal":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
 
     def flush(self, iteration: int) -> Optional[Dict[str, Any]]:
         """Write everything buffered as one shard tagged with ``iteration``."""
@@ -107,15 +169,26 @@ class TrajectoryJournal:
         self.shards.append(entry)
         self._total += len(self._pending)
         self._pending = []
-        self._write_manifest()
+        self._append_to_shard_log(entry)
         return entry
 
+    def _append_to_shard_log(self, entry: Dict[str, Any]) -> None:
+        """One line, one shard.  Constant work per flush, whatever the total."""
+        if self._shard_log is None:
+            raise ValueError("journal is closed, or was opened for reading")
+        self._shard_log.write(json.dumps(entry, sort_keys=True) + "\n")
+        # Flush to the OS so a reader — or a crash — sees every shard whose
+        # .npy files are already on disk.  This is one small write, not a
+        # rewrite of the index, which is the whole point of the format.
+        self._shard_log.flush()
+
     def _write_manifest(self) -> None:
+        """The header only.  The shard list lives in the append-only log."""
         write_json(
             {
                 "schema_version": SCHEMA_VERSION,
                 "total": self._total,
-                "shards": self.shards,
+                "shard_log": SHARD_LOG_FILENAME,
             },
             self.path / MANIFEST_FILENAME,
         )
@@ -123,20 +196,44 @@ class TrajectoryJournal:
     # -- reading ----------------------------------------------------------
     @classmethod
     def open(cls, path: PathLike) -> "TrajectoryJournal":
+        """Read a journal of either schema.
+
+        The shard log is authoritative whenever it exists: the header is
+        written at construction and refreshed at ``close``, so a run killed
+        mid-flight leaves a ``total`` of zero in ``manifest.json`` while the
+        log itself is complete.  Counting the log costs one pass and is always
+        right, so the header's ``total`` is never trusted.
+        """
         journal = cls.__new__(cls)
         journal.path = Path(path)
-        manifest_path = journal.path / MANIFEST_FILENAME
-        if not manifest_path.exists():
-            raise FileNotFoundError(f"no journal manifest at {manifest_path}")
-        manifest = json.loads(manifest_path.read_text())
-        if manifest["schema_version"] != SCHEMA_VERSION:
-            raise ValueError(
-                f"unsupported journal schema {manifest['schema_version']}, "
-                f"expected {SCHEMA_VERSION}"
-            )
-        journal.shards = list(manifest["shards"])
         journal._pending = []
-        journal._total = int(manifest["total"])
+        journal._shard_log = None  # read-only; ``flush`` would have nowhere to go
+
+        manifest_path = journal.path / MANIFEST_FILENAME
+        shard_log_path = journal.path / SHARD_LOG_FILENAME
+        manifest: Optional[Dict[str, Any]] = None
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            version = int(manifest.get("schema_version", SCHEMA_VERSION))
+            if version not in SUPPORTED_SCHEMA_VERSIONS:
+                raise ValueError(
+                    f"unsupported journal schema {version}, expected one of "
+                    f"{', '.join(str(v) for v in SUPPORTED_SCHEMA_VERSIONS)}"
+                )
+
+        if shard_log_path.exists():
+            journal.shards = _read_shard_log(shard_log_path)
+        elif manifest is not None and "shards" in manifest:
+            journal.shards = list(manifest["shards"])  # schema 1
+        elif manifest is None:
+            raise FileNotFoundError(
+                f"no journal at {journal.path}: expected {SHARD_LOG_FILENAME} "
+                f"or a schema-1 {MANIFEST_FILENAME}"
+            )
+        else:
+            journal.shards = []
+
+        journal._total = sum(int(shard["count"]) for shard in journal.shards)
         return journal
 
     def iterations(self) -> Tuple[int, ...]:

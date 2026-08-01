@@ -48,6 +48,7 @@ from paradigm_b.holdem.arm2_iterative.journal import JournalEntry, TrajectoryJou
 from paradigm_b.holdem.arms_common.budget import SpendRecord
 from paradigm_b.holdem.arms_common.evaluation import EvaluationConfig, TestSituation, evaluate_agent
 from paradigm_b.holdem.arms_common.fitting import StudentResult, fit_value_net
+from paradigm_b.holdem.arms_common.progress import ProgressEvaluator
 from paradigm_b.holdem.arms_common.storage import (
     PathLike,
     load_run_state,
@@ -145,6 +146,8 @@ def fit_online_student_async(
     journal_path: Optional[PathLike] = None,
     checkpoint_path: Optional[PathLike] = None,
     state_path: Optional[PathLike] = None,
+    progress: Optional[ProgressEvaluator] = None,
+    progress_join_timeout: float = 120.0,
 ) -> StudentResult:
     """Algorithm 1 across ``config.actors`` processes, one learner here."""
     rng = rng if rng is not None else np.random.default_rng(config.seed)
@@ -277,7 +280,9 @@ def fit_online_student_async(
                         trajectory_id += 1
                 spend.generation_seconds += time.perf_counter() - waiting
                 if journal is not None:
+                    journalling = time.perf_counter()
                     journal.flush(iteration)
+                    spend.journal_seconds += time.perf_counter() - journalling
 
                 purged = 0
                 if (
@@ -352,7 +357,19 @@ def fit_online_student_async(
                     and config.eval_every is not None
                     and iteration % config.eval_every == 0
                 ):
+                    # Timed like everything else in this loop: an evaluation on
+                    # the learner's own thread is wall clock the run is not
+                    # training with, and untimed sections of this loop have
+                    # form (see ``journal_seconds``).
+                    scoring = time.perf_counter()
                     record.update(evaluate_agent(net, tests, evaluation))
+                    spend.eval_seconds += time.perf_counter() - scoring
+                # The off-thread half: snapshot and launch if due, and fold in
+                # whatever an earlier launch has finished in the meantime.
+                if progress is not None:
+                    progress.maybe_start(iteration, net, spend)
+                    for finished_eval in progress.drain():
+                        history.append(finished_eval)
                 history.append(record)
 
                 if state_directory is not None and (
@@ -395,8 +412,15 @@ def fit_online_student_async(
                         Path(checkpoint_path) / f"student-iter-{iteration:05d}.pt",
                     )
     finally:
+        if progress is not None:
+            # An evaluation in flight when the deadline hits has already done
+            # the expensive part; give it a bounded chance to land rather than
+            # dropping the last point on every plot.
+            progress.join(timeout=progress_join_timeout)
+            history.extend(progress.drain())
         if journal is not None:
             journal.flush(iteration)
+            journal.close()
         if state_directory is not None:
             save_run_state(
                 state_directory,
