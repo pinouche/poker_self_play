@@ -44,15 +44,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import comb
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from paradigm_b.core.cfr.tabular_cfr import CFRConfig
-from paradigm_b.holdem.engine.combos import NUM_COMBOS, board_mask, compatible_mass
-from paradigm_b.holdem.net.features import INPUT_DIM, encode_pbs
+from paradigm_b.holdem.data.store import ReplayBuffer
+from paradigm_b.holdem.engine.combos import board_mask, compatible_mass
+from paradigm_b.holdem.net.features import encode_pbs
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
 from paradigm_b.holdem.net.policy import (
     MAX_ACTIONS,
@@ -139,71 +140,16 @@ class Example:
     # decision node of the subgame that was solved here, not just its root.
     policies: Tuple[PolicyExample, ...] = ()
     # The board this example was solved on.  Carried so a caller can tell which
-    # street produced it — the encoded features contain the board, but recovering
-    # it from them is needless work when the sampler already knows.
+    # street produced it, and because the replay buffer stores it *instead of*
+    # the mask: a mask is ``board_mask(board)`` and nothing else, so five bytes
+    # of card ids replace 5,304 bytes of float32 per row.
     board: Tuple[int, ...] = ()
 
 
-class Buffer:
-    """Circular store of encoded belief states, their masks and their values."""
-
-    def __init__(self, capacity: int) -> None:
-        self.capacity = capacity
-        self.features = np.zeros((capacity, INPUT_DIM), dtype=np.float32)
-        self.masks = np.zeros((capacity, NUM_COMBOS), dtype=np.float32)
-        self.targets = np.zeros((capacity, NUM_PLAYERS, NUM_COMBOS), dtype=np.float32)
-        self.size = 0
-        self._next = 0
-
-    def __len__(self) -> int:
-        return self.size
-
-    def add(self, examples: Sequence[Example]) -> None:
-        for example in examples:
-            self.features[self._next] = example.features
-            self.masks[self._next] = example.mask
-            self.targets[self._next] = example.values
-            self._next = (self._next + 1) % self.capacity
-            self.size = min(self.size + 1, self.capacity)
-
-    def sample(self, batch_size: int, rng: np.random.Generator):
-        index = rng.integers(0, self.size, size=min(batch_size, self.size))
-        return self.features[index], self.masks[index], self.targets[index]
-
-    def purge_oldest(self, fraction: float = 0.5) -> int:
-        """Drop the oldest ``fraction`` of the buffer; return how many went.
-
-        ReBeL's appendix E: *"As initial data is produced with a random value
-        network, we remove half of the data from the replay buffer after 20
-        epochs."*  Without this, labels written by an essentially random
-        network keep being sampled at full weight for the rest of the run —
-        and in a buffer that never fills (2,000 labels into 60,000 slots)
-        nothing is ever evicted by the ordinary circular churn either, so
-        *every* early mistake survives to the last gradient step.
-
-        Order is reconstructed from the write pointer, so this is correct
-        whether or not the buffer has wrapped.
-        """
-        if not 0.0 < fraction < 1.0 or self.size == 0:
-            return 0
-        keep = max(self.size - int(self.size * fraction), 1)
-        if keep >= self.size:
-            return 0
-        if self.size < self.capacity:
-            order = np.arange(self.size)
-        else:  # wrapped: oldest sits at the write pointer
-            order = np.concatenate(
-                [np.arange(self._next, self.capacity), np.arange(0, self._next)]
-            )
-        newest = order[-keep:]
-        # Fancy indexing copies, so this cannot alias the destination.
-        self.features[:keep] = self.features[newest]
-        self.masks[:keep] = self.masks[newest]
-        self.targets[:keep] = self.targets[newest]
-        dropped = self.size - keep
-        self.size = keep
-        self._next = keep % self.capacity
-        return dropped
+# The replay buffer moved to :mod:`paradigm_b.holdem.data.store` when it grew a
+# disk-backed sibling; the name stays importable from here because that is where
+# every caller has always found it.
+Buffer = ReplayBuffer
 
 
 def normalise(values: np.ndarray, reach: np.ndarray, correction: float):

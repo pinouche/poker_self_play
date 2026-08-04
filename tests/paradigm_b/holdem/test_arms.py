@@ -830,19 +830,44 @@ def test_purging_drops_the_oldest_half_and_keeps_the_newest(tmp_path):
             values=np.zeros((2, 1326), dtype=np.float32),
         )
 
+    def live(buffer):
+        """Live rows oldest first.  Purging moves a watermark rather than
+        compacting, so physical slot order is no longer logical order."""
+        rows, _, _ = buffer.raw(np.arange(len(buffer)))
+        return sorted({int(row[0]) for row in rows})
+
     buffer.add([label(i) for i in range(8)])  # not yet wrapped
     assert buffer.purge_oldest(0.5) == 4
     assert len(buffer) == 4
-    kept = sorted({int(buffer.features[i][0]) for i in range(len(buffer))})
-    assert kept == [4, 5, 6, 7]  # the newest four survive
+    assert live(buffer) == [4, 5, 6, 7]  # the newest four survive
 
     # And again once the ring has wrapped past the end.
     buffer = Buffer(capacity=6)
     buffer.add([label(i) for i in range(10)])  # wraps: holds 4..9
     assert len(buffer) == 6
     buffer.purge_oldest(0.5)
-    kept = sorted({int(buffer.features[i][0]) for i in range(len(buffer))})
-    assert kept == [7, 8, 9]
+    assert live(buffer) == [7, 8, 9]
+
+
+def test_purging_copies_nothing():
+    """The watermark is the point: at 60M rows a compacting purge is a memmove
+    of hundreds of gigabytes to *delete* data.  Nothing may be written."""
+    from paradigm_b.holdem.selfplay import Buffer, Example
+
+    buffer = Buffer(capacity=64)
+    buffer.add(
+        [
+            Example(
+                features=np.full(INPUT_DIM, i, dtype=np.float32),
+                mask=np.ones(1326, dtype=np.float32),
+                values=np.zeros((2, 1326), dtype=np.float32),
+            )
+            for i in range(32)
+        ]
+    )
+    before = buffer.features.copy()
+    assert buffer.purge_oldest(0.5) == 16
+    np.testing.assert_array_equal(buffer.features, before)
 
 
 def test_purging_is_a_no_op_at_the_edges():
@@ -914,12 +939,18 @@ def test_shared_weights_publish_and_reload_across_a_version_bump():
 def test_clipping_an_actor_batch_lands_on_the_budget():
     from paradigm_b.holdem.arm2_iterative.actors import ActorBatch
     from paradigm_b.holdem.arm2_iterative.async_student import _clip
+    from paradigm_b.holdem.data.store import encode_board
 
+    # Real board cards, not a count of them: the buffer stores the board
+    # instead of the mask, so the cards have to survive the trip from the actor.
+    boards = np.stack(
+        [encode_board(b) for b in ((0, 1, 2), (3, 4, 5, 6), (7, 8, 9, 10, 11))]
+    )
     batch = ActorBatch(
         features=np.zeros((3, INPUT_DIM), np.float32),
         masks=np.ones((3, 1326), np.float32),
         targets=np.zeros((3, 2, 1326), np.float32),
-        boards=[3, 4, 5],
+        boards=boards,
         leaf_evaluations=10,
         solver_calls=2,
         weight_version=1,
@@ -927,7 +958,9 @@ def test_clipping_an_actor_batch_lands_on_the_budget():
     assert len(_clip(batch, 5)) == 3  # room to spare: untouched
     clipped = _clip(batch, 2)
     assert len(clipped) == 2
-    assert clipped.boards == [3, 4]
+    np.testing.assert_array_equal(clipped.boards, boards[:2])
+    # And the street the journal wants is still recoverable from them.
+    assert [int((row >= 0).sum()) for row in clipped.boards] == [3, 4]
 
 
 def test_the_async_loop_spends_both_budgets_exactly(tmp_path):

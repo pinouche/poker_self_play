@@ -31,6 +31,8 @@ paradigm_b/
   holdem/           stage 4: real cards, 1,326-combo ranges
     arm1_fixed/     (2) frozen dataset             -> docs/arms.md
     arm2_iterative/ (3) ReBeL Algorithm 2          -> docs/arms.md
+    data/store.py   replay buffer, in memory or sharded onto disk
+    data/augmentation.py  the suit and chip symmetries, applied on read
   cli/              leduc.py, holdem.py, compare.py
 common/         cards, hand evaluation, and the neural primitives both share
 docs/           the write-ups
@@ -97,22 +99,94 @@ the same ratio (146 x 7 / 5 = 204.4 labels per update) so the budget-mismatch
 warning stays quiet. `--dry-run` prints the plan and exits; it should read
 `rebel_epochs 1750.0` and `reuse_per_label 5.0`.
 
-**It does not finish.** Measured generation is ~87 labels/s (the 12-hour run of
-2026-08-01, counting its gen+train seconds; its wall clock was inflated by the
-journal, which is off by default now), and this config trains 9x less per label
-so generation gets more of the machine — call it 87-120 labels/s. 896M labels is
-**2,000-3,100 hours**, i.e. 85-130 days. The learner is not the constraint:
-4.375M steps at 15.2/s is 80 hours. Generation is ~30x the bottleneck, which is
-what the paper's 720 V100s were buying. Whatever fraction the run completes
-keeps the ratios exactly, so shortening `--hours` is the only knob needed for a
-smaller version of the same run.
+**It does not finish. It takes 168 hours and 10 minutes**, because `--hours`
+binds and the budgets are nowhere near reachable:
 
-**The one thing that cannot be matched.** ReBeL's 12M-example buffer would be
-313 GB here (26.7 KB per example, measured). At 1M the buffer is 27.4 GB
-resident — with a transient ~11 GB more at each state write, since
-`_save_circular` re-orders each field before writing — and a label's 5
-presentations fall inside ~4,900 gradient steps instead of the paper's ~58,600.
-Same reuse rate, ~12x more correlated batches.
+| | |
+|---|---|
+| generation rate (8 actors, mps, this net) | **~29-31 labels/s** |
+| labels in 168 h | **~18M** of 896,000,000 → **2%** |
+| updates (labels / 204.8) | **~87,000** of 4,375,000 → **2%** |
+| the label budget alone would need | **~8,600 h**, i.e. about a year |
+| after the deadline | final state write, then `evaluate_agent` with LBR — 6-10 min |
+
+Whatever fraction the run completes keeps the ratios exactly, so `--hours` is
+the only knob needed for a smaller version of the same run.
+
+**Where the rate comes from, and one figure not to reuse.** The 12-hour run of
+2026-08-01 delivered 1,269,597 labels in 12.01 h of wall clock: **29.36
+labels/s**, which is what `run_arm2.py` prints when it finishes. An earlier
+version of this section quoted ~87 labels/s, from
+`labels / (generation_seconds + training_seconds)`. That denominator is two
+*learner-side* timers — the drain wait and the gradient steps — and the actors
+are separate processes that keep generating through anything the learner is
+doing. The 66% of that run's wall clock lost to the quadratic journal manifest
+(fixed since, and `--journal` is off by default) was not actor idle time: the
+queue never filled and 37% of drains returned nothing. So removing it frees a
+core rather than tripling generation. Two independent measurements agree with
+29-36 and none with 87: steady-state mid-run windows at ~36 labels/s, and 15.2
+labels/s at 8 actors under a much heavier update load.
+
+**The one lever that is worth ~2x, and it is not a constant factor.** At 8
+actors on MPS the run is GPU-bound, and a cheaper forward converts almost 1:1
+into labels/s (the fused-forward change measured 1.13x on the forward and 1.14x
+end to end). Forward throughput at batch 1024, measured paired and interleaved
+in one process — the only protocol this machine's thermal drift permits:
+
+| net | forward |
+|---|---|
+| `--hidden-dim 1536 --residual-blocks 6` (this run) | 1.00x |
+| `--hidden-dim 1024 --residual-blocks 4` | **2.08x** |
+| `--hidden-dim 768 --residual-blocks 3` | **2.66x** |
+
+The trade is capacity, and at this data scale it is probably not a trade at all:
+the 12-hour run's loss was still falling at 57,000 steps, so the network is
+data-starved rather than capacity-starved, and a smaller one both generates and
+trains about twice as fast. Everything else has been measured and is not a
+lever — a batching server is 1.1x, bf16 is 1.07x (and fp16 overflows: values are
+chips), batching trajectories is 0.62x, and the CFR regret arithmetic is ~2% of
+a label. The one unexplored piece is the all-in river subtree, ~96 five-card
+terminals re-walked every CFR iteration below a node with no decisions under it;
+fusing its 48 rivers into a numba kernel attacks most of the 12% in
+`terminal_values`, but CPU savings convert poorly at a GPU-bound operating point.
+
+**The honest framing of the budget.** 896M labels is ReBeL's number divided by
+its reuse, and ReBeL put 720 V100s behind generation. One M4 Max is not within
+three orders of magnitude of that, and no constant-factor work closes it. The
+question this run can answer is what ~18M labels are worth when they are spent
+well — which is what `--labels-per-update`, read-time augmentation and the
+network size are for, and none of those are throughput problems.
+
+**The buffer, which is now reachable.** A row costs **11,037 bytes** — fp16
+features, fp16 targets, and a 5-byte board that the 1,326-wide mask is rebuilt
+from on the way out — against 27,368 for the float32-with-mask form it replaces.
+So ReBeL's 12M-example buffer is **132 GB**, not 313: past this machine's 137 GB
+of RAM once eight actors and torch are also resident, but nothing at all for
+`--buffer-dir`, which puts the rows in append-only shards on disk and makes a
+state write a manifest instead of a copy.
+
+Whether 12M is *wanted* is a different question from whether it fits. A 168-hour
+run generates ~18M labels, so the choice is really what fraction of the run stays
+resident:
+
+| `--buffer-size` | resident | turnovers in an 18M-label run |
+|---|---|---|
+| 1M | 11.0 GB | 17.8 |
+| 2M | 22.1 GB | 8.9 |
+| 4M | 44.1 GB | 4.5 |
+| 12M | 132.4 GB (disk) | **1.5** |
+
+At 12M almost nothing is ever evicted and the run trains to the end on labels a
+much weaker network wrote; 2-4M keeps a staleness profile close to the 12-hour
+run's and still fits in memory. Reuse per label does not depend on buffer size at
+all — that is `--labels-per-update` — so a bigger buffer buys diversity within a
+batch, not more training.
+
+What still cannot be matched is *dispersion*: a label's 5 presentations fall
+inside ~4,900 gradient steps here against the paper's ~58,600. Read-time
+augmentation softens this — every presentation is a fresh suit relabelling and
+chip scale rather than the same row five times — but the batches remain more
+correlated than the paper's.
 
 **Following it.** Two lines land in `progress.jsonl` and in the log every 5
 hours of wall clock (`--progress-every-hours`, which exists because an iteration
@@ -171,7 +245,15 @@ starting another one; `run_state` holds only the latest snapshot, swapped in by
 rename. Repeat the flags: the network shape, the action abstraction and
 `--buffer-size` are fingerprinted and a resume that disagrees is refused rather
 than silently retrained, and the rest of the flags are simply not stored.
-Checkpoints are weights only and cannot continue a run.
+Checkpoints are weights only and cannot continue a run. `--state-every` counts
+*iterations*, and an iteration is one drain of the actor queue rather than a
+fixed amount of work — 217,174 of them in the 12-hour run, so ~5-10 a second and
+`--state-every 60000` is a snapshot every two or three hours.
+
+State is versioned, and the fp16 buffer rows bumped it to 3: a `run_state`
+written before that holds float32-with-mask arrays and is refused rather than
+misread. `runs/arm2-12h/run_state` is one of those and can no longer be resumed
+from — its `student.pt` weights are still loadable.
 
 ## Documentation
 

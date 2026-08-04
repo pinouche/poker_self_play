@@ -65,7 +65,8 @@ from paradigm_b.holdem.net.policy import (
     train_policy_net,
 )
 from paradigm_b.holdem.net.value_net import HoldemValueNet
-from paradigm_b.holdem.selfplay import Buffer, Example
+from paradigm_b.holdem.data.store import build_buffer
+from paradigm_b.holdem.selfplay import Example
 
 
 def learner_thread_count(actors: int, requested: Optional[int] = None) -> int:
@@ -151,6 +152,10 @@ def fit_online_student_async(
 ) -> StudentResult:
     """Algorithm 1 across ``config.actors`` processes, one learner here."""
     rng = rng if rng is not None else np.random.default_rng(config.seed)
+    # A stream of its own, for the reason given in ``student.py``.  Actors do
+    # the generating here, so this cannot perturb them — but keeping the two
+    # paths identical is worth more than the argument that one of them is safe.
+    augment_rng = np.random.default_rng(np.random.SeedSequence(config.seed).spawn(2)[1])
     device = torch.device(config.device)
     net = net if net is not None else HoldemValueNet(config.value_net)
     net.to(device)
@@ -158,7 +163,14 @@ def fit_online_student_async(
 
     optimiser = torch.optim.Adam(net.parameters(), lr=config.learning_rate)
     loss_fn = nn.HuberLoss(reduction="mean")
-    buffer = Buffer(config.buffer_size)
+    buffer = build_buffer(
+        config.buffer_size,
+        directory=config.buffer_dir,
+        shard_rows=config.buffer_shard_rows,
+        hot_rows=config.buffer_hot_rows,
+        augment=config.augment_on_read,
+        augment_rng=augment_rng,
+    )
     journal = TrajectoryJournal(journal_path) if journal_path is not None else None
     spend = SpendRecord()
     history: List[Dict[str, float]] = []
@@ -184,6 +196,7 @@ def fit_online_student_async(
             optimiser=optimiser,
             buffer=buffer,
             rng=rng,
+            augment_rng=augment_rng,
             policy_net=policy_net,
             policy_optimiser=policy_optimiser,
             policy_buffer=policy_buffer,
@@ -240,12 +253,19 @@ def fit_online_student_async(
                         if room <= 0:
                             break
                         batch = _clip(batch, room)
+                        # ``board`` is what the buffer stores in place of the
+                        # mask, so it has to survive the trip from the actor:
+                        # ``batch.boards`` is fixed width with -1 for a card the
+                        # street has not dealt.
                         buffer.add(
                             [
                                 Example(
                                     features=batch.features[i],
                                     mask=batch.masks[i],
                                     values=batch.targets[i],
+                                    board=tuple(
+                                        int(c) for c in batch.boards[i] if c >= 0
+                                    ),
                                 )
                                 for i in range(len(batch))
                             ]
@@ -272,7 +292,7 @@ def fit_online_student_async(
                                         iteration=iteration,
                                         trajectory=trajectory_id,
                                         step=i,
-                                        board_cards=batch.boards[i],
+                                        board_cards=int((batch.boards[i] >= 0).sum()),
                                     )
                                     for i in range(len(batch))
                                 ]
@@ -391,6 +411,7 @@ def fit_online_student_async(
                         iteration=iteration,
                         trajectory_id=trajectory_id,
                         rng=rng,
+                        augment_rng=augment_rng,
                         net=net,
                         optimiser=optimiser,
                         buffer=buffer,
@@ -429,6 +450,7 @@ def fit_online_student_async(
                 iteration=iteration,
                 trajectory_id=trajectory_id,
                 rng=rng,
+                augment_rng=augment_rng,
                 net=net,
                 optimiser=optimiser,
                 buffer=buffer,

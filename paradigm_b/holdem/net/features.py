@@ -53,6 +53,10 @@ PUBLIC_DIM = BOARD_DIM + NUM_SCALARS + BETTING_HISTORY_DIM
 
 
 POT_CHIPS_INDEX = SCALAR_OFFSET + 5
+# The two absolute-chip scalars, and the only inputs the chip isomorphism in
+# ``data/augmentation.py`` touches: every other scalar is already a ratio and is
+# therefore invariant under a uniform rescaling of the money.
+STACK_CHIPS_INDEX = SCALAR_OFFSET + 6
 
 
 @lru_cache(maxsize=8192)

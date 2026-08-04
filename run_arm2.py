@@ -65,6 +65,7 @@ from paradigm_b.holdem.arms_common.play import PlayConfig
 from paradigm_b.holdem.arms_common.progress import ProgressConfig, ProgressEvaluator
 from paradigm_b.holdem.arms_common.storage import save_checkpoint, write_json
 from paradigm_b.holdem.data.sampling import SituationConfig
+from paradigm_b.holdem.data.store import ROW_BYTES
 from paradigm_b.holdem.net.value_net import HoldemValueNetConfig
 
 
@@ -85,6 +86,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--buffer-size", type=int, default=60_000)
+    parser.add_argument(
+        "--buffer-dir",
+        type=str,
+        default=None,
+        help="put the replay rows in append-only shards under this directory "
+        "instead of holding them in memory. A canonical row is ~11KB, so an "
+        "in-memory buffer is fine up to a few million; past that this is what "
+        "makes the capacity reachable. Expected to be NVMe, and may sit outside "
+        "the run directory. With it set, --state-every stops copying the buffer "
+        "at all: the shards are already durable and the state records a "
+        "manifest into them",
+    )
+    parser.add_argument("--shard-rows", type=int, default=16_384)
+    parser.add_argument(
+        "--hot-rows",
+        type=int,
+        default=262_144,
+        help="rows of the newest data mirrored in RAM when --buffer-dir is set. "
+        "A cache, not a tier -- sampling stays uniform over every live row. "
+        "262,144 rows is ~2.9GB",
+    )
+    parser.add_argument(
+        "--suit-augmentations",
+        type=int,
+        default=2,
+        help="ReBeL's two augmentation clauses, applied when a row is read: "
+        "every draw gets a fresh suit relabelling and a fresh chip scale. Any "
+        "value >= 1 turns it on (the paper's K=2 included); 0 is the ablation, "
+        "serving rows exactly as stored",
+    )
     parser.add_argument("--purge-after-iterations", type=int, default=100)
     parser.add_argument("--state-every", type=int, default=400)
     parser.add_argument("--actors", type=int, default=8)
@@ -173,6 +204,10 @@ def build(args: argparse.Namespace, excluded) -> OnlineStudentConfig:
         trajectories_per_iteration=args.trajectories_per_iteration,
         updates_per_iteration=args.updates_per_iteration,
         buffer_size=args.buffer_size,
+        buffer_dir=args.buffer_dir,
+        buffer_shard_rows=args.shard_rows,
+        buffer_hot_rows=args.hot_rows,
+        suit_augmentations=args.suit_augmentations,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         situations=SituationConfig(excluded_boards=excluded),
@@ -209,6 +244,13 @@ def describe(args: argparse.Namespace, config: OnlineStudentConfig) -> dict:
         "labels_if_25_per_second": round(args.hours * 3600 * 25),
         "labels_if_80_per_second": round(args.hours * 3600 * 80),
         "state_writes": round(iterations / max(config.state_every, 1)),
+        # What the rows cost, which is the sizing question --buffer-dir exists
+        # to answer.  A canonical row is fp16 features + fp16 targets + a
+        # 5-byte board; the mask is rebuilt from the board on the way out.
+        "buffer_row_bytes": ROW_BYTES,
+        "buffer_gb_when_full": round(args.buffer_size * ROW_BYTES / 1e9, 2),
+        "buffer_rows_live_where": args.buffer_dir or "memory",
+        "augment_on_read": config.augment_on_read,
     }
 
 

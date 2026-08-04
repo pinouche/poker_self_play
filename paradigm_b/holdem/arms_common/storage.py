@@ -205,12 +205,19 @@ class RunLayout:
 # both networks, both optimisers, both buffers, the spend, the iteration counter
 # and the RNG.
 #
-# The buffers dominate the bytes: 60,000 examples is ~1.6GB, because each one
-# carries a 2,792-wide encoding, a 1,326 mask and a 2 x 1,326 target.  They are
-# written uncompressed and sliced to ``size``, so an early checkpoint is small
-# and a full one is a single sequential write.
+# The value buffer used to dominate the bytes, and used to be copied here in
+# full on every save.  It no longer is.  It owns its own persistence now
+# (:meth:`paradigm_b.holdem.data.store.ReplayBuffer.write_state`), which for the
+# in-memory form means canonical fp16 rows at 2.5x less than the float32
+# encoding-plus-mask it replaces, and for the sharded form means a manifest and
+# no copy at all -- the shards are already durable, already outside this
+# directory, and staging a second copy of them would be the largest single cost
+# in a long run.  The policy buffer is small and unchanged.
+#
+# 3: the value buffer's rows became canonical fp16 without a mask, so a state
+# written under 2 holds arrays this build cannot read as its buffer.
 
-RUN_STATE_VERSION = 2
+RUN_STATE_VERSION = 3
 
 
 def _buffer_order(size: int, capacity: int, next_index: int) -> np.ndarray:
@@ -242,6 +249,8 @@ def _load_circular(directory: Path, name: str, buffer, fields: Sequence[str], me
             f"{buffer.capacity}; raise buffer_size or the oldest data would be "
             f"silently dropped on resume"
         )
+    if hasattr(buffer, "_ensure_allocated"):
+        buffer._ensure_allocated(size)
     for field_name in fields:
         array = np.load(directory / f"{name}-{field_name}.npy")
         getattr(buffer, field_name)[:size] = array
@@ -279,6 +288,10 @@ def save_run_state(
     iteration: int,
     trajectory_id: int,
     rng,
+    # The stream the buffer's read-time isomorphisms are drawn from.  Saved with
+    # everything else, because a resume that reset it would re-draw the same
+    # transforms over rows it has already served under them.
+    augment_rng=None,
     net,
     optimiser,
     buffer,
@@ -303,13 +316,13 @@ def save_run_state(
         "iteration": int(iteration),
         "trajectory_id": int(trajectory_id),
         "rng": rng.bit_generator.state,
-        "buffer": _save_circular(
-            staging,
-            "buffer",
-            buffer,
-            {"features": buffer.features, "masks": buffer.masks, "targets": buffer.targets},
-        ),
+        # The buffer decides what "saving" means for it.  A sharded buffer
+        # returns a manifest and writes no rows here at all, which is what keeps
+        # ``state_every`` from costing a full buffer copy.
+        "buffer": buffer.write_state(staging),
     }
+    if augment_rng is not None:
+        meta["augment_rng"] = augment_rng.bit_generator.state
     if policy_net is not None:
         torch.save(policy_net.state_dict(), staging / "policy_net.pt")
     if policy_optimiser is not None:
@@ -348,6 +361,7 @@ def load_run_state(
     optimiser,
     buffer,
     rng,
+    augment_rng=None,
     policy_net=None,
     policy_optimiser=None,
     policy_buffer=None,
@@ -379,9 +393,7 @@ def load_run_state(
     optimiser.load_state_dict(
         torch.load(directory / "value_optimiser.pt", map_location="cpu")
     )
-    _load_circular(
-        directory, "buffer", buffer, ("features", "masks", "targets"), meta["buffer"]
-    )
+    buffer.read_state(directory, meta["buffer"])
     if policy_net is not None and (directory / "policy_net.pt").exists():
         policy_net.load_state_dict(
             torch.load(directory / "policy_net.pt", map_location="cpu")
@@ -399,6 +411,8 @@ def load_run_state(
             meta["policy_buffer"],
         )
     rng.bit_generator.state = meta["rng"]
+    if augment_rng is not None and "augment_rng" in meta:
+        augment_rng.bit_generator.state = meta["augment_rng"]
 
     initial_state = torch.load(directory / "initial_state.pt", map_location="cpu")
     return {

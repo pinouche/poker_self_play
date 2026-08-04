@@ -71,6 +71,7 @@ from paradigm_b.holdem.net.policy import (
     PolicyExample,
 )
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
+from paradigm_b.holdem.data.store import encode_board
 from paradigm_b.holdem.selfplay import Example, HoldemSelfPlayConfig, collect_trajectory
 
 
@@ -81,7 +82,12 @@ class ActorBatch:
     features: np.ndarray
     masks: np.ndarray
     targets: np.ndarray
-    boards: List[int]
+    # The board each label was solved on, as card ids padded with ``-1``, not
+    # just how many cards it had.  The replay buffer stores the board *instead
+    # of* the 1,326-wide mask and rebuilds the mask from it, so the cards have
+    # to survive the trip from the actor process; the street the journal wants
+    # is recoverable from them and the reverse is not.
+    boards: np.ndarray
     leaf_evaluations: int
     solver_calls: int
     weight_version: int
@@ -221,7 +227,7 @@ def actor_loop(
             features=np.stack([e.features for e in examples]).astype(np.float32),
             masks=np.stack([e.mask for e in examples]).astype(np.float32),
             targets=np.stack([e.values for e in examples]).astype(np.float32),
-            boards=[len(e.board) for e in examples],
+            boards=np.stack([encode_board(e.board) for e in examples]),
             leaf_evaluations=leaf_evaluations,
             solver_calls=solver_calls,
             weight_version=version,

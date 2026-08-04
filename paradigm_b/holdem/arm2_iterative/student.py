@@ -56,7 +56,8 @@ from paradigm_b.holdem.net.policy import (
     train_policy_net,
 )
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
-from paradigm_b.holdem.selfplay import Buffer, HoldemSelfPlayConfig, collect_trajectory
+from paradigm_b.holdem.data.store import build_buffer
+from paradigm_b.holdem.selfplay import HoldemSelfPlayConfig, collect_trajectory
 from paradigm_b.holdem.data.sampling import SituationConfig
 from paradigm_b.holdem.net.leaf_values import NetLeafValues
 
@@ -79,6 +80,30 @@ class OnlineStudentConfig:
     # DeepStack-style postflop sampler, which the fixed-vs-iterative comparison
     # needs because it scores each street on its own held-out boards.
     preflop_start: bool = True
+    # Both of ReBeL's augmentation clauses, applied when a row is read rather
+    # than when it is written — see
+    # :func:`~paradigm_b.holdem.data.augmentation.transform_batch`.
+    #
+    # ``K`` used to be a storage multiplier in the paper: K transformed copies
+    # of each solve in the buffer, each pinned to one point of its orbit, plus a
+    # periodic in-place pass to re-transform them.  Drawing the transformation
+    # at sample time instead makes both unnecessary and is strictly stronger —
+    # one canonical row per solve, a fresh orbit point on every draw — so this
+    # is a switch rather than a count.  Any value >= 1 means "transform on
+    # read", which is the default and what the paper's K=2 becomes here.  ``0``
+    # is the ablation: canonical rows served exactly as stored.
+    suit_augmentations: int = 2
+    # Where the replay rows live.  ``None`` keeps them in memory, which is right
+    # up to a few million.  A path puts them in append-only shards on disk
+    # (:class:`~paradigm_b.holdem.data.store.ShardedReplayBuffer`) and is what
+    # makes a paper-sized capacity reachable; it is expected to be NVMe and may
+    # sit outside the run directory.
+    buffer_dir: Optional[str] = None
+    buffer_shard_rows: int = 16_384
+    # Rows of the newest data mirrored in memory when the buffer is sharded.
+    # A cache, not a tier — sampling stays uniform over every live row.
+    # 262,144 rows is ~2.9 GB at the fp16 row size.
+    buffer_hot_rows: int = 262_144
     # ReBeL appendix E removes half the replay buffer after 20 of its 1,750
     # epochs, because the earliest labels were written by a random network.
     # ``None`` disables it; the labels still count against the label budget,
@@ -112,8 +137,11 @@ class OnlineStudentConfig:
     # steps against an empty replay buffer, which is a worse starting point
     # than it looks.  ``None`` disables it.
     #
-    # The buffers are what this costs: 60,000 examples is ~1.6GB, so at a
-    # 12-hour run a cadence around half an hour is the right order.
+    # The replay arrays grow lazily toward ``buffer_size``, and a state file
+    # contains only populated rows — in canonical fp16, so 2.5x smaller than the
+    # encoding-plus-mask form it replaces (60,000 examples is ~0.66GB, not
+    # ~1.6GB).  With ``buffer_dir`` set the rows are not copied here at all: the
+    # shards are already durable and the state records a manifest into them.
     state_every: Optional[int] = None
     # Continue from a directory written by ``state_every``.  Budgets are read as
     # *totals*, so a run resumed at 400k of a 1M label budget generates the
@@ -183,6 +211,11 @@ class OnlineStudentConfig:
         return self.learning_rate * (0.5 ** halvings)
 
     @property
+    def augment_on_read(self) -> bool:
+        """Whether sampled rows are re-transformed; see ``suit_augmentations``."""
+        return self.suit_augmentations >= 1
+
+    @property
     def uses_policy_net(self) -> bool:
         """Whether theta_pi is trained, warm-starts search, or both."""
         return (
@@ -244,6 +277,13 @@ def fit_online_student(
         )
 
     rng = rng if rng is not None else np.random.default_rng(config.seed)
+    # Augmentation draws from a stream of its own.  It is handed to the buffer,
+    # which applies the isomorphisms at sample time; sharing the generation rng
+    # would let each transform advance the stream that decides which situations
+    # get sampled next, so a run with ``suit_augmentations`` set would search
+    # different subgames than one without — destroying the only comparison the
+    # setting is supposed to allow, and doing it invisibly.
+    augment_rng = np.random.default_rng(np.random.SeedSequence(config.seed).spawn(2)[1])
     device = torch.device(config.device)
     net = net if net is not None else HoldemValueNet(config.value_net)
     net.to(device)
@@ -251,7 +291,14 @@ def fit_online_student(
 
     optimiser = torch.optim.Adam(net.parameters(), lr=config.learning_rate)
     loss_fn = nn.HuberLoss(reduction="mean")
-    buffer = Buffer(config.buffer_size)
+    buffer = build_buffer(
+        config.buffer_size,
+        directory=config.buffer_dir,
+        shard_rows=config.buffer_shard_rows,
+        hot_rows=config.buffer_hot_rows,
+        augment=config.augment_on_read,
+        augment_rng=augment_rng,
+    )
     journal = TrajectoryJournal(journal_path) if journal_path is not None else None
     spend = SpendRecord()
     history: List[Dict[str, float]] = []
@@ -280,6 +327,7 @@ def fit_online_student(
             optimiser=optimiser,
             buffer=buffer,
             rng=rng,
+            augment_rng=augment_rng,
             policy_net=policy_net,
             policy_optimiser=policy_optimiser,
             policy_buffer=policy_buffer,
@@ -414,6 +462,7 @@ def fit_online_student(
                 iteration=iteration,
                 trajectory_id=trajectory_id,
                 rng=rng,
+                augment_rng=augment_rng,
                 net=net,
                 optimiser=optimiser,
                 buffer=buffer,
@@ -450,6 +499,7 @@ def fit_online_student(
             iteration=iteration,
             trajectory_id=trajectory_id,
             rng=rng,
+            augment_rng=augment_rng,
             net=net,
             optimiser=optimiser,
             buffer=buffer,

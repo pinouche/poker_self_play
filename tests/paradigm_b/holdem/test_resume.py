@@ -22,6 +22,8 @@ from paradigm_b.holdem.arm2_iterative.student import (
 )
 from paradigm_b.holdem.arms_common.storage import load_run_state, save_run_state
 from paradigm_b.holdem.data.sampling import SituationConfig
+from paradigm_b.holdem.engine.combos import NUM_COMBOS
+from paradigm_b.holdem.net.features import INPUT_DIM
 from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
 from paradigm_b.holdem.arms_common.situations import StreetMix
 from paradigm_b.holdem.selfplay import Buffer, Example, HoldemSelfPlayConfig
@@ -126,9 +128,9 @@ def test_the_buffer_survives_with_its_eviction_order(tmp_path):
         buffer.add(
             [
                 Example(
-                    features=np.full(buffer.features.shape[1], value, dtype=np.float32),
-                    mask=np.ones(buffer.masks.shape[1], dtype=np.float32),
-                    values=np.full(buffer.targets.shape[1:], value, dtype=np.float32),
+                    features=np.full(INPUT_DIM, value, dtype=np.float32),
+                    mask=np.ones(NUM_COMBOS, dtype=np.float32),
+                    values=np.full((2, NUM_COMBOS), value, dtype=np.float32),
                 )
             ]
         )
@@ -160,10 +162,95 @@ def test_the_buffer_survives_with_its_eviction_order(tmp_path):
         rng=np.random.default_rng(1),
     )
     # Oldest (4) first, newest (11) last -- the order age is read off.
-    assert [float(row[0]) for row in restored.features[: restored.size]] == list(
-        range(4, 12)
+    rows, _, _ = restored.raw(np.arange(restored.size))
+    assert [float(row[0]) for row in rows] == list(range(4, 12))
+    assert restored._start == 0, "a restored buffer starts at its oldest row"
+
+
+def test_a_sharded_buffer_saves_a_manifest_rather_than_its_rows(tmp_path):
+    """The reason a disk-backed buffer is cheaper end to end, not merely bigger.
+
+    An in-memory buffer has to write every live row into the state directory on
+    each ``--state-every``.  The shards are already durable and already outside
+    the run's atomic swap, so there is nothing to copy -- and at the sizes this
+    exists for, that copy would be the single largest cost in a long run.
+    """
+    from paradigm_b.holdem.data.store import ShardedReplayBuffer
+
+    shards = tmp_path / "shards"
+    buffer = ShardedReplayBuffer(64, shards, shard_rows=4, hot_rows=3, augment=False)
+    buffer.add(
+        [
+            Example(
+                features=np.full(INPUT_DIM, value, dtype=np.float32),
+                mask=np.ones(NUM_COMBOS, dtype=np.float32),
+                values=np.full((2, NUM_COMBOS), value, dtype=np.float32),
+                board=(0, 1, 2),
+            )
+            for value in range(10)
+        ]
     )
-    assert restored._next == 0, "a full buffer's pointer wraps back to the start"
+
+    net = HoldemValueNet(TINY_NET)
+    optimiser = torch.optim.Adam(net.parameters())
+    config = tiny_config(buffer_size=64)
+    state = tmp_path / "state"
+    save_run_state(
+        state,
+        config=config,
+        spend=type("S", (), {"to_dict": lambda self: {}})(),
+        iteration=1,
+        trajectory_id=1,
+        rng=np.random.default_rng(0),
+        net=net,
+        optimiser=optimiser,
+        buffer=buffer,
+        initial_state=weights(net),
+    )
+    assert not list(state.glob("buffer-*.npy")), "rows were copied into the state"
+
+    restored = ShardedReplayBuffer(64, shards, shard_rows=4, hot_rows=3, augment=False)
+    load_run_state(
+        state,
+        config=config,
+        net=net,
+        optimiser=optimiser,
+        buffer=restored,
+        rng=np.random.default_rng(1),
+    )
+    assert len(restored) == 10
+    rows, _, _ = restored.raw(np.arange(len(restored)))
+    assert [float(row[0]) for row in rows] == list(range(10))
+
+
+def test_a_missing_shard_is_refused_rather_than_resumed_around(tmp_path):
+    """The manifest points outside the run directory, so the two can be parted.
+
+    Coming back with a shard gone would silently train on a buffer with a hole
+    in the middle of its history, which is exactly the failure a run state is
+    supposed to make impossible.
+    """
+    from paradigm_b.holdem.data.store import ShardedReplayBuffer
+
+    shards = tmp_path / "shards"
+    buffer = ShardedReplayBuffer(64, shards, shard_rows=4, augment=False)
+    buffer.add(
+        [
+            Example(
+                features=np.zeros(INPUT_DIM, dtype=np.float32),
+                mask=np.ones(NUM_COMBOS, dtype=np.float32),
+                values=np.zeros((2, NUM_COMBOS), dtype=np.float32),
+                board=(0, 1, 2),
+            )
+            for _ in range(10)
+        ]
+    )
+    meta = buffer.write_state(tmp_path / "state")
+    next(shards.glob("shard-00000000-features.npy")).unlink()
+
+    restored = ShardedReplayBuffer(64, shards, shard_rows=4, augment=False)
+    with pytest.raises(FileNotFoundError, match="missing"):
+        restored.read_state(tmp_path / "state", meta)
 
 
 def test_resume_refuses_a_different_abstraction(tmp_path):
