@@ -1,0 +1,1 @@
+"""Paradigm A entry points."""

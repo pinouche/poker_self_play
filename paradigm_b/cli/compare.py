@@ -1,0 +1,330 @@
+"""Arm 1 vs arm 2: are labels a reusable asset, or do they go stale?
+
+``compare``      Run both arms at equal label and update budgets, from one
+                 seeded set of starting weights, and score them by held-out
+                 exploitability per street.
+``label-drift``  The follow-up probe: re-solve a frozen dataset's own inputs
+                 with a stronger evaluator and measure how far its labels had
+                 drifted.  The river is the control — it has no leaves, so a
+                 non-zero river drift means the pipeline is inconsistent and no
+                 other number can be trusted.
+
+Examples::
+
+    python -m paradigm_b.cli.compare compare --run runs/labels-01 --label-budget 20000
+    python -m paradigm_b.cli.compare label-drift --run runs/labels-01
+
+Reachable as ``python solve.py compare`` and ``python solve.py label-drift``.
+Full write-up, including what is held equal and how to read the result:
+``docs/arms.md``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+
+import torch
+
+from paradigm_b.holdem.arm1_fixed.build import DatasetBuildConfig
+from paradigm_b.holdem.arm1_fixed.store import DatasetStore
+from paradigm_b.holdem.arm1_fixed.student import FixedStudentConfig
+from paradigm_b.holdem.arm2_iterative.student import OnlineStudentConfig
+from paradigm_b.holdem.arms_common.evaluation import EvaluationConfig
+from paradigm_b.holdem.arms_common.storage import RunLayout
+from paradigm_b.holdem.compare.experiment import ComparisonConfig, run_comparison
+from paradigm_b.holdem.compare.relabel import measure_label_drift
+from paradigm_b.holdem.data.sampling import SituationConfig
+from paradigm_b.holdem.net.value_net import HoldemValueNet, HoldemValueNetConfig
+from paradigm_b.holdem.selfplay import HoldemSelfPlayConfig
+
+
+# --- argument wiring -------------------------------------------------------
+def _add_compare_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--run", type=str, required=True, help="run directory")
+    parser.add_argument("--label-budget", type=int, default=20_000)
+    parser.add_argument("--update-budget", type=int, default=4_000)
+    parser.add_argument("--river-examples", type=int, default=20_000)
+    parser.add_argument("--turn-examples", type=int, default=6_000)
+    parser.add_argument("--flop-examples", type=int, default=2_000)
+    parser.add_argument(
+        "--self-play-examples",
+        type=int,
+        default=0,
+        help="frozen on-policy control source; separates stale labels from "
+        "a different input distribution",
+    )
+    parser.add_argument("--teacher-updates", type=int, default=4_000)
+    parser.add_argument(
+        "--trajectories-per-iteration",
+        type=int,
+        default=16,
+        help="arm 2 only; with updates-per-iteration this sets the labels-per-"
+        "update ratio, which should roughly match label-budget/update-budget",
+    )
+    parser.add_argument("--updates-per-iteration", type=int, default=40)
+    parser.add_argument(
+        "--exploration",
+        type=float,
+        default=0.25,
+        help="arm 2: SAMPLE_LEAF's eps — probability that the one sampled "
+        "player takes a uniform-random action at each step of the descent "
+        "(ReBeL appendix E's eps = 25%%).  Measured worse at a 2,000-label "
+        "budget; set 0.0 for small runs",
+    )
+    parser.add_argument(
+        "--warm-start-iterations",
+        type=int,
+        default=0,
+        help="arm 2: t_warm — initialise each subgame's policy from the policy "
+        "network and start CFR's counter here instead of at 0.  Needs a policy "
+        "network, so it implies --policy-updates-per-iteration",
+    )
+    parser.add_argument(
+        "--policy-updates-per-iteration",
+        type=int,
+        default=0,
+        help="arm 2: gradient steps on theta_pi per iteration, from the D_pi "
+        "targets search produces.  Off by default: these steps are outside "
+        "--update-budget, so a non-zero value stops the two arms being an "
+        "equal-compute comparison",
+    )
+    parser.add_argument(
+        "--purge-after-iterations",
+        type=int,
+        default=None,
+        help="arm 2: drop the oldest half of the replay buffer once, at this "
+        "iteration, flushing labels written by the near-random initial network "
+        "(ReBeL appendix E does this after 20 of its 1,750 epochs)",
+    )
+    parser.add_argument("--purge-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--actors",
+        type=int,
+        default=0,
+        help="arm 2: actor processes generating trajectories in parallel.  0 "
+        "keeps the reproducible synchronous loop, which is what a controlled "
+        "comparison wants; higher is much faster but not bit-reproducible.  "
+        "8 is the measured knee on a 16-logical-core M4 Max (4.8x; 16 actors "
+        "buy only 18%% more for double the processes)",
+    )
+    parser.add_argument(
+        "--learner-threads",
+        type=int,
+        default=None,
+        help="arm 2: threads the learner's gradient steps may use.  Default "
+        "leaves it the cores the actors are not on (cpu_count - actors); "
+        "ignored when --actors is 0",
+    )
+    parser.add_argument(
+        "--weight-sync-every",
+        type=int,
+        default=50,
+        help="gradient steps between publishing weights to the actors",
+    )
+    parser.add_argument(
+        "--state-every",
+        type=int,
+        default=None,
+        help="arm 2: write a resumable run state (both networks, both "
+        "optimisers, both buffers, the spend and the RNG) every N iterations.  "
+        "~1.9GB per write, so half-hourly is the right order on a long run",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="arm 2: continue a run from a --state-every directory.  Budgets "
+        "are read as totals, so the run finishes the original budget rather "
+        "than spending it again",
+    )
+    parser.add_argument("--buffer-size", type=int, default=60_000)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--hidden-dim", type=int, default=1536)
+    parser.add_argument("--residual-blocks", type=int, default=6)
+    parser.add_argument("--card-embedding-dim", type=int, default=128)
+    parser.add_argument("--eval-boards", type=int, default=2)
+    parser.add_argument("--eval-iterations", type=int, default=40)
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=None,
+        help="score mid-run every N iterations (arm 2) / N updates (arm 1); "
+        "off by default because a flop+turn score is not cheap",
+    )
+    parser.add_argument("--checkpoint-every", type=int, default=10)
+    parser.add_argument(
+        "--flop-depth-limit",
+        type=int,
+        default=1,
+        help="betting rounds of flop lookahead when scoring; 2 is ~170x the work",
+    )
+    parser.add_argument("--rebuild-dataset", action="store_true")
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cpu")
+
+
+def _add_drift_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--run", type=str, required=True, help="an existing run directory")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="evaluator to re-solve with; defaults to the iterative student",
+    )
+    parser.add_argument("--sample-size", type=int, default=64)
+    parser.add_argument(
+        "--cfr-iterations",
+        type=int,
+        default=None,
+        help="override; by default each source is re-solved at the count it "
+        "was generated with, which is what makes the river a control",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cpu")
+
+
+def register(sub) -> None:
+    """Add this module's subcommands to a shared subparser object."""
+    parser = sub.add_parser(
+        "compare", help="frozen labels vs ReBeL-refreshed labels, at equal budgets"
+    )
+    _add_compare_args(parser)
+    parser.set_defaults(func=run_compare)
+
+    parser = sub.add_parser(
+        "label-drift",
+        help="how far a frozen dataset's labels sit from freshly-solved ones",
+    )
+    _add_drift_args(parser)
+    parser.set_defaults(func=run_label_drift)
+
+
+# --- commands --------------------------------------------------------------
+def run_compare(args: argparse.Namespace) -> None:
+    """Both arms, equal budgets, one report."""
+    value_net = HoldemValueNetConfig(
+        hidden_dim=args.hidden_dim,
+        num_residual_blocks=args.residual_blocks,
+        card_embedding_dim=args.card_embedding_dim,
+    )
+    config = ComparisonConfig(
+        run_path=args.run,
+        label_budget=args.label_budget,
+        update_budget=args.update_budget,
+        dataset=DatasetBuildConfig(
+            river_examples=args.river_examples,
+            turn_examples=args.turn_examples,
+            flop_examples=args.flop_examples,
+            self_play_examples=args.self_play_examples,
+            teacher_updates=args.teacher_updates,
+            teacher_batch_size=args.batch_size,
+            teacher_learning_rate=args.learning_rate,
+            value_net=value_net,
+            workers=args.workers,
+        ),
+        rebuild_dataset=args.rebuild_dataset,
+        fixed=FixedStudentConfig(
+            label_budget=0,
+            update_budget=0,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            eval_every=args.eval_every,
+        ),
+        iterative=OnlineStudentConfig(
+            self_play=HoldemSelfPlayConfig(
+                exploration=args.exploration,
+                warm_start_iterations=args.warm_start_iterations,
+            ),
+            policy_updates_per_iteration=(
+                args.policy_updates_per_iteration
+                if args.policy_updates_per_iteration > 0
+                or args.warm_start_iterations <= 0
+                # A warm start needs a policy network that is actually being
+                # trained; warm-starting from an untouched random one would be
+                # strictly worse than the uniform policy it replaces.
+                else args.updates_per_iteration
+            ),
+            actors=args.actors,
+            learner_threads=args.learner_threads,
+            weight_sync_every=args.weight_sync_every,
+            purge_after_iterations=args.purge_after_iterations,
+            purge_fraction=args.purge_fraction,
+            buffer_size=args.buffer_size,
+            state_every=args.state_every,
+            resume_from=args.resume_from,
+            trajectories_per_iteration=args.trajectories_per_iteration,
+            updates_per_iteration=args.updates_per_iteration,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            eval_every=args.eval_every,
+            checkpoint_every=args.checkpoint_every,
+        ),
+        evaluation=EvaluationConfig(
+            situations=SituationConfig(board_cards=4),
+            boards_per_street=args.eval_boards,
+            search_iterations=args.eval_iterations,
+            flop_tree_depth_limit=args.flop_depth_limit,
+            device=args.device,
+        ),
+        value_net=value_net,
+        seed=args.seed,
+        device=args.device,
+    )
+    run_comparison(config, verbose=True)
+
+
+def _net_config_from_state(state) -> HoldemValueNetConfig:
+    """Recover a value net's shape from its own weights.
+
+    Saves the caller from having to repeat ``--hidden-dim`` and friends when
+    probing a run that was trained with non-default sizes — and from the silent
+    ``load_state_dict`` failure that follows when they forget.
+    """
+    linear = [
+        k
+        for k, v in state.items()
+        if k.startswith("trunk.layers") and k.endswith(".weight") and v.dim() == 2
+    ]
+    return HoldemValueNetConfig(
+        hidden_dim=int(state["trunk.layers.0.weight"].shape[0]),
+        num_residual_blocks=len(linear),
+        card_embedding_dim=int(state["board_embedding.card_embedding.weight"].shape[1]),
+    )
+
+
+def run_label_drift(args: argparse.Namespace) -> None:
+    """Re-solve a frozen dataset's own inputs with a stronger evaluator."""
+    layout = RunLayout.at(args.run)
+    store = DatasetStore.open(layout.dataset)
+    checkpoint = args.checkpoint or layout.iterative_student
+    state = torch.load(checkpoint, map_location=args.device)
+    # Size the network from the checkpoint rather than the defaults, so a run
+    # made with --hidden-dim can be probed without repeating the flag.
+    net = HoldemValueNet(_net_config_from_state(state))
+    net.load_state_dict(state)
+
+    results = measure_label_drift(
+        store,
+        net,
+        sample_size=args.sample_size,
+        seed=args.seed,
+        cfr_iterations=args.cfr_iterations,
+        device=args.device,
+        results_path=layout.relabel,
+    )
+    print(json.dumps(results, indent=2))
+    print(f"\n{results['verdict']}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    register(parser.add_subparsers(dest="command", required=True))
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
